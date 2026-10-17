@@ -13,6 +13,21 @@ struct ContentView: View {
     private let background = Color(red: 0.055, green: 0.06, blue: 0.09)
 
     var body: some View {
+        TabView {
+            coreTab
+                .tabItem {
+                    Label("I2P Core", systemImage: "cpu")
+                }
+            RouterDashboardView()
+                .tabItem {
+                    Label("Router", systemImage: "speedometer")
+                }
+        }
+        .tint(accent)
+        .preferredColorScheme(.dark)
+    }
+
+    private var coreTab: some View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 14) {
@@ -27,10 +42,9 @@ struct ContentView: View {
             .background(background.ignoresSafeArea())
             .navigationTitle("I2P Core")
             .navigationBarTitleDisplayMode(.large)
-        }
-        .preferredColorScheme(.dark)
-        .onAppear {
-            if results.isEmpty { refresh() }
+            .onAppear {
+                if results.isEmpty { refresh() }
+            }
         }
     }
 

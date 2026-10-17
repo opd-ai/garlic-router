@@ -554,6 +554,18 @@ actor I2PNetworkDatabase {
     func floodfillCount() -> Int { knownFloodfills.count }
     func knownPeerCount() -> Int { knownPeers.count }
 
+    /// Aggregated live status for the router dashboard.
+    func status(now: Date = Date()) -> I2PNetDBStatus {
+        let live = entries.values.filter { !$0.isExpired(now) }
+        return I2PNetDBStatus(
+            routerInfoCount: live.filter { $0.entryType == .routerInfo }.count,
+            leaseSetCount: live.filter { $0.entryType == .leaseSet }.count,
+            floodfillCount: knownFloodfills.count,
+            peerCount: knownPeers.count,
+            isLocalFloodfill: isFloodfillRouter
+        )
+    }
+
     // MARK: Bootstrapping
 
     /// Startup bootstrapping: takes seed floodfills (from reseed data), fetches their

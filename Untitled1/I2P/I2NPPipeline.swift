@@ -135,8 +135,13 @@ final class I2NPMessageRouter {
         lock.unlock()
     }
 
+    /// Observation hook invoked for every routed inbound message, before
+    /// dispatch (used by the status engine for throughput counting).
+    var onMessageRouted: ((I2NPMessage, Data) -> Void)?
+
     /// Routes an inbound I2NP message from the given source router.
     func handleIncoming(_ message: I2NPMessage, from source: Data) async {
+        onMessageRouted?(message, source)
         guard !message.isExpired() else { return } // expiry enforcement
         guard let body = try? message.parseBody() else { return }
         switch body {
