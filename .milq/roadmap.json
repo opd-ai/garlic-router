@@ -164,9 +164,9 @@
       "mockups" : [
 
       ],
-      "status" : "in_progress",
+      "status" : "done",
       "title" : "Align NTCP2 obfuscation and framing with the spec",
-      "updatedAt" : "2026-10-17T16:32:40Z"
+      "updatedAt" : "2026-10-17T16:45:25Z"
     },
     {
       "createdAt" : "2026-10-17T14:20:08Z",

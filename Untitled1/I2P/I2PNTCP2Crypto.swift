@@ -194,11 +194,11 @@ enum NTCP2KeyObfuscation {
 /// ephemeral-key obfuscation (block-aligned 32-byte input, 32-byte output).
 enum I2PAESCBC {
     static func encrypt(_ data: Data, key: Data, iv: Data) -> Data {
-        crypt(data, key: key, iv: iv, operation: kCCEncrypt)
+        crypt(data, key: key, iv: iv, operation: CCOperation(kCCEncrypt))
     }
 
     static func decrypt(_ data: Data, key: Data, iv: Data) -> Data {
-        crypt(data, key: key, iv: iv, operation: kCCDecrypt)
+        crypt(data, key: key, iv: iv, operation: CCOperation(kCCDecrypt))
     }
 
     private static func crypt(_ data: Data, key: Data, iv: Data, operation: CCOperation) -> Data {

@@ -66,11 +66,16 @@ final class NTCP2InitiatorHandshake {
         // responder's static key, bound to the initial chaining key.
         let obfuscatedE = try NTCP2KeyObfuscation.encrypt(ephemeralPublic,
                                                           chainingKey: NTCP2NoiseChain.initialChainingKey,
-                                                          material: remoteStaticKey)
+                                                          material: remoteStatic.rawRepresentation)
         var message = obfuscatedE
-        message += Data([UInt8((ciphertext.count >> 8) & 0xff), UInt8(ciphertext.count & 0xff)])
-        message += ciphertext
-        if padding > 0 { message += I2PCrypto.randomBytes(padding) }
+        let optionsLengthHigh = UInt8((ciphertext.count >> 8) & 0xff)
+        let optionsLengthLow = UInt8(ciphertext.count & 0xff)
+        message.append(optionsLengthHigh)
+        message.append(optionsLengthLow)
+        message.append(ciphertext)
+        if padding > 0 {
+            message.append(contentsOf: I2PCrypto.randomBytes(padding))
+        }
         return message
     }
 
@@ -204,9 +209,14 @@ final class NTCP2ResponderHandshake {
                                                            chainingKey: NTCP2NoiseChain.initialChainingKey,
                                                            material: e1raw)
         var reply = obfuscatedE2
-        reply += Data([UInt8((ciphertext.count >> 8) & 0xff), UInt8(ciphertext.count & 0xff)])
-        reply += ciphertext
-        if padding > 0 { reply += I2PCrypto.randomBytes(padding) }
+        let replyOptionsLengthHigh = UInt8((ciphertext.count >> 8) & 0xff)
+        let replyOptionsLengthLow = UInt8(ciphertext.count & 0xff)
+        reply.append(replyOptionsLengthHigh)
+        reply.append(replyOptionsLengthLow)
+        reply.append(ciphertext)
+        if padding > 0 {
+            reply.append(contentsOf: I2PCrypto.randomBytes(padding))
+        }
         stage = .awaitingConfirm
         return (reply, total)
     }
