@@ -11,6 +11,12 @@ import SwiftUI
 struct Untitled1App: App {
     @Environment(\.scenePhase) private var scenePhase
 
+    init() {
+        // Persist the faulting context of any launch crash so the next run can
+        // surface the exact failure point (crash-diagnostics card, core tab).
+        I2PCrashReporter.install()
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView()

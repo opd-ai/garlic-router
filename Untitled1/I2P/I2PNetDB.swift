@@ -133,9 +133,14 @@ actor I2PNetworkDatabase {
         }
     }
 
-    /// Adopts asynchronously restored entries onto the actor (isolated mutation).
+    /// Adopts asynchronously restored entries onto the actor. Merges rather
+    /// than replaces: live stores that arrive while the restore is running
+    /// (the router is published and reachable within seconds of launch) must
+    /// survive the adoption.
     private func adoptRestored(_ restored: [Data: StoredEntry]) {
-        entries = restored
+        for (key, entry) in restored where entries[key] == nil {
+            entries[key] = entry
+        }
     }
 
     // MARK: Kademlia XOR distance metric
@@ -700,6 +705,12 @@ actor I2PNetworkDatabase {
     private nonisolated static func restoredEntries(from storage: I2PNetDBStorage) -> [Data: StoredEntry] {
         var restored: [Data: StoredEntry] = [:]
         for (key, record) in storage.loadAll() {
+            // Bound the restore's memory spike: oversized persisted records are
+            // not spec-shaped netdb entries; drop them.
+            guard record.payload.count <= 65_536 else {
+                storage.remove(key: key)
+                continue
+            }
             guard let entryType = I2PDatabaseEntryType(rawValue: record.entryType) else {
                 storage.remove(key: key)
                 continue
