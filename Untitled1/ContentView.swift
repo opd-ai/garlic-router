@@ -7,6 +7,7 @@ import SwiftUI
 
 struct ContentView: View {
     @State private var results: [I2PSelfTestResult] = []
+    @State private var readinessResults: [I2PSelfTestResult] = []
     @State private var sizes: [(name: String, bytes: Int)] = []
 
     private let accent = Color(red: 0.47, green: 0.44, blue: 0.97)
@@ -42,6 +43,7 @@ struct ContentView: View {
                     cryptoSuiteCard
                     serializationCard
                     selfTestCard
+                    readinessCard
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 4)
@@ -51,6 +53,9 @@ struct ContentView: View {
             .navigationTitle("I2P Core")
             .navigationBarTitleDisplayMode(.large)
             .onAppear {
+                // Graceful router restart on launch (and on foreground, via
+                // the app's scene-phase handler).
+                I2PRouterAppContext.shared.resumeAfterBackground()
                 if results.isEmpty { refresh() }
             }
         }
@@ -69,6 +74,56 @@ struct ContentView: View {
         Task {
             let fresh = await I2PMainnetVerification.runAll()
             await MainActor.run { results = fresh }
+        }
+    }
+
+    /// The production readiness audit runs the existing compliance machinery
+    /// plus dedicated readiness probes; it performs no mainnet traffic.
+    private func runReadinessAudit() {
+        Task {
+            let fresh = await I2PReadinessAudit.runAll()
+            await MainActor.run { readinessResults = fresh }
+        }
+    }
+
+    private var readinessCard: some View {
+        card(title: "Production readiness") {
+            Button {
+                runReadinessAudit()
+            } label: {
+                Label("Run readiness audit", systemImage: "stethoscope")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .background(accent.opacity(0.15), in: RoundedRectangle(cornerRadius: 12))
+            }
+            .buttonStyle(.plain)
+            .tint(accent)
+
+            if !readinessResults.isEmpty {
+                let passed = readinessResults.filter(\.passed).count
+                Text(passed == readinessResults.count
+                     ? "\(passed) of \(readinessResults.count) checks passed"
+                     : "\(passed) of \(readinessResults.count) checks passed — findings below")
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(passed == readinessResults.count ? Color.green : Color.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                ForEach(readinessResults.indices, id: \.self) { index in
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: readinessResults[index].passed ? "checkmark.circle.fill" : "xmark.circle.fill")
+                            .foregroundStyle(readinessResults[index].passed ? Color.green : Color.red)
+                            .font(.caption)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(readinessResults[index].name)
+                                .font(.footnote.weight(.medium))
+                            Text(readinessResults[index].detail)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
         }
     }
 

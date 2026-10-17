@@ -1,12 +1,13 @@
 //
 //  I2PRouterAppContext.swift
-//  The running router backing the dashboard: real identity (persisted),
-//  netdb with persistent storage, NTCP2 transport, tunnel pool and I2NP
-//  router, all wired through the status engine's event stream.
+//  The running router backing the dashboard: real identity (persisted in
+//  the Keychain), netdb with persistent storage, NTCP2 transport, tunnel pool
+//  and I2NP router, all wired through the status engine's event stream.
 //
 
 import Foundation
 import CryptoKit
+import Security
 
 final class I2PRouterAppContext {
     static let shared = I2PRouterAppContext()
@@ -26,8 +27,17 @@ final class I2PRouterAppContext {
     private let tunnelParticipant: I2PTunnelParticipant
     private let tunnelPeerProvider: I2PTunnelPeerProvider
     private(set) var mainnetRouterInfo: I2PRouterInfo
+    private(set) var lifecycleState: LifecycleState = .suspended
     private var started = false
+    private var startedNetDBMaintenance = false
     private var ntcp2Bridge: NTCP2I2NPBridge?
+
+    /// Router lifecycle states: running (transports, pools, SAM socket live)
+    /// or suspended (clean shutdown — netdb state rides persistent storage).
+    enum LifecycleState {
+        case running
+        case suspended
+    }
 
     /// The SAMv3.3 API socket bound to this router (port 7656 by default).
     lazy var samServer: I2PSAMServer = {
@@ -59,23 +69,37 @@ final class I2PRouterAppContext {
 
     private init() {
         // Router identity: an Ed25519 signing key plus an X25519 encryption
-        // key, generated once per installation and reused on later launches.
+        // key, generated once per installation, persisted in the Keychain
+        // (never in unprotected user-defaults storage) and reused on later
+        // launches so the RouterHash is stable for the router's lifetime.
         let defaults = UserDefaults.standard
         let signingKey: Curve25519.Signing.PrivateKey
         let encryptionKey: Curve25519.KeyAgreement.PrivateKey
-        if let storedSeed = defaults.string(forKey: "i2p.router.signingSeed"),
-           let seed = Data(base64Encoded: storedSeed), seed.count == 32,
-           let storedEnc = defaults.string(forKey: "i2p.router.encryptionKey"),
-           let encData = Data(base64Encoded: storedEnc), encData.count == 32,
-           let restoredSigning = try? Curve25519.Signing.PrivateKey(rawRepresentation: seed),
-           let restoredEncryption = try? Curve25519.Signing.PrivateKey(rawRepresentation: encData) {
+        // Migration: keys persisted in UserDefaults by earlier builds move into
+        // the Keychain and are removed from the unprotected store.
+        if I2PRouterKeychain.read(account: "signingSeed") == nil,
+           let legacy = defaults.string(forKey: "i2p.router.signingSeed"),
+           let data = Data(base64Encoded: legacy), data.count == 32 {
+            I2PRouterKeychain.write(data, account: "signingSeed")
+            defaults.removeObject(forKey: "i2p.router.signingSeed")
+        }
+        if I2PRouterKeychain.read(account: "encryptionKey") == nil,
+           let legacy = defaults.string(forKey: "i2p.router.encryptionKey"),
+           let data = Data(base64Encoded: legacy), data.count == 32 {
+            I2PRouterKeychain.write(data, account: "encryptionKey")
+            defaults.removeObject(forKey: "i2p.router.encryptionKey")
+        }
+        if let storedSeed = I2PRouterKeychain.read(account: "signingSeed"),
+           let storedEncryption = I2PRouterKeychain.read(account: "encryptionKey"),
+           let restoredSigning = try? Curve25519.Signing.PrivateKey(rawRepresentation: storedSeed),
+           let restoredEncryption = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: storedEncryption) {
             signingKey = restoredSigning
             encryptionKey = restoredEncryption
         } else {
             signingKey = Curve25519.Signing.PrivateKey()
             encryptionKey = Curve25519.KeyAgreement.PrivateKey()
-            defaults.set(signingKey.rawRepresentation.base64EncodedString(), forKey: "i2p.router.signingSeed")
-            defaults.set(encryptionKey.rawRepresentation.base64EncodedString(), forKey: "i2p.router.encryptionKey")
+            I2PRouterKeychain.write(signingKey.rawRepresentation, account: "signingSeed")
+            I2PRouterKeychain.write(encryptionKey.rawRepresentation, account: "encryptionKey")
         }
         self.encryptionKey = encryptionKey
         signingSeed = signingKey.rawRepresentation
@@ -149,18 +173,45 @@ final class I2PRouterAppContext {
     func start() {
         guard !started else { return }
         started = true
+        lifecycleState = .running
         _ = try? ntcp2.startListener(port: 0)
         let bridge = NTCP2I2NPBridge(router: i2npRouter)
         ntcp2Bridge = bridge
         ntcp2.delegate = bridge
-        Task { await netDB.startMaintenance() }
+        // The netdb maintenance loop spawns exactly once for the process
+        // lifetime; resume cycles must not duplicate it.
+        if !startedNetDBMaintenance {
+            startedNetDBMaintenance = true
+            Task { await netDB.startMaintenance() }
+        }
         // Reachability advertisement (surfaced by the mainnet CI suite): a
         // real router publishes its external address so mainnet peers can
-        // dial us for inbound tunnel participation.
+        // dial us for inbound tunnel participation. Re-running after a
+        // resume picks up network-interface changes (WiFi ↔ cellular).
         Task { await advertiseReachableAddress() }
         tunnelPool.start()
         engine.start()
         samServer.start()
+    }
+
+    /// Clean shutdown for app termination or background suspension: stops the
+    /// NTCP2 listener and sessions, the tunnel pool's maintenance loop and the
+    /// SAM socket. Netdb state rides persistent storage, so suspension loses
+    /// nothing; a later resume restarts everything gracefully.
+    func shutdownForTermination() {
+        guard started else { return }
+        started = false
+        lifecycleState = .suspended
+        ntcp2.shutdown()
+        tunnelPool.stop()
+        samServer.stop()
+    }
+
+    /// Graceful restart on launch or after a background suspension. Re-running
+    /// the reachability advertisement picks up network-interface changes.
+    func resumeAfterBackground() {
+        guard !started else { return }
+        start()
     }
 
     /// Binds the NTCP2 listener, discovers our public IPv4 address over
@@ -235,4 +286,51 @@ private final class NTCP2I2NPBridge: NTCP2TransportDelegate {
     }
 
     func transport(_ transport: NTCP2Transport, sessionDidClose session: NTCP2Session) {}
+}
+
+// MARK: - Identity keychain
+
+/// The router's private identity material lives in the Keychain (generic
+/// password class, after-first-unlock accessibility) — never in unprotected
+/// user-defaults storage, so the RouterHash is stable for the router's
+/// lifetime and the raw keys never sit in an unencrypted plist.
+enum I2PRouterKeychain {
+    private static let service = "i2p.router.identity"
+
+    static func read(account: String) -> Data? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess else { return nil }
+        return result as? Data
+    }
+
+    @discardableResult
+    static func write(_ data: Data, account: String) -> Bool {
+        let attributes: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        SecItemDelete(attributes as CFDictionary)
+        var query = attributes
+        query[kSecValueData as String] = data
+        query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        return SecItemAdd(query as CFDictionary, nil) == errSecSuccess
+    }
+
+    static func delete(account: String) {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        SecItemDelete(query as CFDictionary)
+    }
 }
