@@ -192,6 +192,37 @@ actor I2PNetworkDatabase {
         knownFloodfills.contains(hash) || (hash == localRouterHash && isFloodfillRouter)
     }
 
+    /// Netdb cache quota: neither the in-memory cache nor the persisted store
+    /// may grow without bound, no matter how many stores the network floods us
+    /// with (the hardening quota in executable form).
+    static let maxCacheEntries = 4_000
+
+    /// Makes room for one more entry: expired residents are evicted first, then
+    /// the ones farthest from the incoming key by the Kademlia metric — the least
+    /// useful cache residents go first, and their disk records are reclaimed too.
+    private func enforceCacheQuota(for incomingKey: Data) {
+        guard entries.count >= Self.maxCacheEntries else { return }
+        var toFree = entries.count + 1 - Self.maxCacheEntries
+        let expiredKeys = entries
+            .filter { $1.isExpired() }
+            .prefix(toFree)
+            .map(\.key)
+        for key in expiredKeys {
+            entries.removeValue(forKey: key)
+            storage.remove(key: key)
+            toFree -= 1
+        }
+        guard toFree > 0 else { return }
+        let victims = entries.keys
+            .filter { $0 != incomingKey }
+            .sorted { !Self.isCloser($0, than: $1, to: incomingKey) }
+            .prefix(toFree)
+        for key in victims {
+            entries.removeValue(forKey: key)
+            storage.remove(key: key)
+        }
+    }
+
     // MARK: Inbound message handling (entry point used by the transport)
 
     /// Handles an inbound netdb message. The transport layer calls this on delivery.
@@ -234,8 +265,11 @@ actor I2PNetworkDatabase {
             }
         }
 
-        // 3. Accept into cache + disk.
+        // 3. Accept into cache + disk (bounded by the cache quota: eviction
+        // removes expired-first, then farthest-from-key, and reclaims their
+        // disk records, so neither memory nor disk can run away).
         if !isDuplicate {
+            enforceCacheQuota(for: key)
             entries[key] = entry
             try? storage.persist(key: key, record: I2PNetDBStorage.Record(
                 entryType: s.entryType.rawValue,
@@ -328,6 +362,7 @@ actor I2PNetworkDatabase {
             learn(from: routerInfo)
         }
         ownRouterInfo = entry
+        enforceCacheQuota(for: entry.key)
         entries[entry.key] = entry
         try? storage.persist(key: entry.key, record: I2PNetDBStorage.Record(
             entryType: I2PDatabaseEntryType.routerInfo.rawValue,
@@ -344,6 +379,7 @@ actor I2PNetworkDatabase {
         let payload = leaseSet.serialize()
         guard let entry = try? Self.ingest(payload, entryType: .leaseSet) else { return 0 }
         ownLeaseSet = entry
+        enforceCacheQuota(for: entry.key)
         entries[entry.key] = entry
         try? storage.persist(key: entry.key, record: I2PNetDBStorage.Record(
             entryType: I2PDatabaseEntryType.leaseSet.rawValue,
@@ -361,6 +397,7 @@ actor I2PNetworkDatabase {
         if let routerInfo = entry.routerInfo {
             learn(from: routerInfo)
         }
+        enforceCacheQuota(for: entry.key)
         entries[entry.key] = entry
         try? storage.persist(key: entry.key, record: I2PNetDBStorage.Record(
             entryType: I2PDatabaseEntryType.routerInfo.rawValue,
@@ -374,6 +411,7 @@ actor I2PNetworkDatabase {
     func ingestLeaseSet(_ payload: Data) throws {
         let entry = try Self.ingest(payload, entryType: .leaseSet)
         guard !entry.isExpired() else { throw I2PWireError.invalidFormat }
+        enforceCacheQuota(for: entry.key)
         entries[entry.key] = entry
         try? storage.persist(key: entry.key, record: I2PNetDBStorage.Record(
             entryType: I2PDatabaseEntryType.leaseSet.rawValue,
@@ -392,6 +430,7 @@ actor I2PNetworkDatabase {
         }
         let entry = try Self.ingest(payload, entryType: entryType)
         guard !entry.isExpired() else { throw I2PWireError.invalidFormat }
+        enforceCacheQuota(for: entry.key)
         entries[entry.key] = entry
         try? storage.persist(key: entry.key, record: I2PNetDBStorage.Record(
             entryType: entryType.rawValue,
@@ -704,7 +743,23 @@ actor I2PNetworkDatabase {
     /// discarding unverifiable or expired records.
     private nonisolated static func restoredEntries(from storage: I2PNetDBStorage) -> [Data: StoredEntry] {
         var restored: [Data: StoredEntry] = [:]
-        for (key, record) in storage.loadAll() {
+        // Launch-survival cap: the persisted netdb grows with every session that
+        // ingests mainnet entries, and a crash-looping launch ingests MORE before
+        // dying each time — a feedback loop where each successive launch parses and
+        // re-verifies a bigger set (CPU + memory spike) and dies sooner. A memory
+        // kill is an external SIGKILL that no in-app signal handler can report, so
+        // the only durable defense is bounding the restore itself: keep the newest
+        // window and reclaim the overflow from disk so the next launch starts smaller.
+        var records = storage.loadAll()
+        let restoreCap = 1_500
+        if records.count > restoreCap {
+            records.sort { $0.1.storedAt > $1.1.storedAt }
+            for (overflowKey, _) in records.dropFirst(restoreCap) {
+                storage.remove(key: overflowKey)
+            }
+            records = Array(records.prefix(restoreCap))
+        }
+        for (key, record) in records {
             // Bound the restore's memory spike: oversized persisted records are
             // not spec-shaped netdb entries; drop them.
             guard record.payload.count <= 65_536 else {
