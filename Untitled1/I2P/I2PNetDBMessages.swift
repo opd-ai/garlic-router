@@ -8,10 +8,16 @@
 
 import Foundation
 
-/// Database entry types carried in DatabaseStore messages.
+/// Database entry types carried in DatabaseStore messages. Types 2/3/5 are
+/// the LeaseSet2 family (proposal 123): plain, encrypted and meta LeaseSet2
+/// payloads — parsed and signature-verified by I2PLeaseSet2 and ingested by
+/// the netdb so mainnet ECIES destinations resolve through DatabaseLookup.
 enum I2PDatabaseEntryType: UInt8 {
     case routerInfo = 0
     case leaseSet = 1
+    case leaseSet2 = 2
+    case encryptedLeaseSet2 = 3
+    case metaLeaseSet2 = 5
 }
 
 /// I2NP DatabaseStore message: publish a RouterInfo/LeaseSet, reply to a lookup,

@@ -84,6 +84,8 @@ actor I2PNetworkDatabase {
         let routerInfo: I2PRouterInfo?
         let leaseSet: I2PLeaseSet?
         let expiresAt: Date
+        /// LeaseSet2-family entries (proposal 123 store types 2/3/5).
+        var leaseSet2: I2PLeaseSet2? = nil
 
         func isExpired(_ now: Date = Date()) -> Bool {
             now >= expiresAt
@@ -360,6 +362,24 @@ actor I2PNetworkDatabase {
         ))
     }
 
+    /// Ingests a verified LeaseSet2 payload (proposal 123 store types 2/3/5)
+    /// into the local database (no networking). The entry resolves by its
+    /// destination hash through lookup/lookupLeaseSet2.
+    func ingestLeaseSet2(_ payload: Data, entryType: I2PDatabaseEntryType) throws {
+        guard entryType == .leaseSet2 || entryType == .encryptedLeaseSet2 || entryType == .metaLeaseSet2 else {
+            throw I2PWireError.invalidFormat
+        }
+        let entry = try Self.ingest(payload, entryType: entryType)
+        guard !entry.isExpired() else { throw I2PWireError.invalidFormat }
+        entries[entry.key] = entry
+        try? storage.persist(key: entry.key, record: I2PNetDBStorage.Record(
+            entryType: entryType.rawValue,
+            storedAt: Date(),
+            expiresAt: entry.expiresAt,
+            payload: payload
+        ))
+    }
+
     private func storeToNetDB(key: Data, entryType: I2PDatabaseEntryType, payload: Data,
                               floodfillCount: Int, timeout: TimeInterval = 2) async -> Int {
         let targets = selectFloodfills(for: key, count: floodfillCount)
@@ -455,6 +475,14 @@ actor I2PNetworkDatabase {
     /// Looks up a router's RouterInfo by its identity hash.
     func lookupRouterInfo(_ routerHash: Data, timeoutPerRound: TimeInterval = 1.5, maxRounds: Int = 2) async -> I2PRouterInfo? {
         await lookup(routerHash, timeoutPerRound: timeoutPerRound, maxRounds: maxRounds)?.routerInfo
+    }
+
+    /// Resolves a destination (hash of the destination keys-and-certificate, or
+    /// the publication key an LS2 store arrived under) to a signature-verified
+    /// LeaseSet2 over the cache-first DHT path — the mainnet ECIES eepsite
+    /// resolution path (proposal 123 store types 2/3/5).
+    func lookupLeaseSet2(_ key: Data, timeoutPerRound: TimeInterval = 1.5, maxRounds: Int = 2) async -> I2PLeaseSet2? {
+        await lookup(key, timeoutPerRound: timeoutPerRound, maxRounds: maxRounds)?.leaseSet2
     }
 
     // MARK: Refresh / expiration / maintenance
@@ -559,7 +587,7 @@ actor I2PNetworkDatabase {
         let live = entries.values.filter { !$0.isExpired(now) }
         return I2PNetDBStatus(
             routerInfoCount: live.filter { $0.entryType == .routerInfo }.count,
-            leaseSetCount: live.filter { $0.entryType == .leaseSet }.count,
+            leaseSetCount: live.filter { $0.entryType != .routerInfo }.count,
             floodfillCount: knownFloodfills.count,
             peerCount: knownPeers.count,
             isLocalFloodfill: isFloodfillRouter
@@ -623,6 +651,22 @@ actor I2PNetworkDatabase {
                 leaseSet: leaseSet,
                 expiresAt: min(now.addingTimeInterval(Self.leaseSetLifetime),
                                latestLease.addingTimeInterval(Self.leaseGracePeriod))
+            )
+        case .leaseSet2, .encryptedLeaseSet2, .metaLeaseSet2:
+            // LeaseSet2 (proposal 123): parse verifies the delegation block and
+            // the body signature over type+length+data before acceptance.
+            let leaseSet2 = try I2PLeaseSet2.parse(payload, expectedType: UInt16(entryType.rawValue))
+            let latestLease = leaseSet2.resolvedLeaseSet()?.leases.map(\.expiration).max()
+            let expiryCandidate = latestLease ?? leaseSet2.expiresAt
+            return StoredEntry(
+                entryType: entryType,
+                key: leaseSet2.destination.hash,
+                raw: payload,
+                routerInfo: nil,
+                leaseSet: nil,
+                expiresAt: min(now.addingTimeInterval(Self.leaseSetLifetime),
+                               expiryCandidate.addingTimeInterval(Self.leaseGracePeriod)),
+                leaseSet2: leaseSet2
             )
         }
     }

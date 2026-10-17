@@ -107,6 +107,21 @@ enum I2PCrossValidation {
         await runAsync("T4-ST-LSET-EXPIRY", rowID: "ST-LSET", "LeaseSet: expired leases rejected at ingest; grace-bounded lifetime") {
             try await leaseSetExpiryRejection()
         }
+        run("T4-ST-LS2-PARSE", rowID: "ST-LS2", "LeaseSet2 plain (type 2): serialize → parse → reserialize identical; 46-byte leases with cost intact; signature over type+length+data verified") {
+            try leaseSet2RoundTrip()
+        }
+        run("T4-ST-LS2-OFFLINE", rowID: "ST-LS2", "LeaseSet2 offline signing: transient delegation block signed by the permanent key; body signed by the transient key; forged delegation rejected") {
+            try leaseSet2OfflineSignatureRoundTrip()
+        }
+        run("T4-ST-LS2-ELS2", rowID: "ST-LS2", "Encrypted LeaseSet2 (type 3): envelope round trip with the encrypted body preserved byte-exact; destination ECIES key survives; tampering rejected") {
+            try encryptedLeaseSet2RoundTrip()
+        }
+        run("T4-ST-LS2-META", rowID: "ST-LS2", "Meta LeaseSet2 (type 5): entries carry complete inner LeaseSet2s; nested plain LS2 leases recoverable for delivery") {
+            try metaLeaseSet2RoundTrip()
+        }
+        await runAsync("T4-ST-LS2-RESOLVE", rowID: "ST-LS2", "NetDB resolution: LeaseSet2 store types 2/3/5 ingest after verification and resolve through lookup; tampered and expired entries rejected") {
+            try await leaseSet2NetdbResolution()
+        }
         run("T4-ST-PRIM-EDGE", rowID: "ST-PRIM", "Primitives: truncated and oversized reads rejected; nil dates") {
             try primitivesEdgeCases()
         }
@@ -579,6 +594,200 @@ enum I2PCrossValidation {
             throw I2PWireError.invalidFormat
         }
         return "expired leases rejected at ingest; accepted entries bounded by lease expiry + grace and the 1h lifetime"
+    }
+
+    // MARK: LeaseSet2 (proposal 123 store types 2/3/5)
+
+    private static func leaseSet2Sample() throws -> (I2PLeaseSet2, Data) {
+        let (destination, seed) = I2PSamples.sampleIdentity()
+        let leases = [
+            I2PLease2(gatewayHash: I2PCrypto.randomBytes(32), tunnelId: 0x1122_3344,
+                      expiration: Date().addingTimeInterval(600), cost: 5),
+            I2PLease2(gatewayHash: I2PCrypto.randomBytes(32), tunnelId: 0x0BAD_F00D,
+                      expiration: Date().addingTimeInterval(900), cost: 10),
+        ]
+        let ls2 = try I2PLeaseSet2.build(
+            storeType: .plain, destination: destination,
+            published: Date(), expiresOffsetSeconds: 1800, flags: 0,
+            leases: leases, signingSeed: seed)
+        return (ls2, seed)
+    }
+
+    private static func leaseSet2RoundTrip() throws -> String {
+        let (ls2, _) = try leaseSet2Sample()
+        let encoded = ls2.serialize()
+        let parsed = try I2PLeaseSet2.parse(encoded, expectedType: 2)
+        guard parsed.serialize() == encoded else { throw I2PWireError.invalidFormat }
+        guard parsed.storeType == .plain, parsed.leases.count == 2,
+              parsed.leases[0].tunnelId == 0x1122_3344, parsed.leases[0].cost == 5,
+              parsed.leases[1].cost == 10,
+              parsed.expiresAt > Date(), parsed.expiresAt.timeIntervalSince(parsed.published) == 1800 else {
+            throw I2PWireError.invalidFormat
+        }
+        guard parsed.verifySignature(), parsed.verifyTransientBlockSignature() else {
+            throw I2PWireError.invalidSignature
+        }
+        // Tampered body (inside the signed type+length+data range) rejected.
+        var tampered = encoded
+        tampered[60] ^= 0xff
+        guard expectThrow({ _ = try I2PLeaseSet2.parse(tampered) }) else {
+            throw I2PCrossValidationError.unexpectedSuccess
+        }
+        // A body signature made by a different key is rejected on parse.
+        let (_, otherSeed) = I2PSamples.sampleIdentity()
+        let wrongKey = try I2PLeaseSet2.build(
+            storeType: .plain, destination: ls2.destination,
+            published: ls2.published, expiresOffsetSeconds: ls2.expiresOffsetSeconds,
+            flags: 0, leases: ls2.leases, signingSeed: otherSeed)
+        guard expectThrow({ _ = try I2PLeaseSet2.parse(wrongKey.serialize()) }) else {
+            throw I2PCrossValidationError.unexpectedSuccess
+        }
+        return "\(encoded.count) bytes; type+length+data signed; 46-byte leases (gateway/tunnel/end/cost) intact; tampered and cross-key signatures rejected"
+    }
+
+    private static func leaseSet2OfflineSignatureRoundTrip() throws -> String {
+        let (destination, permanentSeed) = I2PSamples.sampleIdentity()
+        let transientSeed = I2PCrypto.generateEd25519Seed()
+        let transientPublicKey = I2PCrypto.ed25519PublicKey(fromSeed: transientSeed)
+        let offline = try I2PLeaseSet2OfflineSignature.sign(
+            sigType: .ed25519,
+            transientExpiration: Date().addingTimeInterval(3600),
+            transientPublicKey: transientPublicKey,
+            permanentSeed: permanentSeed)
+        let leases = [I2PLease2(gatewayHash: I2PCrypto.randomBytes(32), tunnelId: 7,
+                                expiration: Date().addingTimeInterval(600), cost: 3)]
+        let ls2 = try I2PLeaseSet2.build(
+            storeType: .plain, destination: destination,
+            published: Date(), expiresOffsetSeconds: 1800, flags: 0x0001,
+            offlineSignature: offline, leases: leases, signingSeed: transientSeed)
+        let encoded = ls2.serialize()
+        let parsed = try I2PLeaseSet2.parse(encoded)
+        guard parsed.serialize() == encoded, parsed.hasOfflineSignature,
+              parsed.offlineSignature == offline,
+              parsed.bodySigningPublicKey == transientPublicKey else {
+            throw I2PWireError.invalidFormat
+        }
+        // Parse already enforced both verifications: the delegation block under
+        // the permanent key and the body under the transient key. A delegation
+        // block signed by a different (forged) permanent key is rejected.
+        let (_, otherSeed) = I2PSamples.sampleIdentity()
+        let forged = try I2PLeaseSet2OfflineSignature.sign(
+            sigType: .ed25519,
+            transientExpiration: offline.transientExpiration,
+            transientPublicKey: offline.transientPublicKey,
+            permanentSeed: otherSeed)
+        let forgedLS2 = try I2PLeaseSet2.build(
+            storeType: .plain, destination: destination,
+            published: ls2.published, expiresOffsetSeconds: ls2.expiresOffsetSeconds,
+            flags: 0x0001, offlineSignature: forged, leases: leases,
+            signingSeed: transientSeed)
+        guard expectThrow({ _ = try I2PLeaseSet2.parse(forgedLS2.serialize()) }) else {
+            throw I2PCrossValidationError.unexpectedSuccess
+        }
+        return "transient delegation block signed by the permanent key; body signed by the transient key; forged delegation rejected"
+    }
+
+    private static func encryptedLeaseSet2RoundTrip() throws -> String {
+        let (destination, seed) = I2PSamples.sampleIdentity()
+        let inner = I2PCrypto.randomBytes(240)
+        let ls2 = try I2PLeaseSet2.build(
+            storeType: .encrypted, destination: destination,
+            published: Date(), expiresOffsetSeconds: 1800, flags: 0,
+            encryptedBody: inner, signingSeed: seed)
+        let encoded = ls2.serialize()
+        let parsed = try I2PLeaseSet2.parse(encoded, expectedType: 3)
+        guard parsed.serialize() == encoded, parsed.storeType == .encrypted,
+              parsed.encryptedBody == inner, parsed.leases.isEmpty else {
+            throw I2PWireError.invalidFormat
+        }
+        // The destination — and with it the ECIES delivery key — survives the envelope.
+        guard parsed.destination.encryptionPublicKey == destination.encryptionPublicKey,
+              parsed.destination.encryptionPublicKey.count == 32 else {
+            throw I2PWireError.invalidFormat
+        }
+        guard parsed.verifySignature(), parsed.verifyTransientBlockSignature() else {
+            throw I2PWireError.invalidSignature
+        }
+        var tampered = encoded
+        tampered[encoded.count - 70] ^= 0xff
+        guard expectThrow({ _ = try I2PLeaseSet2.parse(tampered) }) else {
+            throw I2PCrossValidationError.unexpectedSuccess
+        }
+        return "\(encoded.count) bytes; encrypted inner body preserved byte-exact; destination ECIES key survives the envelope; tampered signature rejected"
+    }
+
+    private static func metaLeaseSet2RoundTrip() throws -> String {
+        let (destination, seed) = I2PSamples.sampleIdentity()
+        let innerLeases = [I2PLease2(gatewayHash: I2PCrypto.randomBytes(32), tunnelId: 0x0AA0_BBCC,
+                                     expiration: Date().addingTimeInterval(600), cost: 7)]
+        let inner = try I2PLeaseSet2.build(
+            storeType: .plain, destination: destination,
+            published: Date(), expiresOffsetSeconds: 1800, flags: 0,
+            leases: innerLeases, signingSeed: seed)
+        let meta = try I2PLeaseSet2.build(
+            storeType: .meta, destination: destination,
+            published: Date(), expiresOffsetSeconds: 1800, flags: 0,
+            metaEntries: [I2PMetaLeaseSet2Entry(flags: 0, inner: inner)], signingSeed: seed)
+        let encoded = meta.serialize()
+        let parsed = try I2PLeaseSet2.parse(encoded, expectedType: 5)
+        guard parsed.serialize() == encoded, parsed.metaEntries.count == 1,
+              parsed.metaEntries[0].inner.storeType == .plain,
+              parsed.metaEntries[0].inner.leases == innerLeases else {
+            throw I2PWireError.invalidFormat
+        }
+        // The nested plain LS2's leases are delivery-usable through the resolver.
+        guard let resolved = parsed.resolvedLeaseSet(), resolved.leases.count == 1,
+              resolved.leases[0].tunnelId == 0x0AA0_BBCC else {
+            throw I2PWireError.invalidFormat
+        }
+        guard parsed.verifySignature() else { throw I2PWireError.invalidSignature }
+        return "meta LS2 round trips; nested plain LS2 entry re-parses; its leases recover for delivery; signature verified"
+    }
+
+    private static func leaseSet2NetdbResolution() async throws -> String {
+        let netdb = try makeNetDB()
+        // (a) A plain LeaseSet2 ingests and resolves by destination hash with
+        // delivery-usable lease entries.
+        let (plain, _) = try leaseSet2Sample()
+        try await netdb.ingestLeaseSet2(plain.serialize(), entryType: .leaseSet2)
+        guard await netdb.hasEntry(plain.destination.hash) else { throw I2PWireError.invalidFormat }
+        let resolved = await netdb.lookupLeaseSet2(plain.destination.hash, timeoutPerRound: 0.5, maxRounds: 1)
+        guard let resolved, resolved.storeType == .plain, resolved.leases.count == 2,
+              resolved.leases[0].tunnelId == 0x1122_3344 else {
+            throw I2PWireError.invalidFormat
+        }
+        // (b) An encrypted LeaseSet2 envelope ingests (signature-verified) and
+        // resolves; its inner body stays opaque per the b33 blinding/auth spec.
+        let (dest, seed) = I2PSamples.sampleIdentity()
+        let els2 = try I2PLeaseSet2.build(
+            storeType: .encrypted, destination: dest,
+            published: Date(), expiresOffsetSeconds: 1800, flags: 0,
+            encryptedBody: I2PCrypto.randomBytes(100), signingSeed: seed)
+        try await netdb.ingestLeaseSet2(els2.serialize(), entryType: .encryptedLeaseSet2)
+        let resolvedEncrypted = await netdb.lookupLeaseSet2(els2.destination.hash, timeoutPerRound: 0.5, maxRounds: 1)
+        guard let resolvedEncrypted, resolvedEncrypted.storeType == .encrypted,
+              !resolvedEncrypted.encryptedBody.isEmpty else {
+            throw I2PWireError.invalidFormat
+        }
+        // (c) Tampered LeaseSet2 payloads are rejected at ingest.
+        var tampered = plain.serialize()
+        tampered[60] ^= 0xff
+        guard await expectThrowAsync({ try await netdb.ingestLeaseSet2(tampered, entryType: .leaseSet2) }) else {
+            throw I2PCrossValidationError.unexpectedSuccess
+        }
+        // (d) An entry whose expiry has lapsed beyond the grace period is rejected.
+        let (expiredDest, expiredSeed) = I2PSamples.sampleIdentity()
+        let expired = try I2PLeaseSet2.build(
+            storeType: .plain, destination: expiredDest,
+            published: Date(timeIntervalSince1970: 1_000_000),
+            expiresOffsetSeconds: 60, flags: 0,
+            leases: [I2PLease2(gatewayHash: I2PCrypto.randomBytes(32), tunnelId: 1,
+                               expiration: Date(timeIntervalSince1970: 1_000_060), cost: 1)],
+            signingSeed: expiredSeed)
+        guard await expectThrowAsync({ try await netdb.ingestLeaseSet2(expired.serialize(), entryType: .leaseSet2) }) else {
+            throw I2PCrossValidationError.unexpectedSuccess
+        }
+        return "plain/encrypted LeaseSet2s ingest after signature verification and resolve through lookup; leases delivery-usable; tampered and expired entries rejected"
     }
 
     private static func primitivesEdgeCases() throws -> String {

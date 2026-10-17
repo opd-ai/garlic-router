@@ -148,6 +148,7 @@ enum I2PMainnetVerification {
         await run("Mainnet well-known destination resolved to a LeaseSet over the live DHT") {
             let destinations = try await I2PMainnetHosts.fetchWellKnownDestinations(limit: 6)
             var attempted: [String] = []
+            var envelopeVerified: [String] = []
             var lastFailure: Error = I2PMainnetFailure(message: "no lookup attempted")
             for destination in destinations {
                 let started = Date()
@@ -156,24 +157,47 @@ enum I2PMainnetVerification {
                     let latency = Date().timeIntervalSince(started) * 1000
                     resolvedLeaseSet = (destination.name, leaseSet)
                     await checkpoints.capture(netDB: netDB, ntcp2: ntcp2, pool: tunnelPool)
-                    return String(format: "%@ resolved over the live DHT in %.0fms: %d lease(s), gateways %@, tunnel IDs %@",
+                    return String(format: "%@ resolved over the live DHT in %.0fms as a classic LeaseSet: %d lease(s), gateways %@, tunnel IDs %@",
                                   destination.name, latency, leaseSet.leases.count,
                                   leaseSet.leases.prefix(2).map { String($0.gatewayHash.hex.prefix(10)) }.joined(separator: ","),
                                   leaseSet.leases.prefix(2).map { String($0.tunnelId) }.joined(separator: ","))
                 }
-                attempted.append(destination.name)
+                // LeaseSet2 (proposal 123 store types 2/3/5): parsed and
+                // signature-verified at ingest; the lease entries resolve for
+                // delivery through the LS2 resolution path.
+                if let entry, let leaseSet2 = entry.leaseSet2 {
+                    let latency = Date().timeIntervalSince(started) * 1000
+                    if let converted = leaseSet2.resolvedLeaseSet() {
+                        resolvedLeaseSet = (destination.name, converted)
+                        await checkpoints.capture(netDB: netDB, ntcp2: ntcp2, pool: tunnelPool)
+                        return String(format: "%@ resolved over the live DHT in %.0fms as LeaseSet2 store type %d (ECIES destination, offline-signing flag %@): %d lease entry(s) recovered for delivery — gateway %@, tunnel IDs %@",
+                                      destination.name, latency, leaseSet2.storeType.rawValue,
+                                      leaseSet2.hasOfflineSignature ? "set" : "absent",
+                                      converted.leases.count,
+                                      converted.leases.prefix(2).map { String($0.gatewayHash.hex.prefix(10)) }.joined(separator: ","),
+                                      converted.leases.prefix(2).map { String($0.tunnelId) }.joined(separator: ","))
+                    }
+                    // The envelope itself verified (destination ECIES key +
+                    // delegation block + body signature) but the lease entries
+                    // ride the encrypted inner body: per the LS2 spec they only
+                    // decrypt under the b33 blinding/auth path.
+                    envelopeVerified.append("\(destination.name) (type \(leaseSet2.storeType.rawValue))")
+                    lastFailure = I2PMainnetFailure(message: "\(destination.name): a LeaseSet2 (store type \(leaseSet2.storeType.rawValue)) answered and its envelope verified — destination identity with offline/transient signing keys, signature over the LS2 body, ECIES key present — but its lease entries ride the encrypted inner body, recoverable only through the spec's b33 blinding/auth decryption path")
+                    continue
+                }
                 if let entry {
                     lastFailure = I2PMainnetFailure(message: "\(destination.name): the live response was a RouterInfo, not a LeaseSet")
                 } else {
                     lastFailure = I2PMainnetFailure(message: "\(destination.name): no parseable LeaseSet answered over the live DHT")
                 }
+                attempted.append(destination.name)
             }
-            throw I2PMainnetFailure(message: "no modern-parseable LeaseSet among \(attempted.count) well-known mainnet destinations (\(attempted.joined(separator: ", "))); last: \(String(describing: lastFailure)) — mainnet publishes LeaseSet2 for ECIES destinations and LeaseSet v1 with legacy encryption keys for the rest, both outside the current parser scope")
+            throw I2PMainnetFailure(message: "no lease-bearing LeaseSet (v1 or LeaseSet2 with recoverable entries) among \(attempted.count) well-known mainnet destinations (\(attempted.joined(separator: ", "))); \(envelopeVerified.count) encrypted/meta LeaseSet2 envelope(s) verified but expose no recoverable leases (b33 blinding/auth decryption remains spec-gated); last: \(String(describing: lastFailure))")
         }
 
         await run("Mainnet garlic end-to-end delivery to the resolved lease gateway") {
             guard let resolvedLeaseSet else {
-                throw I2PMainnetFailure(message: "no modern-parseable LeaseSet was resolved in the destination scenario — garlic construction and delivery were not attempted (policy/parser scope)")
+                throw I2PMainnetFailure(message: "no lease-bearing LeaseSet was resolved in the destination scenario — garlic construction and delivery were not attempted (encrypted LeaseSet2 inner bodies remain gated on the b33 blinding/auth decryption path)")
             }
             let leaseSet = resolvedLeaseSet.leaseSet
             let now = Date()
