@@ -425,3 +425,44 @@ struct I2PSAMSessionSummary {
     let bytesTx: Int
     let bytesRx: Int
 }
+// MARK: - Session key persistence
+
+/// Optional session persistence (PERSISTENT=true): destination private keys
+/// are saved under the session nickname so a re-created session restores the
+/// same destination across bridge restarts.
+final class I2PSAMKeyStore {
+    private let directory: URL
+    private let lock = NSLock()
+
+    init(directory: URL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+        .first!.appendingPathComponent("i2p-sam-keys", isDirectory: true)) {
+        self.directory = directory
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    /// Filenames are keyed on the nickname's SHA-256 so any nickname string
+    /// maps to exactly one file.
+    private func file(for nickname: String) -> URL {
+        directory.appendingPathComponent(I2PCrypto.sha256(Data(nickname.utf8)).hex + ".key")
+    }
+
+    func load(nickname: String) -> Data? {
+        lock.lock(); defer { lock.unlock() }
+        guard let raw = try? Data(contentsOf: file(for: nickname)),
+              let decoded = I2PSAMEncoding.normalizedBase64(String(decoding: raw, as: UTF8.self)) else {
+            return nil
+        }
+        return decoded
+    }
+
+    func save(nickname: String, privateKey: Data) {
+        lock.lock(); defer { lock.unlock() }
+        try? privateKey.base64EncodedString().write(to: file(for: nickname),
+                                                    atomically: true, encoding: .utf8)
+    }
+
+    func remove(nickname: String) {
+        lock.lock(); defer { lock.unlock() }
+        try? FileManager.default.removeItem(at: file(for: nickname))
+    }
+}

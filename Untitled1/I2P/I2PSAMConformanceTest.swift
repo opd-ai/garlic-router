@@ -364,6 +364,8 @@ enum I2PSAMConformanceTest {
         await run("SAM STREAM CONNECT/ACCEPT end-to-end through tunnels", streamE2ETest)
         await run("SAM DATAGRAM SEND fragmentation + reassembly", datagramTest)
         await run("SAM RAW anonymous datagram delivery", rawTest)
+        await run("SAM session persistence (save/restore private keys)", persistenceTest)
+        await run("SAM load: 3 concurrent streams · latency + throughput", loadTest)
         return results
     }
 
@@ -645,6 +647,145 @@ enum I2PSAMConformanceTest {
         aliceClient.close()
         bobClient.close()
         return "RAW datagram delivered anonymously without a return destination"
+    }
+
+    /// Session persistence: PERSISTENT=true saves the destination's private
+    /// keys under the nickname; a later session with the same nickname
+    /// restores the same destination. Plain TRANSIENT stays fresh.
+    private static func persistenceTest() async throws -> String {
+        let rig = try SAMTestRig(label: "persist")
+        rig.start()
+        defer { rig.stop() }
+        guard let port = await waitForPort(rig) else { throw I2PSAMError.timeout }
+
+        let first = SAMTestClient()
+        try await first.connect(port: port)
+        first.send("HELLO VERSION MIN=3.0 MAX=3.3")
+        _ = try await first.readLine()
+        first.send("SESSION CREATE STYLE=STREAM ID=p1 DESTINATION=TRANSIENT PERSISTENT=true")
+        let status1 = try await first.readLine()
+        guard status1.hasPrefix("SESSION STATUS RESULT=OK"),
+              let destination1 = replyValue(after: "DESTINATION", in: status1) else {
+            throw I2PSAMError.invalidCommand("persistent session failed: \(status1)")
+        }
+        first.close()
+        // Allow the bridge to tear the session down before re-creating it.
+        try await Task.sleep(for: .milliseconds(200))
+
+        let second = SAMTestClient()
+        try await second.connect(port: port)
+        second.send("HELLO VERSION MIN=3.0 MAX=3.3")
+        _ = try await second.readLine()
+        second.send("SESSION CREATE STYLE=STREAM ID=p1 DESTINATION=TRANSIENT PERSISTENT=true")
+        let status2 = try await second.readLine()
+        guard status2.hasPrefix("SESSION STATUS RESULT=OK"),
+              let restored = replyValue(after: "DESTINATION", in: status2),
+              restored == destination1 else {
+            throw I2PSAMError.invalidCommand("session persistence failed: \(status2)")
+        }
+
+        // Without PERSISTENT, a TRANSIENT session gets a fresh destination.
+        second.send("SESSION CREATE STYLE=STREAM ID=p2 DESTINATION=TRANSIENT")
+        let status3 = try await second.readLine()
+        guard status3.hasPrefix("SESSION STATUS RESULT=OK"),
+              let fresh = replyValue(after: "DESTINATION", in: status3),
+              fresh != destination1 else {
+            throw I2PSAMError.invalidCommand("transient semantics failed: \(status3)")
+        }
+        second.close()
+        return "persistent session restored the same destination; plain TRANSIENT stayed fresh"
+    }
+
+    /// Load validation: three concurrent stream pairs (each on its own
+    /// connection, per SAM v3 one-stream-per-connection), latency probes and
+    /// a bidirectional bulk round-trip per stream.
+    private static func loadTest() async throws -> String {
+        let aliceRig = try SAMTestRig(label: "load-a")
+        let bobRig = try SAMTestRig(label: "load-b")
+        aliceRig.start()
+        bobRig.start()
+        defer { aliceRig.stop(); bobRig.stop() }
+        guard let alicePort = await waitForPort(aliceRig), let bobPort = await waitForPort(bobRig) else {
+            throw I2PSAMError.timeout
+        }
+
+        let pairs = 3
+        var aliceClients: [SAMTestClient] = []
+        var bobClients: [SAMTestClient] = []
+        defer {
+            aliceClients.forEach { $0.close() }
+            bobClients.forEach { $0.close() }
+        }
+        for index in 0..<pairs {
+            let aliceClient = SAMTestClient()
+            try await aliceClient.connect(port: alicePort)
+            let aliceDestination = try await sampleSessionHandshake(aliceClient, id: "la\(index)")
+            let bobClient = SAMTestClient()
+            try await bobClient.connect(port: bobPort)
+            let bobDestination = try await sampleSessionHandshake(bobClient, id: "lb\(index)")
+            try await crossPublish(from: aliceRig, destinationHash: try destinationFromB64(aliceDestination).hash, into: bobRig)
+            try await crossPublish(from: bobRig, destinationHash: try destinationFromB64(bobDestination).hash, into: aliceRig)
+
+            aliceClient.send("STREAM ACCEPT ID=la\(index)")
+            bobClient.send("STREAM CONNECT ID=lb\(index) DESTINATION=\(aliceDestination)")
+            let connectStatus = try await bobClient.readLine()
+            guard connectStatus.hasPrefix("STREAM STATUS RESULT=OK") else {
+                throw I2PSAMError.invalidCommand("pair \(index) connect failed: \(connectStatus)")
+            }
+            let acceptStatus = try await aliceClient.readLine()
+            guard acceptStatus.hasPrefix("STREAM STATUS RESULT=OK") else {
+                throw I2PSAMError.invalidCommand("pair \(index) accept failed: \(acceptStatus)")
+            }
+            aliceClients.append(aliceClient)
+            bobClients.append(bobClient)
+        }
+
+        // Concurrent workout: latency probes then a bidirectional bulk
+        // transfer on every stream, all three pairs running at once.
+        let probe = I2PCrypto.randomBytes(32)
+        let bulk = I2PCrypto.randomBytes(8192)
+        var totalRTTms = 0.0
+        var aggregateKBps = 0.0
+        let started = Date()
+        try await withThrowingTaskGroup(of: (rttMs: Double, kbps: Double).self) { group in
+            for index in 0..<pairs {
+                group.addTask {
+                    var rttTotal = 0.0
+                    for _ in 0..<6 {
+                        let sent = Date()
+                        bobClients[index].sendRaw(probe)
+                        let echoed = try await aliceClients[index].readBytes(probe.count)
+                        guard echoed == probe else {
+                            throw I2PSAMError.invalidCommand("latency probe mismatch")
+                        }
+                        aliceClients[index].sendRaw(echoed)
+                        _ = try await bobClients[index].readBytes(probe.count)
+                        rttTotal += Date().timeIntervalSince(sent)
+                    }
+                    let roundTripStart = Date()
+                    bobClients[index].sendRaw(bulk)
+                    let inbound = try await aliceClients[index].readBytes(bulk.count)
+                    guard inbound == bulk else {
+                        throw I2PSAMError.invalidCommand("bulk inbound mismatch")
+                    }
+                    aliceClients[index].sendRaw(inbound)
+                    let outbound = try await bobClients[index].readBytes(bulk.count)
+                    guard outbound == bulk else {
+                        throw I2PSAMError.invalidCommand("bulk echo mismatch")
+                    }
+                    let elapsed = Date().timeIntervalSince(roundTripStart)
+                    let kbps = elapsed > 0 ? Double(bulk.count * 2) / elapsed / 1024 : 0
+                    return (rttMs: (rttTotal / 6) * 1000, kbps: kbps)
+                }
+            }
+            for try await result in group {
+                totalRTTms += result.rttMs
+                aggregateKBps += result.kbps
+            }
+        }
+        let elapsed = Date().timeIntervalSince(started)
+        return String(format: "3 concurrent streams verified · avg RTT %.1f ms · %.0f KB/s aggregate · %.1f s workout",
+                      totalRTTms / Double(pairs), aggregateKBps, elapsed)
     }
 
     private static func waitForPort(_ rig: SAMTestRig, timeout: TimeInterval = 10) async -> UInt16? {

@@ -106,6 +106,8 @@ final class I2PSAMServer {
     private(set) var log: [String] = []
     var onChange: (() -> Void)?
     let transport: I2PSAMGarlicTransport
+    /// Optional session key persistence for PERSISTENT=true sessions.
+    let keyStore = I2PSAMKeyStore()
     private let dispatcher: I2PSAMGarlicDispatcher
     private var renewalTask: Task<Void, Never>?
 
@@ -509,12 +511,26 @@ final class I2PSAMConnection {
             throw I2PSAMError.invalidCommand("hello_required")
         }
         lock.unlock()
+        // Optional session persistence: PERSISTENT=true saves the destination's
+        // private keys under the nickname and restores them on re-creation.
         let keys: I2PSAMDestinationKeys
+        let persistent = options["PERSISTENT"] == "true"
         if destinationSpec == "TRANSIENT" {
-            keys = I2PSAMDestinationKeys.generate()
+            if persistent, let saved = server.keyStore.load(nickname: id),
+               let restored = try? I2PSAMDestinationKeys.parse(saved) {
+                keys = restored
+            } else {
+                keys = I2PSAMDestinationKeys.generate()
+                if persistent {
+                    server.keyStore.save(nickname: id, privateKey: keys.privateKeyData)
+                }
+            }
         } else if let data = I2PSAMEncoding.normalizedBase64(destinationSpec),
                   let parsed = try? I2PSAMDestinationKeys.parse(data) {
             keys = parsed
+            if persistent {
+                server.keyStore.save(nickname: id, privateKey: keys.privateKeyData)
+            }
         } else {
             throw I2PSAMError.invalidDestination
         }

@@ -136,3 +136,14 @@ SEND with reassembly, and anonymous RAW datagrams.
 - App integration: `I2PRouterAppContext.shared.samServer` owns the listener;
   the router's `start()` boots it. The SAM tab exposes status, sessions, the
   command reference and the activity log.
+## Session persistence
+
+`SESSION CREATE` accepts an optional `PERSISTENT=true` option. When set, the bridge saves the destination's private keys under the session nickname (in `Application Support/i2p-sam-keys`) and restores them on a later `SESSION CREATE` with the same nickname, giving the session a stable destination across reconnects and bridge restarts. Without the option, `TRANSIENT` always generates a fresh destination.
+
+```
+SESSION CREATE STYLE=STREAM ID=echo DESTINATION=TRANSIENT PERSISTENT=true
+```
+
+## Load characteristics
+
+The conformance suite includes a load validation: three concurrent stream pairs (each on its own connection, per SAM v3's one-stream-per-connection model) run at the same time over the loopback router rig. Each stream performs six latency probes (32-byte round-trips, reported as average RTT in ms) and one 8 KB bidirectional bulk transfer (reported in KB/s). The results appear in the app's self-test card alongside the other SAM conformance results, giving a baseline throughput/latency reference for the bridge as tunnels and transports evolve.
