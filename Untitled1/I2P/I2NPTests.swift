@@ -182,10 +182,13 @@ private static func typedPayloadTest() async throws -> String {
         let local = I2PDeliveryInstructions(mode: .local)
         let (parsedLocal, localConsumed) = try I2PDeliveryInstructions.parse(local.serialize())
         guard parsedLocal.mode == .local, localConsumed == 2 else { throw I2NPError.invalidPayload }
-        let tunnel = I2PDeliveryInstructions(mode: .tunnel, tunnelID: 0xDEADBEEF, delayMilliseconds: 250)
+        let gateway = I2PCrypto.randomBytes(32)
+        let tunnel = I2PDeliveryInstructions(mode: .tunnel, tunnelID: 0xDEADBEEF,
+                                             routerHash: gateway, delayMilliseconds: 250)
         let (parsedTunnel, tunnelConsumed) = try I2PDeliveryInstructions.parse(tunnel.serialize())
         guard parsedTunnel.mode == .tunnel, parsedTunnel.tunnelID == 0xDEADBEEF,
-              parsedTunnel.delayMilliseconds == 250, tunnelConsumed == 11 else {
+              parsedTunnel.routerHash == gateway,
+              parsedTunnel.delayMilliseconds == 250, tunnelConsumed == 42 else {
             throw I2NPError.invalidPayload
         }
         let router = I2PDeliveryInstructions(mode: .router, routerHash: I2PCrypto.randomBytes(32))
@@ -196,7 +199,7 @@ private static func typedPayloadTest() async throws -> String {
         let delayed = I2PDeliveryInstructions(mode: .local, delayMilliseconds: 1_000)
         let (parsedDelayed, _) = try I2PDeliveryInstructions.parse(delayed.serialize())
         guard parsedDelayed.delayMilliseconds == 1_000 else { throw I2NPError.invalidPayload }
-        return "local (2 B), tunnel (11 B), router (35 B) instructions verified"
+        return "local (2 B), tunnel (42 B: tunnel ID + gateway), router (35 B) instructions verified"
     }
 private struct I2NPTestNode {
     let routerHash: Data

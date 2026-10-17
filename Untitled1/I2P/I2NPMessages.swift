@@ -243,7 +243,9 @@ struct I2PDeliveryInstructions {
         case .local:
             precondition(tunnelID == nil && routerHash == nil)
         case .tunnel:
-            precondition(tunnelID != nil && routerHash == nil)
+            // Tunnel delivery names both the tunnel and its gateway router
+            // (real I2P format: [1][tunnelID][routerHash]).
+            precondition(tunnelID != nil && routerHash?.count == 32)
         case .router:
             precondition(tunnelID == nil && routerHash?.count == 32)
         }
@@ -264,6 +266,7 @@ struct I2PDeliveryInstructions {
             break
         case .tunnel:
             w.integer(tunnelID!)
+            w.raw(routerHash!)
         case .router:
             w.raw(routerHash!)
         }
@@ -282,6 +285,7 @@ struct I2PDeliveryInstructions {
             break
         case .tunnel:
             tunnelID = try r.integer()
+            routerHash = try r.raw(32)
         case .router:
             routerHash = try r.raw(32)
         }
