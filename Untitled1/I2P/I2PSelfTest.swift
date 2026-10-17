@@ -93,6 +93,7 @@ enum I2PSelfTest {
         results.append(contentsOf: await I2PGarlicSelfTest.runAll())
         results.append(contentsOf: await I2PRouterStatusSelfTest.runAll())
         results.append(contentsOf: I2PSpecComplianceSelfTest.runAll())
+        results.append(contentsOf: await I2PSAMConformanceTest.runAll())
         return results
     }
 

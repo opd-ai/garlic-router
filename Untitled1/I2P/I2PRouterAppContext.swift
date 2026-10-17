@@ -21,8 +21,30 @@ final class I2PRouterAppContext {
     private let deliveryTransport: I2PNTCP2DeliveryTransport
     private let i2npRouter: I2NPMessageRouter
     private let tunnelPool: I2PTunnelPool
+    private let tunnelBuildHub: I2PTunnelBuildHub
+    private let tunnelBuildTransport: I2PTunnelBuildTransport
+    private let tunnelParticipant: I2PTunnelParticipant
+    private let tunnelPeerProvider: I2PTunnelPeerProvider
     private var started = false
     private var ntcp2Bridge: NTCP2I2NPBridge?
+
+    /// The SAMv3.3 API socket bound to this router (port 7656 by default).
+    lazy var samServer: I2PSAMServer = {
+        let core = I2PSAMRouterCore(
+            routerHash: self.routerHash,
+            netDB: self.netDB,
+            participant: self.tunnelParticipant,
+            buildTransport: self.tunnelBuildTransport,
+            peerProvider: self.tunnelPeerProvider,
+            delivery: self.deliveryTransport,
+            i2npRouter: self.i2npRouter,
+            controlledRouter: { [weak self] hash in
+                guard let self, hash == self.routerHash else { return nil }
+                return self.i2npRouter
+            }
+        )
+        return I2PSAMServer(core: core, port: 7656)
+    }()
 
     private init() {
         // Router identity: an Ed25519 signing key plus an X25519 encryption
@@ -93,17 +115,21 @@ final class I2PRouterAppContext {
             transport: buildTransport
         )
         buildHub.register(participant)
+        tunnelBuildHub = buildHub
+        tunnelBuildTransport = buildTransport
+        tunnelParticipant = participant
+        tunnelPeerProvider = EmptyTunnelPeerProvider()
         tunnelPool = I2PTunnelPool(
             localRouterHash: routerHash,
             participant: participant,
             transport: buildTransport,
-            peerProvider: EmptyTunnelPeerProvider()
+            peerProvider: tunnelPeerProvider
         )
         engine.attach(tunnelPool: tunnelPool)
     }
 
     /// Starts the router: listener, netdb maintenance, tunnel pool
-    /// maintenance and the status engine's event stream.
+    /// maintenance, the status engine's event stream, and the SAMv3.3 socket.
     func start() {
         guard !started else { return }
         started = true
@@ -114,6 +140,7 @@ final class I2PRouterAppContext {
         Task { await netDB.startMaintenance() }
         tunnelPool.start()
         engine.start()
+        samServer.start()
     }
 
     /// A signed RouterInfo for our own identity (real key material).

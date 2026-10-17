@@ -22,6 +22,10 @@ struct ContentView: View {
                 .tabItem {
                     Label("Router", systemImage: "speedometer")
                 }
+            SAMView()
+                .tabItem {
+                    Label("SAM", systemImage: "terminal")
+                }
         }
         .tint(accent)
         .preferredColorScheme(.dark)
