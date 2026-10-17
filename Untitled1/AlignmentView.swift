@@ -64,9 +64,13 @@ struct AlignmentView: View {
         isRunning = true
         Task {
             let runResults = await I2PCrossValidation.runAll()
-            results = runResults
-            lastRunAt = I2PCrossValidation.lastRunAt
-            isRunning = false
+            // State mutation happens on the main actor — publishing @State from
+            // a background thread crashes the app on modern iOS.
+            await MainActor.run {
+                results = runResults
+                lastRunAt = I2PCrossValidation.lastRunAt
+                isRunning = false
+            }
         }
     }
 

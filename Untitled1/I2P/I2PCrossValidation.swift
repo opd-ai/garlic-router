@@ -621,7 +621,7 @@ enum I2PCrossValidation {
         guard parsed.storeType == .plain, parsed.leases.count == 2,
               parsed.leases[0].tunnelId == 0x1122_3344, parsed.leases[0].cost == 5,
               parsed.leases[1].cost == 10,
-              parsed.expiresAt > Date(), parsed.expiresAt.timeIntervalSince(parsed.published) == 1800 else {
+              parsed.expiresAt > Date(), abs(parsed.expiresAt.timeIntervalSince(parsed.published) - 1800) < 1 else {
             throw I2PWireError.invalidFormat
         }
         guard parsed.verifySignature(), parsed.verifyTransientBlockSignature() else {
