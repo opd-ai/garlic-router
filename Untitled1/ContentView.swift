@@ -93,8 +93,8 @@ struct ContentView: View {
         }
     }
 
-    /// The production readiness audit runs the existing compliance machinery
-    /// plus dedicated readiness probes; it performs no mainnet traffic.
+    /// Runs the bounded mobile-safe readiness checks. Expensive cryptographic,
+    /// Keychain-mutating and live-transport suites are intentionally excluded.
     private func runReadinessAudit() {
         guard !readinessRunning else { return }
         readinessRunning = true
@@ -113,7 +113,7 @@ struct ContentView: View {
             Button {
                 runReadinessAudit()
             } label: {
-                Label(readinessRunning ? "Running readiness checks…" : "Run readiness audit",
+                Label(readinessRunning ? "Running safe checks…" : "Run readiness audit",
                       systemImage: readinessRunning ? "hourglass" : "stethoscope")
                     .font(.subheadline.weight(.semibold))
                     .frame(maxWidth: .infinity)
@@ -127,7 +127,7 @@ struct ContentView: View {
             if !readinessResults.isEmpty {
                 let passed = readinessResults.filter(\.passed).count
                 auditResultsSection(passed, of: readinessResults.count,
-                                    allPassedSummary: "\(passed) of \(readinessResults.count) checks passed",
+                                    allPassedSummary: "Bounded checks passed · extended probes not run",
                                     findingsSummary: "\(passed) of \(readinessResults.count) checks passed — findings below",
                                     isExpanded: $readinessExpanded) {
                     ForEach(readinessResults.indices, id: \.self) { index in
