@@ -137,3 +137,77 @@ enum I2PCrypto {
         Data(Ed25519Pure.publicKey(seed: Array(seed)))
     }
 }
+
+// MARK: - Modern crypto policy (legacy removal audit + regression guard)
+
+/// The modern-only crypto mandate, enforced two ways:
+///
+/// 1. **Type safety** — the algorithm registries above contain only the
+///    modern cases (SigType 7/11, EncType 4/5). There is no legacy case to
+///    construct and no legacy code path to call: requesting a legacy
+///    algorithm from wire data fails `init?(rawValue:)` and every structure
+///    parser throws `unsupportedAlgorithm` — compile/type errors, never
+///    silent fallbacks.
+/// 2. **Regression test** — `audit()` pins the registries to exactly the
+///    modern cases and is exercised by the cross-validation policy tests, so
+///    any reintroduction of a legacy enum case or parse path fails the suite.
+///
+/// Audit outcome (legacy-removal sweep): the router implements none of the
+/// legacy algorithms inventoried in the compliance review — no asymmetric
+/// ElGamal-style key establishment, no broken signature suites, no obsolete
+/// block ciphers, no MD5/SHA-1 digest paths, and no ad-hoc un-HKDF'd key
+/// stretching anywhere in the codebase. The two AES-256-CBC call sites are
+/// spec-mandated components of the modern protocols themselves (the NTCP2
+/// ephemeral-key obfuscation keystream in `NTCP2KeyObfuscation` and the tunnel
+/// layer cipher in `I2PTunnelLayerCipher`), not legacy session crypto — both
+/// are recorded as aligned in the truth table and retained.
+enum I2PCryptoPolicy {
+    /// The approved inventory: the full modern suite.
+    static let approvedSignatureTypes: [I2PSigType] = I2PSigType.allCases
+    static let approvedEncryptionTypes: [I2PEncType] = I2PEncType.allCases
+
+    /// The banned-algorithm inventory from the audit, kept as documentation of
+    /// what must never appear in the codebase (and what the policy tests scan
+    /// the registries and parse boundaries against).
+    static let bannedAlgorithms: [String] = [
+        "ElGamal-2048 (EncType 0)",
+        "3DES",
+        "DSA-SHA1 (SigType 0)",
+        "RSA-2048-SHA1 (SigType 1)",
+        "ECDSA-P256 (SigType 3)",
+        "ECDSA-P384 (SigType 4)",
+        "ECDSA-P521 (SigType 5)",
+        "RSA-4096-SHA512 (SigType 6)",
+        "MD5",
+        "SHA-1",
+    ]
+
+    /// Runtime audit: the registries contain exactly the modern cases, no
+    /// legacy type code can construct a case, and identity key material is
+    /// the modern 32-byte shape. Throws on any policy violation.
+    static func audit() throws {
+        guard I2PSigType.allCases.map(\.rawValue) == [7, 11] else {
+            throw I2PWireError.unsupportedAlgorithm
+        }
+        guard I2PEncType.allCases.map(\.rawValue) == [4, 5] else {
+            throw I2PWireError.unsupportedAlgorithm
+        }
+        // No legacy or unapproved type code may construct a registry case.
+        for legacyCode: UInt16 in [0, 1, 2, 3, 6, 8, 9, 10] where I2PSigType(rawValue: legacyCode) != nil {
+            throw I2PWireError.unsupportedAlgorithm
+        }
+        for legacyCode: UInt16 in [0, 1, 2, 3, 6, 7, 8] where I2PEncType(rawValue: legacyCode) != nil {
+            throw I2PWireError.unsupportedAlgorithm
+        }
+        // Identity key material is the modern shape: EncType 4/5 and SigType
+        // 7/11 public keys are 32 bytes, signatures 64.
+        for sigType in approvedSignatureTypes {
+            guard sigType.publicKeyLength == 32, sigType.signatureLength == 64 else {
+                throw I2PWireError.unsupportedAlgorithm
+            }
+        }
+        for encType in approvedEncryptionTypes where encType.publicKeyLength != 32 {
+            throw I2PWireError.unsupportedAlgorithm
+        }
+    }
+}

@@ -9,10 +9,10 @@
 //  type (2), signature length (2), padding length (1), version length (2),
 //  signer ID length (2), content length (8), timestamp (8), then version,
 //  signer, content (zip), padding and signature. The reseed container
-//  signature is NOT verified — a documented deviation: RSA/ECDSA container
-//  signatures sit outside the modern crypto stack. Integrity rides on the
-//  HTTPS transport, and every RouterInfo inside is Ed25519 signature-verified
-//  again when ingested into the netdb.
+//  signature is NOT verified — a documented deviation: the container signature
+//  algorithms used in the wild sit outside the modern-only crypto policy.
+//  Integrity rides on the HTTPS transport, and every RouterInfo inside is
+//  Ed25519 signature-verified again when ingested into the netdb.
 //
 //  Zip layout: end-of-central-directory scan, central directory entries and
 //  local headers; entries are stored (method 0) or raw-deflate (method 8),

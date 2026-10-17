@@ -240,6 +240,17 @@ enum I2PSpecTruthTable {
             edges: "Keyed and unkeyed modes must match RFC 7693 vectors byte-for-byte.",
             status: .pendingWireVerification,
             tests: ["T4-CR-BLAKE2B-KAT"]),
+        row("CR-POLICY", .crypto,
+            "Modern-only crypto policy: the registries carry exactly SigType 7/11 and EncType 4/5; legacy algorithms and legacy wire input are rejected at every parse boundary.",
+            spec: "I2P common_structures_spec#type_SignatureType/#type_EncType; modern crypto mandate from the compliance review",
+            java: "net.i2p.crypto suite (modern algorithms only)",
+            swift: "I2PCrypto.swift (registries + I2PCryptoPolicy audit) + I2PStructures.swift (legacy certificate rejection)",
+            wire: "Algorithm identifiers on the wire are 2-byte type codes; only 0x04/0x05 (EncType) and 0x07/0x0B (SigType) decode. Null certificates (type 0) and any legacy/unapproved type code throw unsupportedAlgorithm at parse.",
+            encoding: "Registry enums contain no legacy cases, so legacy requests are type errors, never silent fallbacks; the AES-256-CBC call sites in NTCP2KeyObfuscation and I2PTunnelLayerCipher are spec-mandated modern-protocol components and are the only AES-CBC usage.",
+            crypto: "Modern suite only: X25519 (EncType 4/5), Ed25519/Ed25519ph (SigType 7/11), ChaCha20-Poly1305 AEAD, HKDF-SHA256, SHA-256 and BLAKE2b.",
+            edges: "The policy audit pins the registries and is exercised by the cross-validation suite; legacy peer identities (null certificates / legacy type codes) cannot be ingested by the netdb because every entry is signature-parsed through the modern-only certificate path.",
+            status: .aligned,
+            tests: ["T4-CR-POLICY-REGISTRY", "T4-CR-POLICY-LEGACY-REJECT"]),
     ]
 
     // MARK: Structures

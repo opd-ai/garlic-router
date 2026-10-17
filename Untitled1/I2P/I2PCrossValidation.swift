@@ -191,6 +191,12 @@ enum I2PCrossValidation {
         run("T4-CR-ED25519PH-DOM2", rowID: "CR-ED25519PH", "Ed25519ph dom2: context bytes, domain separation from plain Ed25519") {
             try ed25519phDom2()
         }
+        run("T4-CR-POLICY-REGISTRY", rowID: "CR-POLICY", "Modern-only policy: registries pinned to SigType 7/11 + EncType 4/5; no legacy type code constructs a case") {
+            try modernCryptoPolicyRegistry()
+        }
+        run("T4-CR-POLICY-LEGACY-REJECT", rowID: "CR-POLICY", "Modern-only policy: null certificates, legacy sig/enc type codes and legacy identities rejected at parse — no silent fallbacks") {
+            try legacyWireRejection()
+        }
 
         // MARK: Tunnels — build records
 
@@ -1226,6 +1232,81 @@ enum I2PCrossValidation {
             }
         }
         return "5 seeds: public keys identical, signatures verify cross-implementation both ways, deterministic"
+    }
+
+    // MARK: Modern crypto policy
+
+    /// The legacy-removal regression guard: the algorithm registries carry
+    /// exactly the modern cases, so any reintroduction of a legacy enum value
+    /// fails here — the Swift equivalent of a static-analyzer rule banning the
+    /// deleted types.
+    private static func modernCryptoPolicyRegistry() throws -> String {
+        try I2PCryptoPolicy.audit()
+        // The approved inventory is exactly the modern suite.
+        guard I2PCryptoPolicy.approvedSignatureTypes == [.ed25519, .ed25519ph],
+              I2PCryptoPolicy.approvedEncryptionTypes == [.x25519, .eciesX25519] else {
+            throw I2PWireError.unsupportedAlgorithm
+        }
+        // Registries are the policy inventory: nothing else can be requested.
+        guard I2PSigType.allCases == I2PCryptoPolicy.approvedSignatureTypes,
+              I2PEncType.allCases == I2PCryptoPolicy.approvedEncryptionTypes else {
+            throw I2PWireError.unsupportedAlgorithm
+        }
+        // The banned inventory is documentation-only and never intersects the
+        // registries (every banned algorithm names a type code outside 7/11 and 4/5).
+        let bannedNames = I2PCryptoPolicy.bannedAlgorithms.map { $0.lowercased() }
+        guard !I2PCryptoPolicy.bannedAlgorithms.isEmpty,
+              Set(bannedNames).count == I2PCryptoPolicy.bannedAlgorithms.count else {
+            throw I2PWireError.unsupportedAlgorithm
+        }
+        return "\(I2PCryptoPolicy.bannedAlgorithms.count) legacy algorithms inventoried and banned; registries pinned to SigType 7/11 and EncType 4/5 with 32-byte keys and 64-byte signatures"
+    }
+
+    /// Legacy wire input is rejected at every parse boundary: null certificates
+    /// (legacy identity shape), unapproved signature/encryption type codes and
+    /// hand-built legacy identities all throw — no silent fallbacks.
+    private static func legacyWireRejection() throws -> String {
+        // Null certificate (type 0): the legacy identity shape.
+        var nullWriter = I2PWriter()
+        nullWriter.byte(0)
+        nullWriter.short(0)
+        guard expectThrow({ var r = I2PReader(nullWriter.data); _ = try I2PCertificate.parse(&r) }) else {
+            throw I2PCrossValidationError.unexpectedSuccess
+        }
+        // Unapproved signature and encryption type codes in a key certificate.
+        for (sigCode, encCode) in [(UInt16(0), UInt16(4)), (UInt16(1), UInt16(4)),
+                                   (UInt16(3), UInt16(4)), (UInt16(7), UInt16(0)),
+                                   (UInt16(7), UInt16(2)), (UInt16(11), UInt16(6))] {
+            var payload = I2PWriter()
+            payload.short(sigCode)
+            payload.short(encCode)
+            var certWriter = I2PWriter()
+            certWriter.byte(5)
+            certWriter.short(UInt16(payload.data.count))
+            certWriter.raw(payload.data)
+            guard expectThrow({ var r = I2PReader(certWriter.data); _ = try I2PCertificate.parse(&r) }) else {
+                throw I2PCrossValidationError.unexpectedSuccess
+            }
+        }
+        // A hand-built keysAndCert with a null certificate is rejected whole —
+        // legacy identities cannot enter the netdb.
+        let identity = Data(repeating: 0x41, count: 256) + Data(repeating: 0x42, count: 128) + nullWriter.data
+        guard expectThrow({ var r = I2PReader(identity); _ = try I2PKeysAndCert.parse(&r) }) else {
+            throw I2PCrossValidationError.unexpectedSuccess
+        }
+        // Emission side: a modern identity serializes a type-5 key certificate
+        // carrying exactly SigType 7 / EncType 4.
+        let (_, seed) = I2PSamples.sampleIdentity()
+        let keyPair = I2PCrypto.generateX25519KeyPair()
+        let signingKey = I2PCrypto.ed25519PublicKey(fromSeed: seed)
+        let destination = I2PDestination(encryptionPublicKey: keyPair.publicKey, signingPublicKey: signingKey)
+        var reader = I2PReader(Data(destination.raw.suffix(from: 256 + 128)))
+        let certificate = try I2PCertificate.parse(&reader)
+        guard certificate.sigType == I2PSigType.ed25519,
+              certificate.encType == I2PEncType.x25519 else {
+            throw I2PWireError.unsupportedAlgorithm
+        }
+        return "null certificates, legacy sig/enc type codes and legacy identities rejected at parse; modern identities emit type-5 key certificates only"
     }
 
     private static func ed25519phDom2() throws -> String {

@@ -4,12 +4,12 @@
 //  records (I2NP type 21) and VariableTunnelBuildReply records (I2NP type 22),
 //  layered so only the addressed hop can decrypt its record.
 //
-//  Spec notes: classic I2P encrypts request records with ElGamal and layers
-//  tunnel data with AES-256-CBC. This router uses the modern cipher suite
-//  (EncType 4/5): each record is ECIES-X25519 — an ephemeral X25519 key
-//  agreement with the hop's encryption key, HKDF-SHA256 key derivation, and
-//  a ChaCha20-Poly1305 AEAD box. Reply records use the per-hop reply key and
-//  reply IV carried in the request record.
+//  Spec notes: this router implements the modern cipher suite (EncType 4/5)
+//  under the modern-only crypto policy: each record is ECIES-X25519 — an
+//  ephemeral X25519 key agreement with the hop's encryption key, HKDF-SHA256
+//  key derivation, and a ChaCha20-Poly1305 AEAD box. Reply records use the
+//  per-hop reply key and reply IV carried in the request record. Tunnel data
+//  layer encryption follows the tunnel spec (see I2PTunnelLayerCipher).
 //
 
 import Foundation
