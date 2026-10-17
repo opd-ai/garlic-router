@@ -275,22 +275,6 @@
       "status" : "done",
       "title" : "Parse LeaseSet2 for mainnet destinations",
       "updatedAt" : "2026-10-17T20:43:25Z"
-    },
-    {
-      "createdAt" : "2026-10-17T20:28:59Z",
-      "description" : "New screen shown on first launch: a guided connection flow that walks through identity creation (RouterHash revealed), reachability advertisement (external address published to floodfills), reseed progress (RouterInfos ingested from live servers), and establishing sessions to real floodfills with a live count. Ends with a 'Connect to mainnet' action that starts the router and hands off to the Router dashboard. Skippable; the dashboard works regardless.",
-      "glyph" : "power button with signal waves",
-      "id" : "ae892945",
-      "mockups" : [
-        {
-          "brief" : "First-launch router onboarding screen for the I2P router app. Dark background, centered layout. Top: a glowing violet router glyph inside a circle with concentric signal rings. Title 'Bring your router online', subtitle 'Your identity is generated on this device and never leaves it.' Below, a vertical step list in translucent dark cards, each with a status icon: 'Identity created' (green check, RouterHash chip in monospaced violet showing 12 hex characters), 'External address published' (green check, 'published to 5 floodfills'), 'Downloading reseed' (spinning violet indicator, '212 router infos verified'), 'Connecting to floodfills' (pending, gray). Bottom: a prominent filled violet button 'Connect to mainnet' and a muted text button 'Skip for now'. SF Pro typography, violet accent, dark translucent cards consistent with the I2P Core tab.",
-          "id" : "6f3da21b",
-          "title" : "Router onboarding"
-        }
-      ],
-      "status" : "pending",
-      "title" : "Add router onboarding",
-      "updatedAt" : "2026-10-17T20:28:59Z"
     }
   ],
   "version" : 1
