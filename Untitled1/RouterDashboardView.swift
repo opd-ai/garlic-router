@@ -7,13 +7,10 @@ import SwiftUI
 
 struct RouterDashboardView: View {
     @State private var snapshot: I2PRouterStatusSnapshot?
+    @State private var isStarting = false
 
     private let accent = Color(red: 0.47, green: 0.44, blue: 0.97)
     private let background = Color(red: 0.055, green: 0.06, blue: 0.09)
-
-    private var engine: I2PRouterStatusEngine {
-        I2PRouterAppContext.shared.engine
-    }
 
     var body: some View {
         NavigationStack {
@@ -26,9 +23,24 @@ struct RouterDashboardView: View {
                         tunnelsCard(snapshot)
                         throughputCard(snapshot)
                         footerText(snapshot)
-                    } else {
-                        ProgressView("Connecting to router status stream…")
+                    } else if isStarting {
+                        ProgressView("Starting router…")
                             .padding(.top, 80)
+                    } else {
+                        card(title: "Router is stopped") {
+                            Text("The router starts only when you ask, keeping app launch light and predictable.")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                            Button(action: startRouter) {
+                                Label("Start router", systemImage: "play.fill")
+                                    .font(.subheadline.weight(.semibold))
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 10)
+                                    .background(accent.opacity(0.18), in: RoundedRectangle(cornerRadius: 12))
+                            }
+                            .buttonStyle(.plain)
+                            .tint(accent)
+                        }
                     }
                 }
                 .padding(.horizontal, 16)
@@ -40,10 +52,17 @@ struct RouterDashboardView: View {
             .navigationBarTitleDisplayMode(.large)
         }
         .preferredColorScheme(.dark)
-        .task {
-            I2PRouterAppContext.shared.start()
-            for await snapshot in engine.snapshots {
-                self.snapshot = snapshot
+    }
+
+    private func startRouter() {
+        guard !isStarting else { return }
+        isStarting = true
+        Task { @MainActor in
+            let context = I2PRouterAppContext.shared
+            context.start()
+            for await update in context.engine.snapshots {
+                snapshot = update
+                isStarting = false
             }
         }
     }

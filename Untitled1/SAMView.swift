@@ -38,13 +38,6 @@ struct SAMView: View {
             .navigationBarTitleDisplayMode(.large)
         }
         .preferredColorScheme(.dark)
-        .task {
-            I2PRouterAppContext.shared.start()
-            while !Task.isCancelled {
-                refresh()
-                try? await Task.sleep(for: .seconds(1))
-            }
-        }
     }
 
     private func refresh() {
@@ -104,8 +97,19 @@ struct SAMView: View {
                 .foregroundStyle(.secondary)
 
             Button {
-                if listening { server.stop() } else { server.start() }
-                refresh()
+                if listening {
+                    server.stop()
+                    refresh()
+                } else {
+                    server.start()
+                    Task { @MainActor in
+                        for _ in 0..<20 {
+                            try? await Task.sleep(for: .milliseconds(100))
+                            refresh()
+                            if listening || failure != nil { break }
+                        }
+                    }
+                }
             } label: {
                 Label(listening ? "Stop SAM socket" : "Start SAM socket",
                       systemImage: listening ? "stop.circle" : "play.circle")

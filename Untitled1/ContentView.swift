@@ -18,7 +18,6 @@ struct ContentView: View {
     @State private var hardeningExpanded = false
     @State private var specExpanded = false
     @State private var productionExpanded = false
-    @State private var crashReport: String?
     @State private var sizes: [(name: String, bytes: Int)] = []
 
     private let accent = Color(red: 0.47, green: 0.44, blue: 0.97)
@@ -51,9 +50,6 @@ struct ContentView: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 14) {
-                    if let crashReport {
-                        crashDiagnosticsCard(crashReport)
-                    }
                     cryptoSuiteCard
                     serializationCard
                     selfTestCard
@@ -70,13 +66,6 @@ struct ContentView: View {
             .background(background.ignoresSafeArea())
             .navigationTitle("I2P Core")
             .navigationBarTitleDisplayMode(.large)
-            .onAppear {
-                // Graceful router restart on launch (and on foreground, via
-                // the app's scene-phase handler).
-                I2PRouterAppContext.shared.resumeAfterBackground()
-                if results.isEmpty { refresh() }
-                if crashReport == nil { crashReport = I2PCrashReporter.consumeLastCrashReport() }
-            }
         }
     }
 
@@ -380,25 +369,6 @@ struct ContentView: View {
         }
     }
 
-    /// Surfaces the previous session's persisted crash context (signal +
-    /// symbolicated backtrace) so a launch crash can be pinpointed without
-    /// an attached debugger.
-    private func crashDiagnosticsCard(_ report: String) -> some View {
-        card(title: "Crash diagnostics") {
-            Text("The previous session terminated abnormally:")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            Text(report)
-                .font(.system(.caption2, design: .monospaced))
-                .textSelection(.enabled)
-                .lineLimit(14)
-                .truncationMode(.tail)
-            Text("Captured by the app's signal handler; it survives relaunch so the faulting point stays visible.")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-        }
-    }
-
     private var cryptoSuiteCard: some View {
         card(title: "Cryptographic Suite") {
             suiteRow("X25519", subtitle: "EncType 4 · key agreement")
@@ -413,7 +383,7 @@ struct ContentView: View {
     private var serializationCard: some View {
         card(title: "Serialization") {
             if sizes.isEmpty {
-                Text("Encoding sample structures…")
+                Text("Run round-trip tests to populate sample sizes.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             } else {
