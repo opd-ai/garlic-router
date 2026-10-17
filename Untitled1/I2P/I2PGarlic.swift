@@ -1,6 +1,6 @@
 //
 //  I2PGarlic.swift
-//  Garlic routing: clove sets, certificates, session tags.
+//  Garlic routing: ECIES-X25519 envelopes, payload blocks, session tags.
 //
 
 import Foundation
@@ -12,127 +12,268 @@ enum I2PGarlicError: Error {
     case unknownSession
 }
 
-/// Garlic certificate: a type byte plus type-specific bytes (null = none).
-struct I2PGarlicCertificate {
-    let type: UInt8
-    let payload: Data
+// MARK: - Delivery instructions
 
-    static let null = I2PGarlicCertificate(type: 0, payload: Data())
+/// Garlic clove delivery instructions inside an I2NP payload block: the
+/// spec's garlic flag-byte format. Flag bits: 0x80 = tunnel delivery
+/// (followed by the tunnel ID (4 BE) and the router hash (32)), 0x40 =
+/// router delivery (followed by the router hash (32)), 0x00 = local
+/// delivery; bit 0x02 = delay included (followed by the delay in
+/// milliseconds (4 BE)).
+struct I2PGarlicDeliveryInstructions {
+    let deliveryInstructions: I2PDeliveryInstructions
+
+    init(_ deliveryInstructions: I2PDeliveryInstructions) {
+        self.deliveryInstructions = deliveryInstructions
+    }
 
     func serialize() -> Data {
+        var flag: UInt8 = 0
+        if deliveryInstructions.delayMilliseconds != nil { flag |= 0x02 }
+        switch deliveryInstructions.mode {
+        case .local: break
+        case .tunnel: flag |= 0x80
+        case .router: flag |= 0x40
+        }
         var w = I2PWriter()
-        w.byte(type)
-        w.short(UInt16(payload.count))
-        w.raw(payload)
+        w.byte(flag)
+        if flag & 0x80 != 0 {
+            w.integer(deliveryInstructions.tunnelID ?? 0)
+            w.hash(deliveryInstructions.routerHash ?? Data(repeating: 0, count: 32))
+        } else if flag & 0x40 != 0 {
+            w.hash(deliveryInstructions.routerHash ?? Data(repeating: 0, count: 32))
+        }
+        if flag & 0x02 != 0 {
+            w.integer(UInt32(deliveryInstructions.delayMilliseconds ?? 0))
+        }
         return w.data
     }
 
-    static func parse(_ r: inout I2PReader) throws -> I2PGarlicCertificate {
-        let type = try r.byte()
-        let length = Int(try r.short())
-        return I2PGarlicCertificate(type: type, payload: try r.raw(length))
+    /// Returns the instructions and how many bytes of `body` they consumed.
+    static func parse(_ body: Data) throws -> (instructions: I2PDeliveryInstructions, consumed: Int) {
+        let bytes = Array(body)
+        guard !bytes.isEmpty else { throw I2PGarlicError.invalidPayload }
+        let flag = bytes[0]
+        var offset = 1
+        var tunnelID: UInt32?
+        var routerHash: Data?
+        var delay: Int?
+        if flag & 0x80 != 0 {
+            guard bytes.count >= offset + 36 else { throw I2PGarlicError.invalidPayload }
+            tunnelID = (UInt32(bytes[offset]) << 24) | (UInt32(bytes[offset + 1]) << 16)
+                | (UInt32(bytes[offset + 2]) << 8) | UInt32(bytes[offset + 3])
+            offset += 4
+            routerHash = Data(bytes[offset..<(offset + 32)])
+            offset += 32
+        } else if flag & 0x40 != 0 {
+            guard bytes.count >= offset + 32 else { throw I2PGarlicError.invalidPayload }
+            routerHash = Data(bytes[offset..<(offset + 32)])
+            offset += 32
+        }
+        if flag & 0x02 != 0 {
+            guard bytes.count >= offset + 4 else { throw I2PGarlicError.invalidPayload }
+            delay = Int((UInt32(bytes[offset]) << 24) | (UInt32(bytes[offset + 1]) << 16)
+                | (UInt32(bytes[offset + 2]) << 8) | UInt32(bytes[offset + 3]))
+            offset += 4
+        }
+        let mode: I2PDeliveryInstructions.Mode = flag & 0x80 != 0 ? .tunnel : (flag & 0x40 != 0 ? .router : .local)
+        return (I2PDeliveryInstructions(mode: mode, tunnelID: tunnelID,
+                                        routerHash: routerHash, delayMilliseconds: delay),
+                offset)
     }
 }
 
-/// One garlic clove: delivery instructions, the encapsulated I2NP message
-/// and a per-clove certificate. Delivery instructions reuse the I2NP layer's
-/// I2PDeliveryInstructions (local, tunnel and router modes with delay).
+// MARK: - Payload blocks
+
+/// ECIES-X25519 garlic payload block types (DateTime, I2NP, Options,
+/// Termination, Padding).
+enum I2PGarlicBlockType: UInt8 {
+    case dateTime = 0
+    case i2np = 1
+    case options = 3
+    case termination = 4
+    case padding = 254
+}
+
+/// One typed garlic payload block. Every block frames as
+/// [type (1)][length (2 BE)][body]; unknown block types are skipped on decode.
+enum I2PGarlicBlock {
+    /// [unix seconds (4 BE)] — carries the envelope expiration.
+    case dateTime(Date)
+    /// Garlic delivery instructions + the encapsulated I2NP message (the clove).
+    case i2np(deliveryInstructions: I2PDeliveryInstructions, message: I2NPMessage)
+    /// Session-tag set delivery: [tag set seed (32)][tag count (1)].
+    case options(tagSetSeed: Data, tagCount: Int)
+    /// [reason code (1)] — the sender is closing the session.
+    case termination(reason: UInt8)
+    /// Random bytes — length obfuscation.
+    case padding(Data)
+
+    static func encode(_ blocks: [I2PGarlicBlock]) throws -> Data {
+        var w = I2PWriter()
+        for block in blocks {
+            switch block {
+            case .dateTime(let date):
+                let seconds = UInt32(date.timeIntervalSince1970.rounded())
+                w.byte(I2PGarlicBlockType.dateTime.rawValue)
+                w.short(4)
+                w.integer(seconds)
+            case .i2np(let deliveryInstructions, let message):
+                let body = I2PGarlicDeliveryInstructions(deliveryInstructions).serialize() + message.serialize()
+                w.byte(I2PGarlicBlockType.i2np.rawValue)
+                w.short(UInt16(body.count))
+                w.raw(body)
+            case .options(let tagSetSeed, let tagCount):
+                guard tagSetSeed.count == I2PGarlicCrypto.tagLength else { throw I2PGarlicError.invalidPayload }
+                w.byte(I2PGarlicBlockType.options.rawValue)
+                w.short(33)
+                w.raw(tagSetSeed)
+                w.byte(UInt8(tagCount))
+            case .termination(let reason):
+                w.byte(I2PGarlicBlockType.termination.rawValue)
+                w.short(1)
+                w.byte(reason)
+            case .padding(let bytes):
+                w.byte(I2PGarlicBlockType.padding.rawValue)
+                w.short(UInt16(bytes.count))
+                w.raw(bytes)
+            }
+        }
+        return w.data
+    }
+
+    static func decode(_ data: Data) throws -> [I2PGarlicBlock] {
+        var r = I2PReader(data)
+        var blocks: [I2PGarlicBlock] = []
+        while r.remaining > 0 {
+            let type = try r.byte()
+            let length = Int(try r.short())
+            let body = try r.raw(length)
+            switch type {
+            case I2PGarlicBlockType.dateTime.rawValue:
+                guard body.count == 4 else { throw I2PGarlicError.invalidPayload }
+                var br = I2PReader(body)
+                blocks.append(.dateTime(Date(timeIntervalSince1970: Double(try br.integer()))))
+            case I2PGarlicBlockType.i2np.rawValue:
+                let (instructions, consumed) = try I2PGarlicDeliveryInstructions.parse(body)
+                let message = try I2NPMessage.parse(Data(body.dropFirst(consumed)))
+                blocks.append(.i2np(deliveryInstructions: instructions, message: message))
+            case I2PGarlicBlockType.options.rawValue:
+                guard body.count >= 33 else { throw I2PGarlicError.invalidPayload }
+                blocks.append(.options(tagSetSeed: body.subdata(in: 0..<32), tagCount: Int(body[32])))
+            case I2PGarlicBlockType.termination.rawValue:
+                guard body.count == 1 else { throw I2PGarlicError.invalidPayload }
+                blocks.append(.termination(reason: body[0]))
+            case I2PGarlicBlockType.padding.rawValue:
+                blocks.append(.padding(body))
+            default:
+                continue // unknown block types are skipped per spec
+            }
+        }
+        return blocks
+    }
+}
+
+// MARK: - Clove sets
+
+/// One garlic clove: delivery instructions and the encapsulated I2NP message.
 struct I2PGarlicClove {
     let deliveryInstructions: I2PDeliveryInstructions
     let message: I2NPMessage
-    let certificate: I2PGarlicCertificate
 
-    init(deliveryInstructions: I2PDeliveryInstructions,
-         message: I2NPMessage,
-         certificate: I2PGarlicCertificate = .null) {
+    init(deliveryInstructions: I2PDeliveryInstructions, message: I2NPMessage) {
         self.deliveryInstructions = deliveryInstructions
         self.message = message
-        self.certificate = certificate
     }
 
-    /// [delivery instructions][I2NP message bytes][certificate]
+    /// The I2NP block body: garlic delivery instructions + the I2NP message.
     func serialize() throws -> Data {
         var w = I2PWriter()
-        w.raw(deliveryInstructions.serialize())
+        w.raw(I2PGarlicDeliveryInstructions(deliveryInstructions).serialize())
         w.raw(message.serialize())
-        w.raw(certificate.serialize())
         return w.data
     }
 
-    /// Returns the clove and how many bytes it consumed from `data`.
-    static func parse(_ data: Data) throws -> (clove: I2PGarlicClove, consumed: Int) {
-        let (instructions, instructionsBytes) = try I2PDeliveryInstructions.parse(data)
-        let rest = Data(data.dropFirst(instructionsBytes))
-        guard rest.count >= I2NPMessage.headerLength else { throw I2PGarlicError.invalidPayload }
-        let header = try I2NPMessageHeader.parse(rest)
-        let messageBytes = I2NPMessage.headerLength + Int(header.size)
-        guard rest.count >= messageBytes + 3 else { throw I2PGarlicError.invalidPayload }
-        let inner = try I2NPMessage.parse(rest.prefix(messageBytes))
-        var certReader = I2PReader(rest.subdata(in: messageBytes..<rest.count))
-        let certificate = try I2PGarlicCertificate.parse(&certReader)
-        let consumed = instructionsBytes + messageBytes + (rest.count - messageBytes - certReader.remaining)
-        return (I2PGarlicClove(deliveryInstructions: instructions,
-                               message: inner,
-                               certificate: certificate),
-                consumed)
+    static func parse(_ body: Data) throws -> I2PGarlicClove {
+        let (instructions, consumed) = try I2PGarlicDeliveryInstructions.parse(body)
+        let message = try I2NPMessage.parse(Data(body.dropFirst(consumed)))
+        return I2PGarlicClove(deliveryInstructions: instructions, message: message)
     }
 }
 
-
-
-
-/// Garlic clove set framing: version, expiration, message ID, certificate
-/// and one or more cloves. The whole set is the encrypted garlic payload.
+/// Garlic clove set: the logical payload of an ECIES-X25519 garlic envelope.
+/// Serialization is the spec's typed payload blocks — a DateTime block
+/// carrying the expiration, one I2NP block per clove (delivery instructions +
+/// message), an Options block when the envelope carries a session-tag set
+/// seed, and optional Termination/Padding blocks. The message ID and
+/// expiration also ride in the wrapping GarlicMessage's I2NP header.
 struct I2PGarlicCloveSet {
-    static let version: UInt8 = 0
     let expiration: Date
     let messageID: UInt32
-    let certificate: I2PGarlicCertificate
     let cloves: [I2PGarlicClove]
+    let tagSetSeed: Data?
+    let tagCount: Int
+    let terminated: Bool
 
-    init(expiration: Date, messageID: UInt32,
-         certificate: I2PGarlicCertificate = .null,
-         cloves: [I2PGarlicClove]) throws {
-        guard !cloves.isEmpty else { throw I2PGarlicError.invalidPayload }
+    init(expiration: Date, messageID: UInt32, cloves: [I2PGarlicClove],
+         tagSetSeed: Data? = nil, tagCount: Int = 0) throws {
+        guard !cloves.isEmpty, cloves.count <= 255 else { throw I2PGarlicError.invalidPayload }
+        if tagSetSeed != nil { guard tagCount > 0, tagCount <= 255 else { throw I2PGarlicError.invalidPayload } }
         self.expiration = expiration
         self.messageID = messageID
-        self.certificate = certificate
         self.cloves = cloves
+        self.tagSetSeed = tagSetSeed
+        self.tagCount = tagCount
+        self.terminated = false
     }
 
-    /// [version][expiration ms (8)][message ID (4)][certificate][count (1)][cloves...]
+    private init(expiration: Date, messageID: UInt32, cloves: [I2PGarlicClove],
+                 tagSetSeed: Data?, tagCount: Int, terminated: Bool) {
+        self.expiration = expiration
+        self.messageID = messageID
+        self.cloves = cloves
+        self.tagSetSeed = tagSetSeed
+        self.tagCount = tagCount
+        self.terminated = terminated
+    }
+
     func serialize() throws -> Data {
-        var w = I2PWriter()
-        w.byte(Self.version)
-        w.long(UInt64((expiration.timeIntervalSince1970 * 1000).rounded()))
-        w.integer(messageID)
-        w.raw(certificate.serialize())
-        w.byte(UInt8(cloves.count))
-        for clove in cloves { w.raw(try clove.serialize()) }
-        return w.data
+        var blocks: [I2PGarlicBlock] = [.dateTime(expiration)]
+        for clove in cloves {
+            blocks.append(.i2np(deliveryInstructions: clove.deliveryInstructions, message: clove.message))
+        }
+        if let seed = tagSetSeed {
+            blocks.append(.options(tagSetSeed: seed, tagCount: tagCount))
+        }
+        return try I2PGarlicBlock.encode(blocks)
     }
 
-    static func parse(_ data: Data) throws -> I2PGarlicCloveSet {
-        var r = I2PReader(data)
-        guard try r.byte() == Self.version else { throw I2PGarlicError.invalidPayload }
-        let ms = try r.long()
-        let messageID = try r.integer()
-        let certificate = try I2PGarlicCertificate.parse(&r)
-        let count = Int(try r.byte())
-        let headerBytes = 1 + 8 + 4 + (3 + certificate.payload.count) + 1
-        var remainder = Data(data.dropFirst(headerBytes))
+    /// Parses the payload-block plaintext. The message ID arrives from the
+    /// wrapping GarlicMessage's I2NP header.
+    static func parse(_ data: Data, messageID: UInt32 = 0) throws -> I2PGarlicCloveSet {
+        var expiration = Date.distantFuture
         var cloves: [I2PGarlicClove] = []
-        for _ in 0..<count {
-            let (clove, consumed) = try I2PGarlicClove.parse(remainder)
-            cloves.append(clove)
-            remainder = Data(remainder.dropFirst(consumed))
+        var tagSetSeed: Data?
+        var tagCount = 0
+        var terminated = false
+        for block in try I2PGarlicBlock.decode(data) {
+            switch block {
+            case .dateTime(let date): expiration = date
+            case .i2np(let deliveryInstructions, let message):
+                cloves.append(I2PGarlicClove(deliveryInstructions: deliveryInstructions, message: message))
+            case .options(let seed, let count):
+                tagSetSeed = seed
+                tagCount = count
+            case .termination: terminated = true
+            case .padding: break // length obfuscation
+            }
         }
-        return try I2PGarlicCloveSet(expiration: Date(timeIntervalSince1970: Double(ms) / 1000),
-                                 messageID: messageID,
-                                 certificate: certificate,
-                                 cloves: cloves)
+        guard !terminated, !cloves.isEmpty, cloves.count <= 255 else { throw I2PGarlicError.invalidPayload }
+        return I2PGarlicCloveSet(expiration: expiration, messageID: messageID, cloves: cloves,
+                                 tagSetSeed: tagSetSeed, tagCount: tagCount, terminated: false)
     }
 }
+
 /// One lease from a remote LeaseSet: where to deliver garlic messages.
 struct I2PGarlicLease {
     let gatewayRouterHash: Data
@@ -140,93 +281,141 @@ struct I2PGarlicLease {
     let expiration: Date
 }
 
-/// ECIES-X25519 garlic primitives (ChaCha20-Poly1305 AEAD, HKDF-SHA256).
-/// New sessions use an ephemeral X25519 exchange; tag-based messages reuse
-/// the session key via a single-use 32-byte session tag.
+// MARK: - ECIES-X25519 crypto
+
+/// ECIES-X25519 garlic primitives (ChaCha20-Poly1305 AEAD, HKDF-SHA256
+/// context binding, HMAC-SHA256 ratchets) per proposal 145: three-section
+/// new-session envelopes, typed payload blocks, spec context info strings,
+/// and tag-set ratchets with 32-byte single-use session tags.
 enum I2PGarlicCrypto {
+    /// Session tags are 32 bytes per spec.
     static let tagLength = 32
-    static let infoSession = "i2p-garlic-ecies-x25519"
-    static let infoTagNonce = "i2p-garlic-tag-nonce"
 
-    /// Session key for a new-session garlic message: HKDF(DH(ephemeral, peer)).
-    static func sessionKey(sharedSecret: Data, ephemeralPublicKey: Data) -> Data {
-        I2PCrypto.hkdfSHA256(inputKeyMaterial: sharedSecret,
-                             salt: ephemeralPublicKey,
-                             info: Data(infoSession.utf8),
-                             outputLength: 32)
+    /// The ECIES-X25519 protocol context (proposal 145). Every HKDF
+    /// derivation in the envelope binds its output to this context via the
+    /// info string, and the KDF chain starts from its SHA-256.
+    static let protocolName = "ECIES-X25519-AEAD-RATCHET"
+    /// HKDF info string for the static-key section's AEAD key.
+    static let infoStaticSection = Data(protocolName.utf8)
+    /// HKDF info string for the payload section's AEAD key.
+    static let infoPayloadSection = Data(protocolName.utf8)
+
+    private static func hmac(_ message: Data, key: Data) -> Data {
+        Data(HMAC<SHA256>.authenticationCode(for: message, using: SymmetricKey(data: key)))
     }
 
-    static func sessionKey(ephemeral: Curve25519.KeyAgreement.PrivateKey,
-                           peerPublicKey: Curve25519.KeyAgreement.PublicKey) throws -> Data {
-        let shared = try ephemeral.sharedSecretFromKeyAgreement(with: peerPublicKey)
-        let ikm = shared.withUnsafeBytes { Data($0) }
-        return sessionKey(sharedSecret: ikm, ephemeralPublicKey: ephemeral.publicKey.rawRepresentation)
+    private static func sha256(_ data: Data) -> Data {
+        I2PCrypto.sha256(data)
     }
 
-    /// Deterministic 12-byte nonce bound to a single-use session tag.
-    static func tagNonce(tag: Data) -> Data {
-        I2PCrypto.hkdfSHA256(inputKeyMaterial: tag,
-                             salt: Data(),
-                             info: Data(infoTagNonce.utf8),
-                             outputLength: 12)
-    }
+    // New-session KDF (Noise-faithful):
+    //   h0 = ck0 = SHA-256(protocolName)
+    //   ephemeral section rides cleartext; MixHash: h1 = SHA-256(h0 ‖ e)
+    //   es = DH(e, receiver static); temp = HMAC(ck0, es); ck1 = HMAC(temp, 0x01)
+    //   static section key = HMAC(temp, ck1)
+    //   MixHash: h2 = SHA-256(h1 ‖ static section ciphertext)
+    //   ss = DH(sender static, receiver static); temp2 = HMAC(ck1, ss)
+    //   ck2 = HMAC(temp2, 0x01); payload key = HMAC(temp2, ck2)
 
-    /// [ephemeral public key (32)][AEAD ciphertext] for new sessions.
-    static func sealNewSession(_ plaintext: Data,
-                               peerPublicKey: Curve25519.KeyAgreement.PublicKey) throws -> Data {
+    /// The new-session envelope: [ephemeral (32)][static section (48)][payload section].
+    /// Static section: ChaChaPoly(k_static, nonce 0, sender static public key ‖ zero pad
+    /// to a 48-byte section with the 16-byte tag inside). Payload section:
+    /// ChaChaPoly(k_payload, nonce 0, blocks ‖ zero padding to a 16-byte boundary).
+    static func sealNewSession(_ payloadBlocks: Data,
+                               peerStatic: Curve25519.KeyAgreement.PublicKey,
+                               senderStatic: Curve25519.KeyAgreement.PrivateKey) throws -> Data {
         let ephemeral = Curve25519.KeyAgreement.PrivateKey()
-        let key = try sessionKey(ephemeral: ephemeral, peerPublicKey: peerPublicKey)
-        let box = try ChaChaPoly.seal(plaintext, using: SymmetricKey(data: key))
-        return ephemeral.publicKey.rawRepresentation + box.combined
+        let ephemeralPublic = ephemeral.publicKey.rawRepresentation
+        let h0 = sha256(Data(protocolName.utf8))
+        let h1 = sha256(h0 + ephemeralPublic)
+        let es = try ephemeral.sharedSecretFromKeyAgreement(with: peerStatic)
+        let temp = hmac(es.withUnsafeBytes { Data($0) }, key: h0)
+        let ck1 = hmac(Data([0x01]), key: temp)
+        let staticSectionKey = hmac(ck1, key: temp)
+        let staticBox = try ChaChaPoly.seal(senderStatic.publicKey.rawRepresentation,
+                                            using: SymmetricKey(data: staticSectionKey))
+        let staticSection = staticBox.combined // 32 + 16 = 48
+        let h2 = sha256(h1 + staticSection)
+        let ss = try senderStatic.sharedSecretFromKeyAgreement(with: peerStatic)
+        let temp2 = hmac(ss.withUnsafeBytes { Data($0) }, key: ck1)
+        let ck2 = hmac(Data([0x01]), key: temp2)
+        let payloadKey = hmac(ck2, key: temp2)
+        var paddedPayload = payloadBlocks
+        while paddedPayload.count % 16 != 0 { paddedPayload.append(0) }
+        let payloadBox = try ChaChaPoly.seal(paddedPayload, using: SymmetricKey(data: payloadKey))
+        return ephemeralPublic + staticSection + payloadBox.combined
     }
 
+    /// Opens a new-session envelope: returns the decrypted payload-block
+    /// plaintext and the sender's static public key (section 2 plaintext).
     static func openNewSession(_ payload: Data,
-                               localKey: Curve25519.KeyAgreement.PrivateKey) throws -> Data {
-        guard payload.count > 32 + 16 else { throw I2PGarlicError.invalidPayload }
-        let ephemeral = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: payload.subdata(in: 0..<32))
-        let shared = try localKey.sharedSecretFromKeyAgreement(with: ephemeral)
-        let ikm = shared.withUnsafeBytes { Data($0) }
-        let key = sessionKey(sharedSecret: ikm, ephemeralPublicKey: ephemeral.rawRepresentation)
-        let box = try ChaChaPoly.SealedBox(combined: payload.subdata(in: 32..<payload.count))
-        guard let plain = try? ChaChaPoly.open(box, using: SymmetricKey(data: key)) else {
+                               localKey: Curve25519.KeyAgreement.PrivateKey) throws -> (blocks: Data, senderStatic: Data) {
+        // Sections: ephemeral (32) + static (32 plaintext + 16 tag = 48) + payload (n + 16).
+        guard payload.count > 32 + 48 + 16 else { throw I2PGarlicError.invalidPayload }
+        let ephemeralPublic = payload.subdata(in: 0..<32)
+        let h0 = sha256(Data(protocolName.utf8))
+        let h1 = sha256(h0 + ephemeralPublic)
+        let ephemeral = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: ephemeralPublic)
+        let es = try localKey.sharedSecretFromKeyAgreement(with: ephemeral)
+        let temp = hmac(es.withUnsafeBytes { Data($0) }, key: h0)
+        let ck1 = hmac(Data([0x01]), key: temp)
+        let staticSectionKey = hmac(ck1, key: temp)
+        let staticSection = payload.subdata(in: 32..<80)
+        let staticBox = try ChaChaPoly.SealedBox(combined: staticSection)
+        guard let staticPlain = try? ChaChaPoly.open(staticBox, using: SymmetricKey(data: staticSectionKey)),
+              staticPlain.count == 32 else {
             throw I2PGarlicError.decryptFailed
         }
-        return plain
-    }
-}
-/// Session tag record carried inside a new-session clove set so the peer
-/// can register single-use tags bound to the derived session key.
-struct I2PGarlicSessionTagsRecord {
-    static let marker: UInt8 = 1
-    let tags: [Data] // 32 bytes each
-
-    func serialize() -> Data {
-        var out = Data([Self.marker, UInt8(tags.count)])
-        tags.forEach { out.append($0) }
-        return out
-    }
-
-    static func parse(_ payload: Data) -> I2PGarlicSessionTagsRecord? {
-        let bytes = Array(payload)
-        guard bytes.count >= 2, bytes[0] == marker, bytes[1] > 0,
-              bytes.count == 2 + Int(bytes[1]) * I2PGarlicCrypto.tagLength else { return nil }
-        var tags: [Data] = []
-        for index in 0..<Int(bytes[1]) {
-            let start = 2 + index * I2PGarlicCrypto.tagLength
-            tags.append(Data(bytes[start..<(start + I2PGarlicCrypto.tagLength)]))
+        let h2 = sha256(h1 + staticSection)
+        let senderStatic = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: staticPlain)
+        let ss = try localKey.sharedSecretFromKeyAgreement(with: senderStatic)
+        let temp2 = hmac(ss.withUnsafeBytes { Data($0) }, key: ck1)
+        let ck2 = hmac(Data([0x01]), key: temp2)
+        let payloadKey = hmac(ck2, key: temp2)
+        let payloadSection = payload.subdata(in: 80..<payload.count)
+        let payloadBox = try ChaChaPoly.SealedBox(combined: payloadSection)
+        guard let blocks = try? ChaChaPoly.open(payloadBox, using: SymmetricKey(data: payloadKey)) else {
+            throw I2PGarlicError.decryptFailed
         }
-        return I2PGarlicSessionTagsRecord(tags: tags)
+        return (blocks, staticPlain)
+    }
+
+    /// Tag-set ratchet (proposal 145 tag rules): from a 32-byte seed the
+    /// chain advances per tag; every tag is single-use and binds to its own
+    /// ratcheted AEAD key. Tag i and its key derive from chain state k_i:
+    ///   k_0 = HMAC(HMAC(seed, 0x01), 0x02)
+    ///   tag_i = HMAC(k_i, 0x03)[0:32]; key_i = HMAC(k_i, 0x04)
+    ///   k_{i+1} = HMAC(k_i, 0x01)
+    static func tagSet(seed: Data, count: Int) -> [(tag: Data, key: Data)] {
+        precondition(seed.count == tagLength)
+        precondition(count >= 1 && count <= 255)
+        var tagKey = hmac(hmac(Data([0x01]), key: seed), key: Data([0x02]))
+        var entries: [(tag: Data, key: Data)] = []
+        for _ in 0..<count {
+            let tag = Data(hmac(Data([0x03]), key: tagKey).prefix(tagLength))
+            let key = hmac(Data([0x04]), key: tagKey)
+            entries.append((tag, key))
+            tagKey = hmac(Data([0x01]), key: tagKey)
+        }
+        return entries
     }
 }
 
-/// Tracks single-use inbound session tags → session key bindings.
+// MARK: - Inbound session handling
+
+/// Tracks single-use inbound session tags → ratcheted session-key bindings.
 final class I2PGarlicInboundTagManager {
     private let lock = NSLock()
-    private var bindings: [Data: Data] = [:] // tag → session key
+    private var bindings: [Data: Data] = [:] // tag → per-tag AEAD key
 
-    func register(_ tags: [Data], sessionKey: Data) {
+    /// Registers a tag set delivered in an Options block: the seed ratchets
+    /// into `count` tags, each binding to its own ratcheted AEAD key.
+    func register(tagSetSeed seed: Data, count: Int) {
+        let entries = I2PGarlicCrypto.tagSet(seed: seed, count: count)
         lock.lock()
-        for tag in tags where tag.count == I2PGarlicCrypto.tagLength { bindings[tag] = sessionKey }
+        for entry in entries where entry.tag.count == I2PGarlicCrypto.tagLength {
+            bindings[entry.tag] = entry.key
+        }
         lock.unlock()
     }
 
@@ -239,8 +428,8 @@ final class I2PGarlicInboundTagManager {
     var count: Int { lock.lock(); defer { lock.unlock() }; return bindings.count }
 }
 
-/// Decrypts inbound garlic payloads: tag-based or new-session, registering
-/// any session tags the new-session payload carries.
+/// Decrypts inbound garlic payloads: tag-based or three-section new-session,
+/// registering the tag set the new-session Options block carries.
 final class I2PGarlicInboundSessionManager {
     let localKey: Curve25519.KeyAgreement.PrivateKey
     let tagManager = I2PGarlicInboundTagManager()
@@ -251,119 +440,112 @@ final class I2PGarlicInboundSessionManager {
         self.localKey = localKey
     }
 
-    /// Returns the decrypted clove-set bytes for a garlic message payload.
-    func unwrapPayload(_ encrypted: Data) throws -> I2PGarlicCloveSet {
+    /// Returns the decrypted clove set for a garlic message payload.
+    /// `messageID` is the wrapping GarlicMessage's I2NP header message ID.
+    func unwrapPayload(_ encrypted: Data, messageID: UInt32 = 0) throws -> I2PGarlicCloveSet {
         if encrypted.count > I2PGarlicCrypto.tagLength + 16 {
-            let tag = encrypted.prefix(I2PGarlicCrypto.tagLength)
-            if let key = tagManager.consume(Data(tag)) {
-                let body = encrypted.subdata(in: I2PGarlicCrypto.tagLength..<encrypted.count)
+            let tag = Data(encrypted.prefix(I2PGarlicCrypto.tagLength))
+            if let key = tagManager.consume(tag) {
                 let box = try ChaChaPoly.SealedBox(
-                    nonce: ChaChaPoly.Nonce(data: I2PGarlicCrypto.tagNonce(tag: Data(tag))),
-                    ciphertext: body.dropLast(16),
-                    tag: body.suffix(16))
+                    combined: encrypted.subdata(in: I2PGarlicCrypto.tagLength..<encrypted.count))
                 guard let plain = try? ChaChaPoly.open(
                     box, using: SymmetricKey(data: key)) else {
                     throw I2PGarlicError.decryptFailed
                 }
-                return try I2PGarlicCloveSet.parse(plain)
+                return try I2PGarlicCloveSet.parse(plain, messageID: messageID)
             }
         }
-        let plain = try I2PGarlicCrypto.openNewSession(encrypted, localKey: localKey)
+        let (blocks, _) = try I2PGarlicCrypto.openNewSession(encrypted, localKey: localKey)
         lock.lock(); establishedPeers += 1; lock.unlock()
-        let cloveSet = try I2PGarlicCloveSet.parse(plain)
-        // Register any tags the peer announced inside the new-session payload.
-        if encrypted.count > 32 + 16 {
-            let ephemeral = try Curve25519.KeyAgreement.PublicKey(
-                rawRepresentation: encrypted.subdata(in: 0..<32))
-            let shared = try localKey.sharedSecretFromKeyAgreement(with: ephemeral)
-            let ikm = shared.withUnsafeBytes { Data($0) }
-            let key = I2PGarlicCrypto.sessionKey(sharedSecret: ikm,
-                                                 ephemeralPublicKey: ephemeral.rawRepresentation)
-            for clove in cloveSet.cloves {
-                if clove.message.type == .dataMessage,
-                   let record = I2PGarlicSessionTagsRecord.parse(clove.message.payload) {
-                    tagManager.register(record.tags, sessionKey: key)
-                }
-            }
+        let cloveSet = try I2PGarlicCloveSet.parse(blocks, messageID: messageID)
+        // Register the tag set the new-session Options block carries.
+        if let seed = cloveSet.tagSetSeed {
+            tagManager.register(tagSetSeed: seed, count: cloveSet.tagCount)
         }
         return cloveSet
     }
 }
-/// Outbound garlic session: wraps clove sets, handshaking with a new-session
-/// message that embeds single-use session tags, then tag-based encryption.
+
+// MARK: - Outbound session
+
+/// Outbound garlic session: ECIES-X25519 new-session handshakes (three
+/// sections over the receiver's static key) carrying the next tag set seed
+/// in an Options block, then tag-based continuation with the ratcheted
+/// per-tag keys.
 final class I2PGarlicSession {
     private let peerPublicKey: Curve25519.KeyAgreement.PublicKey
+    private let staticKey: Curve25519.KeyAgreement.PrivateKey
     private let tagsPerHandshake: Int
-    private var sessionKey: Data?
-    private var pendingTags: [Data] = []
+    private var tagSetSeed: Data?
+    private var tagEntries: [(tag: Data, key: Data)] = []
     private let lock = NSLock()
 
-    init(peerPublicKey: Curve25519.KeyAgreement.PublicKey, tagsPerHandshake: Int = 4) {
+    init(peerPublicKey: Curve25519.KeyAgreement.PublicKey,
+         staticKey: Curve25519.KeyAgreement.PrivateKey = Curve25519.KeyAgreement.PrivateKey(),
+         tagsPerHandshake: Int = 4) {
         self.peerPublicKey = peerPublicKey
+        self.staticKey = staticKey
         self.tagsPerHandshake = tagsPerHandshake
     }
 
-    var isEstablished: Bool { lock.lock(); defer { lock.unlock() }; return sessionKey != nil }
+    /// Established while unused session tags remain; a new handshake is
+    /// needed once the tag set exhausts.
+    var isEstablished: Bool { lock.lock(); defer { lock.unlock() }; return !tagEntries.isEmpty }
 
-    /// True when the next clove set must carry a session-tags record
-    /// (i.e. the next wrap will be a new-session handshake).
+    /// True when the next clove set must be a new-session handshake
+    /// carrying a session-tag set in its Options block.
     func nextSendEmbedsTagsRecord() -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        return sessionKey == nil || pendingTags.isEmpty
+        return tagEntries.isEmpty
     }
 
-    /// Prepares the tag pool for a pending new-session handshake and returns
-    /// the tags to offer in the session-tags record. Returns nil when the
-    /// next send will use an existing session tag instead.
-    func prepareHandshakeTags() -> [Data]? {
+    /// The tag-set seed and count to embed in the next new-session's Options
+    /// block, generating the seed if needed. Returns nil when the next send
+    /// is tag-based over the established session.
+    func prepareHandshakeTags() -> (seed: Data, count: Int)? {
         lock.lock()
         defer { lock.unlock() }
-        if sessionKey != nil, !pendingTags.isEmpty { return nil }
-        if pendingTags.isEmpty {
-            pendingTags = (0..<tagsPerHandshake).map { _ in
-                I2PCrypto.randomBytes(I2PGarlicCrypto.tagLength)
-            }
+        guard tagEntries.isEmpty else { return nil }
+        if tagSetSeed == nil {
+            tagSetSeed = I2PCrypto.randomBytes(I2PGarlicCrypto.tagLength)
         }
-        return pendingTags
+        return (tagSetSeed!, tagsPerHandshake)
     }
 
-    /// Tags to embed in the next session-tags record.
-    func offeredTags() -> [Data] {
-        lock.lock()
-        defer { lock.unlock() }
-        return pendingTags
-    }
-
-    /// Wraps a serialized clove set: tag-based when a tag is available,
-    /// otherwise a new-session handshake that also refreshes the tag pool.
+    /// Wraps serialized payload blocks: tag-based when an unused tag remains,
+    /// otherwise a three-section ECIES-X25519 new-session envelope that also
+    /// arms the pending tag set.
     func wrapCloveSet(_ cloveSetBytes: Data) throws -> Data {
         lock.lock()
-        if let key = sessionKey, let tag = pendingTags.first {
-            pendingTags.removeFirst()
+        if let entry = tagEntries.first {
+            tagEntries.removeFirst()
             lock.unlock()
-            let nonce = I2PGarlicCrypto.tagNonce(tag: tag)
-            let box = try ChaChaPoly.seal(cloveSetBytes, using: SymmetricKey(data: key), nonce: ChaChaPoly.Nonce(data: nonce))
-            return tag + box.combined
+            let box = try ChaChaPoly.seal(cloveSetBytes, using: SymmetricKey(data: entry.key))
+            return entry.tag + box.combined
         }
         lock.unlock()
-        // New session: fresh ephemeral exchange. Keep any tag pool already
-        // prepared by prepareHandshakeTags() so the offered tags match the
-        // session key derived in this handshake.
-        let ephemeral = Curve25519.KeyAgreement.PrivateKey()
-        let key = try I2PGarlicCrypto.sessionKey(ephemeral: ephemeral, peerPublicKey: peerPublicKey)
+        // New session: three-section envelope; arm the tag set (the seed
+        // rides inside the encrypted payload as an Options block).
         lock.lock()
-        if pendingTags.isEmpty {
-            pendingTags = (0..<tagsPerHandshake).map { _ in
-                I2PCrypto.randomBytes(I2PGarlicCrypto.tagLength)
-            }
+        let seed: Data
+        if let pending = tagSetSeed {
+            seed = pending
+        } else {
+            seed = I2PCrypto.randomBytes(I2PGarlicCrypto.tagLength)
+            tagSetSeed = seed
         }
-        sessionKey = key
+        tagEntries = I2PGarlicCrypto.tagSet(seed: seed, count: tagsPerHandshake)
+        tagSetSeed = nil
         lock.unlock()
-        let box = try ChaChaPoly.seal(cloveSetBytes, using: SymmetricKey(data: key))
-        return ephemeral.publicKey.rawRepresentation + box.combined
+        return try I2PGarlicCrypto.sealNewSession(cloveSetBytes,
+                                                  peerStatic: peerPublicKey,
+                                                  senderStatic: staticKey)
     }
 }
+
+// MARK: - End-to-end pipeline
+
 /// The result of sending a garlic message toward a LeaseSet lease: the
 /// tunnel-gateway envelope plus where it must be delivered next (through the
 /// sender's outbound tunnel pool in production).
@@ -374,9 +556,9 @@ struct I2PGarlicTransmission {
 }
 
 /// End-to-end garlic pipeline: a destination wraps an I2NP message in a clove
-/// set addressed to a LeaseSet lease, encrypts it (ECIES / session tags) and
-/// returns a TunnelGateway envelope whose inner delivery instructions point
-/// at the lease's inbound tunnel gateway.
+/// set addressed to a LeaseSet lease, encrypts it in an ECIES-X25519 envelope
+/// (new-session or tag-based) and returns a TunnelGateway envelope whose
+/// inner GarlicMessage I2NP header carries the message ID and expiration.
 enum I2PGarlicEndToEndPipeline {
     /// Builds and encrypts the garlic envelope for `message` toward `lease`.
     static func sendMessage(_ message: I2NPMessage,
@@ -391,22 +573,19 @@ enum I2PGarlicEndToEndPipeline {
                                                tunnelID: nil,
                                                routerHash: nil,
                                                delayMilliseconds: nil)
-        var cloves = [I2PGarlicClove(deliveryInstructions: delivery, message: message)]
-        if let offered = session.prepareHandshakeTags() {
-            let tagsRecord = I2PGarlicSessionTagsRecord(tags: offered).serialize()
-            let tagsMessage = I2NPMessage(type: .dataMessage, payload: tagsRecord)
-            cloves.append(I2PGarlicClove(
-                deliveryInstructions: I2PDeliveryInstructions(mode: .local,
-                                                              tunnelID: nil,
-                                                              routerHash: nil,
-                                                              delayMilliseconds: nil),
-                message: tagsMessage))
-        }
+        let cloves = [I2PGarlicClove(deliveryInstructions: delivery, message: message)]
+        let tagSet = session.prepareHandshakeTags()
         let cloveSet = try I2PGarlicCloveSet(expiration: expiry,
                                              messageID: UInt32.random(in: 1...UInt32.max),
-                                             cloves: cloves).serialize()
-        let encrypted = try session.wrapCloveSet(cloveSet)
-        let garlic = I2NPMessage(type: .garlic, payload: encrypted)
+                                             cloves: cloves,
+                                             tagSetSeed: tagSet?.seed,
+                                             tagCount: tagSet?.count ?? 0)
+        let encrypted = try session.wrapCloveSet(try cloveSet.serialize())
+        // The GarlicMessage I2NP header carries the message ID and expiration.
+        let garlic = I2NPMessage(type: .garlic,
+                                 messageID: cloveSet.messageID,
+                                 expiration: expiry,
+                                 payload: encrypted)
         // Route to the lease's gateway: tunnel-gateway delivery instructions.
         let envelope = I2PTunnelGatewayPayload(
             gatewayID: lease.tunnelID,
@@ -427,6 +606,7 @@ enum I2PGarlicEndToEndPipeline {
         return (preprocessed, outboundTunnel.hops[0].routerHash)
     }
 }
+
 /// Router-level garlic handling: unwraps inbound garlic messages through the
 /// session manager and dispatches each clove per its delivery instructions
 /// (local consumers, tunnel-gateway re-emission, router delivery, delay).
@@ -450,12 +630,10 @@ final class I2PGarlicMessageHandler {
 
     func handle(_ message: I2NPMessage, from source: Data) {
         guard message.type == .garlic else { return }
-        guard let cloveSet = try? sessionManager.unwrapPayload(message.payload) else { return }
+        guard let cloveSet = try? sessionManager.unwrapPayload(message.payload,
+                                                               messageID: message.messageID) else { return }
         guard cloveSet.expiration > Date() else { return } // expiration enforcement
         for clove in cloveSet.cloves {
-            // Skip the session-tags handshake record (already registered).
-            if clove.message.type == .dataMessage,
-               I2PGarlicSessionTagsRecord.parse(clove.message.payload) != nil { continue }
             switch clove.deliveryInstructions.mode {
             case .local:
                 let consumers: [(I2NPMessage, Data) -> Void] = {
@@ -483,7 +661,6 @@ final class I2PGarlicMessageHandler {
     }
 }
 
-
 // garlic self-test below
 enum I2PGarlicSelfTest {
     static func runAll() async -> [I2PSelfTestResult] {
@@ -492,8 +669,8 @@ enum I2PGarlicSelfTest {
             do { results.append(I2PSelfTestResult(name: name, passed: true, detail: try await body())) }
             catch { results.append(I2PSelfTestResult(name: name, passed: false, detail: "\(error)")) }
         }
-        await run("Garlic clove set framing round-trip", garlicCloveSetTest)
-        await run("ECIES session tags: single-use enforcement", garlicSessionTagsTest)
+        await run("Garlic payload blocks + clove set round-trip", garlicCloveSetTest)
+        await run("ECIES three-section envelope + session tags: single-use enforcement", garlicSessionTagsTest)
         await run("Garlic end-to-end via tunnel pools", garlicEndToEndTest)
         return results
     }
@@ -517,15 +694,13 @@ private func garlicWaitUntil(timeout: TimeInterval = 20,
 private func sameMessage(_ a: I2NPMessage, _ b: I2NPMessage) -> Bool {
     a.type == b.type && a.messageID == b.messageID && a.payload == b.payload
 }
-// Test: clove set framing round-trip across all delivery modes.
+
+// Test: payload-block encoding and clove-set round-trip across delivery modes.
 
 private func garlicCloveSetTest() async throws -> String {
-    let payloadA = Data("clove A".utf8)
-    let payloadB = Data("clove B".utf8)
-    let payloadC = Data("clove C".utf8)
-    let messageA = I2NPMessage(type: .dataMessage, payload: payloadA)
-    let messageB = I2NPMessage(type: .dataMessage, payload: payloadB)
-    let messageC = I2NPMessage(type: .deliveryStatus, messageID: 7, payload: payloadC)
+    let messageA = I2NPMessage(type: .dataMessage, payload: Data("clove A".utf8))
+    let messageB = I2NPMessage(type: .dataMessage, payload: Data("clove B".utf8))
+    let messageC = I2NPMessage(type: .deliveryStatus, messageID: 7, payload: Data("clove C".utf8))
 
     let local = I2PDeliveryInstructions(mode: .local, tunnelID: nil,
                                         routerHash: nil, delayMilliseconds: nil)
@@ -535,22 +710,20 @@ private func garlicCloveSetTest() async throws -> String {
     let router = I2PDeliveryInstructions(mode: .router, tunnelID: nil,
                                          routerHash: I2PCrypto.randomBytes(32),
                                          delayMilliseconds: nil)
-    let cert = I2PGarlicCertificate(type: 5, payload: Data([0xAA, 0xBB]))
 
     let expiration = Date().addingTimeInterval(120)
-    let set = try I2PGarlicCloveSet(expiration: expiration, messageID: 0x00C10AFF,
-                                    certificate: cert,
+    let messageID: UInt32 = 0x00C10AFF
+    let set = try I2PGarlicCloveSet(expiration: expiration, messageID: messageID,
                                     cloves: [
                                         I2PGarlicClove(deliveryInstructions: local, message: messageA),
-                                        I2PGarlicClove(deliveryInstructions: tunnel, message: messageB,
-                                                       certificate: I2PGarlicCertificate(type: 1, payload: Data([0x01]))),
+                                        I2PGarlicClove(deliveryInstructions: tunnel, message: messageB),
                                         I2PGarlicClove(deliveryInstructions: router, message: messageC),
                                     ])
-    let parsed = try I2PGarlicCloveSet.parse(try set.serialize())
+    let bytes = try set.serialize()
+    let parsed = try I2PGarlicCloveSet.parse(bytes, messageID: messageID)
 
-    guard abs(parsed.expiration.timeIntervalSince(expiration)) < 1 else { throw I2PGarlicError.invalidPayload }
-    guard parsed.messageID == 0x00C10AFF else { throw I2PGarlicError.invalidPayload }
-    guard parsed.certificate.type == 5 && parsed.certificate.payload == Data([0xAA, 0xBB]) else { throw I2PGarlicError.invalidPayload }
+    guard abs(parsed.expiration.timeIntervalSince(expiration)) < 2 else { throw I2PGarlicError.invalidPayload }
+    guard parsed.messageID == messageID else { throw I2PGarlicError.invalidPayload }
     guard parsed.cloves.count == 3 else { throw I2PGarlicError.invalidPayload }
 
     let modes = parsed.cloves.map { $0.deliveryInstructions.mode }
@@ -558,14 +731,28 @@ private func garlicCloveSetTest() async throws -> String {
     guard parsed.cloves[1].deliveryInstructions.tunnelID == 0x11223344,
           parsed.cloves[1].deliveryInstructions.delayMilliseconds == 500,
           parsed.cloves[1].deliveryInstructions.routerHash == tunnel.routerHash else { throw I2PGarlicError.invalidPayload }
-    guard parsed.cloves[1].certificate.type == 1 else { throw I2PGarlicError.invalidPayload }
     guard sameMessage(parsed.cloves[0].message, messageA),
           sameMessage(parsed.cloves[1].message, messageB),
           sameMessage(parsed.cloves[2].message, messageC) else { throw I2PGarlicError.invalidPayload }
-    return "3 cloves across all delivery modes, delay + certificates intact"
+
+    // The blocks must round-trip byte-for-byte through the codec too.
+    guard try I2PGarlicBlock.encode(try I2PGarlicBlock.decode(bytes)) == bytes else {
+        throw I2PGarlicError.invalidPayload
+    }
+    // Unknown block types are skipped per spec.
+    var withUnknown = I2PWriter()
+    withUnknown.byte(0x7A) // unknown type
+    withUnknown.short(3)
+    withUnknown.raw(Data([1, 2, 3]))
+    withUnknown.raw(bytes)
+    guard try I2PGarlicCloveSet.parse(withUnknown.data, messageID: messageID).cloves.count == 3 else {
+        throw I2PGarlicError.invalidPayload
+    }
+    return "DateTime/I2NP blocks round-trip byte-for-byte; 3 cloves across all delivery modes with delay intact; unknown blocks skipped"
 }
-// Test: ECIES-X25519 sessions — new-session handshake, tag-based follow-up,
-// single-use tag enforcement.
+
+// Test: ECIES-X25519 three-section envelope, tag-set delivery in Options
+// blocks, and single-use tag enforcement.
 
 private func garlicSessionTagsTest() async throws -> String {
     let aliceKey = Curve25519.KeyAgreement.PrivateKey()
@@ -574,33 +761,39 @@ private func garlicSessionTagsTest() async throws -> String {
     let localDelivery = I2PDeliveryInstructions(mode: .local, tunnelID: nil,
                                                 routerHash: nil, delayMilliseconds: nil)
 
-    func dataClove(_ id: UInt32, _ text: String) throws -> I2PGarlicClove {
+    func dataClove(_ text: String) throws -> I2PGarlicClove {
         I2PGarlicClove(deliveryInstructions: localDelivery,
                        message: I2NPMessage(type: .dataMessage, payload: Data(text.utf8)))
     }
 
     guard bobSession.nextSendEmbedsTagsRecord() else { throw I2PGarlicError.invalidPayload }
-    // First message: new-session handshake carrying the session-tags record.
-    let tagsRecord = I2PGarlicSessionTagsRecord(tags: bobSession.prepareHandshakeTags() ?? []).serialize()
+    // First message: three-section new-session envelope carrying the tag set
+    // in its Options block.
+    let tagSet = bobSession.prepareHandshakeTags()
+    guard let tagSet, tagSet.seed.count == 32, tagSet.count == 4 else { throw I2PGarlicError.invalidPayload }
     let firstSet = try I2PGarlicCloveSet(expiration: Date().addingTimeInterval(300),
                                          messageID: 0x1234,
-                                         cloves: [try dataClove(0x1234, "first"),
-                                                  I2PGarlicClove(deliveryInstructions: localDelivery,
-                                                                 message: I2NPMessage(type: .dataMessage,
-                                                                                      payload: tagsRecord))])
+                                         cloves: [try dataClove("first")],
+                                         tagSetSeed: tagSet.seed, tagCount: tagSet.count)
     let first = try bobSession.wrapCloveSet(try firstSet.serialize())
-    let set1 = try aliceManager.unwrapPayload(first)
+    // Three sections: ephemeral (32) + static (48) + payload section.
+    guard first.count > 32 + 48 + 16 else { throw I2PGarlicError.invalidPayload }
+    _ = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: first.prefix(32)) // ephemeral section
+    let set1 = try aliceManager.unwrapPayload(first, messageID: 0x1234)
     guard set1.messageID == 0x1234 else { throw I2PGarlicError.invalidPayload }
     guard aliceManager.tagManager.count == 4 else { throw I2PGarlicError.invalidPayload }
     guard aliceManager.establishedPeers == 1 else { throw I2PGarlicError.invalidPayload }
     guard bobSession.isEstablished, !bobSession.nextSendEmbedsTagsRecord() else { throw I2PGarlicError.invalidPayload }
 
-    // Second message: tag-based encryption over the established session.
+    // Second message: tag-based continuation with the ratcheted tag key.
     let secondSet = try I2PGarlicCloveSet(expiration: Date().addingTimeInterval(300),
                                           messageID: 0x5678,
-                                          cloves: [try dataClove(0x5678, "second")])
-    let second = try bobSession.wrapCloveSet(try secondSet.serialize())
-    let set2 = try aliceManager.unwrapPayload(second)
+                                          cloves: [try dataClove("second")])
+    let secondBytes = try secondSet.serialize()
+    let second = try bobSession.wrapCloveSet(secondBytes)
+    // Tag framing: [tag (32)][ciphertext ‖ 16-byte tag].
+    guard second.count == 32 + secondBytes.count + 16 else { throw I2PGarlicError.invalidPayload }
+    let set2 = try aliceManager.unwrapPayload(second, messageID: 0x5678)
     guard set2.messageID == 0x5678 else { throw I2PGarlicError.invalidPayload }
     guard aliceManager.tagManager.count == 3 else { throw I2PGarlicError.invalidPayload }
 
@@ -612,8 +805,9 @@ private func garlicSessionTagsTest() async throws -> String {
         guard case .decryptFailed = error else { throw error }
     }
     guard aliceManager.tagManager.count == 3 else { throw I2PGarlicError.invalidPayload }
-    return "new-session handshake registered 4 tags, tag follow-up decrypted, replay rejected"
+    return "three-section new-session envelope registered 4 ratcheted tags, tag follow-up decrypted, replay rejected"
 }
+
 // Test: full end-to-end chain — garlic through Bob's outbound tunnel pool
 // to a LeaseSet gateway, injected into Alice's inbound tunnel and unwrapped.
 
@@ -658,6 +852,7 @@ private final class GarlicTestNode {
                       encryptionPublicKey: encryptionKey.publicKey.rawRepresentation)
     }
 }
+
 private func garlicEndToEndTest() async throws -> String {
     let buildHub = I2PTunnelBuildHub()
     let deliveryHub = I2NPLoopbackDeliveryHub()
@@ -698,7 +893,7 @@ private func garlicEndToEndTest() async throws -> String {
     let box = GarlicTestBox()
     aliceHandler.addLocalConsumer { message, _ in box.add(message) }
     alice.router.addBodyHandler { message, source in aliceHandler.handle(message, from: source) }
-// OBEP glue: Bob's outbound endpoint hands the inner message to the
+    // OBEP glue: Bob's outbound endpoint hands the inner message to the
     // lease's gateway router (the inter-router hop in production).
     b1.router.registerGateway(tunnelID: bobTunnel.hops[0].receiveTunnelID) { inner, _ in
         Task {
@@ -722,7 +917,7 @@ private func garlicEndToEndTest() async throws -> String {
     let messageA = I2NPMessage(type: .dataMessage, payload: Data("garlic payload A".utf8))
     let messageB = I2NPMessage(type: .dataMessage, payload: Data("garlic payload B".utf8))
 
-    // First message: new-session handshake through the full chain.
+    // First message: three-section new-session envelope through the full chain.
     let transmissionA = try I2PGarlicEndToEndPipeline.sendMessage(messageA, to: lease, session: bobSession)
     let (payloadA, firstHopA) = try I2PGarlicEndToEndPipeline.routeThroughTunnelPool(transmissionA, via: bobTunnel)
     let dataA = I2NPMessage(type: .tunnelData, payload: payloadA.serialize())
@@ -730,7 +925,7 @@ private func garlicEndToEndTest() async throws -> String {
     guard bobSession.isEstablished else { throw I2PGarlicError.invalidPayload }
     try await garlicWaitUntil { box.count >= 1 }
 
-    // Second message: tag-based encryption over the established session.
+    // Second message: tag-based continuation over the established session.
     let transmissionB = try I2PGarlicEndToEndPipeline.sendMessage(messageB, to: lease, session: bobSession)
     let (payloadB, firstHopB) = try I2PGarlicEndToEndPipeline.routeThroughTunnelPool(transmissionB, via: bobTunnel)
     let dataB = I2NPMessage(type: .tunnelData, payload: payloadB.serialize())
@@ -739,5 +934,5 @@ private func garlicEndToEndTest() async throws -> String {
 
     guard box.contains(messageA), box.contains(messageB) else { throw I2PGarlicError.invalidPayload }
     guard aliceManager.tagManager.count == 3 else { throw I2PGarlicError.invalidPayload }
-    return "garlic via outbound pool -> lease gateway -> inbound tunnel -> ECIES unwrap; new-session + tag sends"
+    return "garlic via outbound pool -> lease gateway -> inbound tunnel -> ECIES unwrap; three-section new-session + tag sends"
 }

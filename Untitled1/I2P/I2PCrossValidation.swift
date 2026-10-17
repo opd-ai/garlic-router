@@ -228,18 +228,24 @@ enum I2PCrossValidation {
             try await netdbExpiryLifetime()
         }
 
-        // MARK: Garlic — envelope, clove, tags, HKDF
+        // MARK: Garlic — envelope, blocks, clove, tags, HKDF
 
-        run("T4-GL-ENV-RT", rowID: "GL-ENV", "Garlic envelope: new-session and tag-based wraps round-trip byte-for-byte") {
+        run("T4-GL-ENV-RT", rowID: "GL-ENV", "ECIES-X25519 envelope: three-section new-session and tag-based wraps round-trip byte-for-byte") {
             try garlicEnvelopeRoundTrip()
         }
-        run("T4-GL-CLOVE-RT", rowID: "GL-CLOVE", "Garlic clove: serialize → parse → reserialize identical") {
+        run("T4-GL-BLOCKS-RT", rowID: "GL-BLOCKS", "Payload blocks: DateTime/I2NP/Options/Termination/Padding round trip; unknown types skipped per spec") {
+            try garlicBlocksRoundTrip()
+        }
+        run("T4-GL-CLOVE-RT", rowID: "GL-CLOVE", "Garlic clove: garlic delivery instructions + I2NP message round trip byte-for-byte") {
             try garlicCloveRoundTrip()
         }
-        run("T4-GL-TAG-REPLAY", rowID: "GL-TAG", "Session tags: single-use enforced; replayed and tampered payloads rejected") {
+        run("T4-GL-TAG-REPLAY", rowID: "GL-TAG", "Session tags: ratcheted per-tag keys strictly single-use; replayed and tampered payloads rejected") {
             try garlicTagReplay()
         }
-        run("T4-GL-HKDF-LABELS", rowID: "GL-HKDF", "Garlic HKDF: deterministic session keys and tag nonces; label constants pinned") {
+        run("T4-GL-TAG-RATCHET", rowID: "GL-TAG", "Tag-set ratchet: chain advances per tag; exhausted sets re-handshake with a fresh seed") {
+            try garlicTagRatchetSpec()
+        }
+        run("T4-GL-HKDF-LABELS", rowID: "GL-HKDF", "Garlic HKDF: spec protocol-context info strings pinned; section key schedule and tag ratchets verified") {
             try garlicHKDFChecks()
         }
 
@@ -354,7 +360,9 @@ enum I2PCrossValidation {
         return netdb
     }
 
-    private static func sampleCloveSet(messageID: UInt32) throws -> I2PGarlicCloveSet {
+    private static func sampleCloveSet(messageID: UInt32,
+                                       tagSetSeed: Data? = nil,
+                                       tagCount: Int = 0) throws -> I2PGarlicCloveSet {
         let local = I2PDeliveryInstructions(mode: .local)
         let tunnel = I2PDeliveryInstructions(mode: .tunnel, tunnelID: 0x0BAD_F00D,
                                              routerHash: I2PCrypto.randomBytes(32),
@@ -366,9 +374,9 @@ enum I2PCrossValidation {
             messageID: messageID,
             cloves: [
                 I2PGarlicClove(deliveryInstructions: local, message: messageA),
-                I2PGarlicClove(deliveryInstructions: tunnel, message: messageB,
-                               certificate: I2PGarlicCertificate(type: 2, payload: Data([0x7F]))),
-            ])
+                I2PGarlicClove(deliveryInstructions: tunnel, message: messageB),
+            ],
+            tagSetSeed: tagSetSeed, tagCount: tagCount)
     }
 
     // MARK: Structures
@@ -1636,26 +1644,41 @@ enum I2PCrossValidation {
 
     // MARK: Garlic
 
+    /// The ECIES-X25519 three-section envelope and tag-based continuation
+    /// round-trip the clove-set payload blocks byte-for-byte.
     private static func garlicEnvelopeRoundTrip() throws -> String {
         let aliceKey = Curve25519.KeyAgreement.PrivateKey()
         let alice = I2PGarlicInboundSessionManager(localKey: aliceKey)
         let bob = I2PGarlicSession(peerPublicKey: aliceKey.publicKey, tagsPerHandshake: 4)
 
-        // First send: ECIES new-session envelope.
-        let firstSet = try sampleCloveSet(messageID: 0x00CA_FE01)
+        // First send: ECIES-X25519 three-section new-session envelope carrying
+        // the tag-set seed in its Options block.
+        let tagSet = bob.prepareHandshakeTags()
+        guard let tagSet else { throw I2PWireError.invalidFormat }
+        let firstSet = try sampleCloveSet(messageID: 0x00CA_FE01,
+                                          tagSetSeed: tagSet.seed, tagCount: tagSet.count)
         let firstBytes = try firstSet.serialize()
         let wrapped1 = try bob.wrapCloveSet(firstBytes)
         guard wrapped1 != firstBytes else { throw I2PWireError.invalidFormat }
-        let unwrapped1 = try alice.unwrapPayload(wrapped1)
-        guard try unwrapped1.serialize() == firstBytes else { throw I2PWireError.invalidFormat }
 
-        // Second send: tag-based continuation over the established session.
+        // Section layout: ephemeral (32) + static (32 plaintext + 16 tag = 48)
+        // + payload section; the first 32 bytes are a valid X25519 curve point.
+        guard wrapped1.count > 32 + 48 + 16 else { throw I2PWireError.invalidFormat }
+        _ = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: Data(wrapped1.prefix(32)))
+
+        let unwrapped1 = try alice.unwrapPayload(wrapped1, messageID: firstSet.messageID)
+        guard try unwrapped1.serialize() == firstBytes else { throw I2PWireError.invalidFormat }
+        // The Options block registered the tag set: 4 ratcheted tags now bound.
+        guard alice.tagManager.count == 4 else { throw I2PWireError.invalidFormat }
+
+        // Second send: tag-based continuation with the first ratcheted tag.
         let secondBytes = try sampleCloveSet(messageID: 0x00CA_FE02).serialize()
         let wrapped2 = try bob.wrapCloveSet(secondBytes)
-        guard wrapped2.count > I2PGarlicCrypto.tagLength + 16 else { throw I2PWireError.invalidFormat }
-        let unwrapped2 = try alice.unwrapPayload(wrapped2)
+        // Tag framing: [tag (32)][ciphertext ‖ 16-byte tag].
+        guard wrapped2.count == 32 + secondBytes.count + 16 else { throw I2PWireError.invalidFormat }
+        let unwrapped2 = try alice.unwrapPayload(wrapped2, messageID: 0x00CA_FE02)
         guard try unwrapped2.serialize() == secondBytes else { throw I2PWireError.invalidFormat }
-        return "new-session and tag-based envelopes both round-trip the clove set byte-for-byte"
+        return "three-section new-session envelope round-trips byte-for-byte (tag set in its Options block); tag-based continuation round-trips"
     }
 
     private static func garlicCloveRoundTrip() throws -> String {
@@ -1664,35 +1687,48 @@ enum I2PCrossValidation {
                                                    delayMilliseconds: nil)
         let message = I2NPMessage(type: .deliveryStatus, messageID: 42,
                                   payload: Data("clove payload".utf8))
-        let clove = I2PGarlicClove(deliveryInstructions: instructions, message: message,
-                                   certificate: I2PGarlicCertificate(type: 5, payload: Data([0xAB, 0xCD])))
-        let encoded = try clove.serialize()
-        let (parsed, consumed) = try I2PGarlicClove.parse(encoded)
-        guard consumed == encoded.count else { throw I2PWireError.invalidFormat }
-        guard try parsed.serialize() == encoded else { throw I2PWireError.invalidFormat }
+        let clove = I2PGarlicClove(deliveryInstructions: instructions, message: message)
+        let blockBody = try clove.serialize()
+        let parsed = try I2PGarlicClove.parse(blockBody)
         guard parsed.deliveryInstructions.tunnelID == 0x0000_55AA,
               parsed.message.messageID == 42 else {
             throw I2PWireError.invalidFormat
         }
-        return "clove (instructions + I2NP + certificate) round trips byte-for-byte with exact consumption"
+        guard try parsed.serialize() == blockBody else { throw I2PWireError.invalidFormat }
+        // A delay-flagged instruction round-trips through the flag-byte format too.
+        let delayed = I2PDeliveryInstructions(mode: .local, tunnelID: nil,
+                                              routerHash: nil, delayMilliseconds: 4000)
+        let delayedBody = try I2PGarlicClove(
+            deliveryInstructions: delayed,
+            message: I2NPMessage(type: .dataMessage, payload: Data("x".utf8))).serialize()
+        let delayedParsed = try I2PGarlicClove.parse(delayedBody)
+        guard delayedParsed.deliveryInstructions.delayMilliseconds == 4000,
+              try delayedParsed.serialize() == delayedBody else { throw I2PWireError.invalidFormat }
+        return "cloves (garlic flag-byte delivery instructions + I2NP message) round-trip byte-for-byte"
     }
 
+    /// Tag sets ratchet per-tag keys that are strictly single-use; replayed and
+    /// tampered payloads rejected; the Options-block tag delivery round trips.
     private static func garlicTagReplay() throws -> String {
-        // Single-use tags at the manager level.
+        // Single-use tags at the manager level, registered from a tag-set seed.
         let manager = I2PGarlicInboundTagManager()
-        let sessionKey = I2PCrypto.randomBytes(32)
-        let tagA = I2PCrypto.randomBytes(32)
-        let tagB = I2PCrypto.randomBytes(32)
-        manager.register([tagA, tagB], sessionKey: sessionKey)
-        guard manager.consume(tagA) == sessionKey else { throw I2PWireError.invalidFormat }
-        guard manager.consume(tagA) == nil else { throw I2PWireError.invalidFormat } // replayed tag rejected
-        guard manager.consume(tagB) == sessionKey else { throw I2PWireError.invalidFormat }
+        let seed = I2PCrypto.randomBytes(I2PGarlicCrypto.tagLength)
+        manager.register(tagSetSeed: seed, count: 2)
+        let chain = I2PGarlicCrypto.tagSet(seed: seed, count: 2)
+        guard manager.consume(chain[0].tag) == chain[0].key else { throw I2PWireError.invalidFormat }
+        guard manager.consume(chain[0].tag) == nil else { throw I2PWireError.invalidFormat } // replayed tag rejected
+        guard manager.consume(chain[1].tag) == chain[1].key else { throw I2PWireError.invalidFormat }
 
         // End-to-end: a replayed tag-based payload fails to decrypt.
         let aliceKey = Curve25519.KeyAgreement.PrivateKey()
         let alice = I2PGarlicInboundSessionManager(localKey: aliceKey)
         let bob = I2PGarlicSession(peerPublicKey: aliceKey.publicKey, tagsPerHandshake: 4)
-        _ = try alice.unwrapPayload(try bob.wrapCloveSet(try sampleCloveSet(messageID: 1).serialize()))
+        let handshake = bob.prepareHandshakeTags()
+        guard let handshake else { throw I2PWireError.invalidFormat }
+        _ = try alice.unwrapPayload(
+            try bob.wrapCloveSet(try sampleCloveSet(messageID: 1,
+                                                    tagSetSeed: handshake.seed,
+                                                    tagCount: handshake.count).serialize()))
         let tagBytes = try sampleCloveSet(messageID: 2).serialize()
         let tagged = try bob.wrapCloveSet(tagBytes)
         guard try alice.unwrapPayload(tagged).serialize() == tagBytes else { throw I2PWireError.invalidFormat }
@@ -1705,43 +1741,169 @@ enum I2PCrossValidation {
         guard expectThrow({ _ = try alice.unwrapPayload(tampered) }) else {
             throw I2PCrossValidationError.unexpectedSuccess
         }
-        // The session-tags record round trips; malformed records rejected.
-        let record = I2PGarlicSessionTagsRecord(tags: [tagA, tagB])
-        guard I2PGarlicSessionTagsRecord.parse(record.serialize())?.tags == [tagA, tagB] else {
+        // The Options-block tag delivery round trips; malformed bodies rejected.
+        let encoded = try I2PGarlicBlock.encode([.options(tagSetSeed: seed, tagCount: 2)])
+        guard case .options(let seedBack, let countBack) = try I2PGarlicBlock.decode(encoded)[0],
+              seedBack == seed, countBack == 2 else {
             throw I2PWireError.invalidFormat
         }
-        guard I2PGarlicSessionTagsRecord.parse(Data([1, 2, 0])) == nil else {
-            throw I2PWireError.invalidFormat
+        guard expectThrow({ _ = try I2PGarlicBlock.encode([.options(tagSetSeed: Data(repeating: 0, count: 8), tagCount: 2)]) }) else {
+            throw I2PCrossValidationError.unexpectedSuccess
         }
-        return "tags strictly single-use; replayed and tampered payloads rejected; tags record round trips"
+        return "ratcheted per-tag keys strictly single-use; replayed and tampered payloads rejected; Options-block delivery round trips"
     }
 
     private static func garlicHKDFChecks() throws -> String {
-        // Session key derivation is deterministic for the same DH pair.
-        let ephemeral = Curve25519.KeyAgreement.PrivateKey()
-        let peer = Curve25519.KeyAgreement.PrivateKey()
-        let key1 = try I2PGarlicCrypto.sessionKey(ephemeral: ephemeral, peerPublicKey: peer.publicKey)
-        let key2 = try I2PGarlicCrypto.sessionKey(ephemeral: ephemeral, peerPublicKey: peer.publicKey)
-        guard key1 == key2, key1.count == 32 else { throw I2PWireError.invalidFormat }
-        let otherEphemeral = Curve25519.KeyAgreement.PrivateKey()
-        guard try I2PGarlicCrypto.sessionKey(ephemeral: otherEphemeral, peerPublicKey: peer.publicKey) != key1 else {
-            throw I2PWireError.invalidFormat
-        }
-        // Tag nonces: deterministic per tag, 12 bytes, tag-sensitive.
-        let tag = I2PCrypto.randomBytes(32)
-        guard I2PGarlicCrypto.tagNonce(tag: tag) == I2PGarlicCrypto.tagNonce(tag: tag) else {
-            throw I2PWireError.invalidFormat
-        }
-        guard I2PGarlicCrypto.tagNonce(tag: tag).count == 12 else { throw I2PWireError.invalidFormat }
-        guard I2PGarlicCrypto.tagNonce(tag: I2PCrypto.randomBytes(32)) != I2PGarlicCrypto.tagNonce(tag: tag) else {
-            throw I2PWireError.invalidFormat
-        }
-        // Label constants are pinned so the garlic alignment item's change is deliberate.
-        guard I2PGarlicCrypto.infoSession == "i2p-garlic-ecies-x25519",
-              I2PGarlicCrypto.infoTagNonce == "i2p-garlic-tag-nonce",
+        // The spec protocol context: every garlic HKDF binds its output to the
+        // ECIES-X25519 protocol name, and the tag length is 32 bytes.
+        guard I2PGarlicCrypto.protocolName == "ECIES-X25519-AEAD-RATCHET",
+              I2PGarlicCrypto.infoStaticSection == Data("ECIES-X25519-AEAD-RATCHET".utf8),
+              I2PGarlicCrypto.infoPayloadSection == I2PGarlicCrypto.infoStaticSection,
               I2PGarlicCrypto.tagLength == 32 else {
             throw I2PWireError.invalidFormat
         }
-        return "session keys and tag nonces deterministic and tag-bound; HKDF info labels pinned (spec alignment tracked under GL-HKDF)"
+        // Section key schedule cross-check: the static section decrypts (with
+        // the KDF-derived key) to exactly the sender's static public key.
+        let aliceKey = Curve25519.KeyAgreement.PrivateKey()
+        let senderStatic = Curve25519.KeyAgreement.PrivateKey()
+        let blocks = I2PCrypto.randomBytes(200)
+        let envelope = try I2PGarlicCrypto.sealNewSession(blocks,
+                                                          peerStatic: aliceKey.publicKey,
+                                                          senderStatic: senderStatic)
+        let ephemeralPublic = Data(envelope.prefix(32))
+        let h0 = I2PCrypto.sha256(Data(I2PGarlicCrypto.protocolName.utf8))
+        let h1 = I2PCrypto.sha256(h0 + ephemeralPublic)
+        let es = try senderStatic.sharedSecretFromKeyAgreement(
+            with: Curve25519.KeyAgreement.PublicKey(rawRepresentation: ephemeralPublic))
+        let temp = Data(HMAC<SHA256>.authenticationCode(for: es.withUnsafeBytes { Data($0) },
+                                                        using: SymmetricKey(data: h0)))
+        let ck1 = Data(HMAC<SHA256>.authenticationCode(for: Data([0x01]),
+                                                       using: SymmetricKey(data: temp)))
+        let staticSectionKey = Data(HMAC<SHA256>.authenticationCode(for: ck1,
+                                                                    using: SymmetricKey(data: temp)))
+        let staticPlain = try ChaChaPoly.open(
+            try ChaChaPoly.SealedBox(combined: envelope.subdata(in: 32..<80)),
+            using: SymmetricKey(data: staticSectionKey))
+        guard staticPlain == senderStatic.publicKey.rawRepresentation else {
+            throw I2PWireError.invalidFormat
+        }
+        // Tag-set ratchets: deterministic from the seed, seed-sensitive, and
+        // each tag is 32 bytes with its own distinct ratcheted key.
+        let seed = I2PCrypto.randomBytes(32)
+        let set = I2PGarlicCrypto.tagSet(seed: seed, count: 3)
+        guard set.count == 3, set.allSatisfy({ $0.tag.count == 32 && $0.key.count == 32 }) else {
+            throw I2PWireError.invalidFormat
+        }
+        guard set == I2PGarlicCrypto.tagSet(seed: seed, count: 3) else {
+            throw I2PWireError.invalidFormat
+        }
+        guard set != I2PGarlicCrypto.tagSet(seed: I2PCrypto.randomBytes(32), count: 3) else {
+            throw I2PWireError.invalidFormat
+        }
+        guard Set(set.map(\.tag.hex)).count == 3 else { throw I2PWireError.invalidFormat }
+        return "ECIES-X25519 info strings pinned to the spec protocol context; section keys derive per the spec schedule; tag-set ratchets deterministic and seed-bound"
+    }
+
+    // MARK: Garlic payload blocks + tag ratchet
+
+    /// Typed payload blocks per the ECIES-X25519 spec: DateTime (0), I2NP (1),
+    /// Options (3), Termination (4) and Padding (254) frame as
+    /// [type (1)][length (2 BE)][body]; unknown types are skipped on decode.
+    private static func garlicBlocksRoundTrip() throws -> String {
+        let date = Date(timeIntervalSince1970: 1_800_000_123)
+        let delivery = I2PDeliveryInstructions(mode: .tunnel, tunnelID: 0x0102_0304,
+                                               routerHash: I2PCrypto.randomBytes(32),
+                                               delayMilliseconds: 250)
+        let message = I2NPMessage(type: .dataMessage, payload: I2PCrypto.randomBytes(60))
+        let seed = I2PCrypto.randomBytes(32)
+        let blocks: [I2PGarlicBlock] = [
+            .dateTime(date),
+            .i2np(deliveryInstructions: delivery, message: message),
+            .options(tagSetSeed: seed, tagCount: 4),
+            .termination(reason: 3),
+            .padding(I2PCrypto.randomBytes(11)),
+        ]
+        let encoded = try I2PGarlicBlock.encode(blocks)
+        let decoded = try I2PGarlicBlock.decode(encoded)
+        guard decoded.count == 5 else { throw I2PWireError.invalidFormat }
+        guard try I2PGarlicBlock.encode(decoded) == encoded else { throw I2PWireError.invalidFormat }
+        guard case .dateTime(let dateBack) = decoded[0],
+              abs(dateBack.timeIntervalSince1970.rounded() - date.timeIntervalSince1970.rounded()) < 1 else {
+            throw I2PWireError.invalidFormat
+        }
+        guard case .i2np(let deliveryBack, let messageBack) = decoded[1],
+              deliveryBack.mode == .tunnel, deliveryBack.tunnelID == 0x0102_0304,
+              deliveryBack.delayMilliseconds == 250,
+              messageBack.serialize() == message.serialize() else {
+            throw I2PWireError.invalidFormat
+        }
+        guard case .options(let seedBack, let countBack) = decoded[2],
+              seedBack == seed, countBack == 4 else {
+            throw I2PWireError.invalidFormat
+        }
+        guard case .termination(let reason) = decoded[3], reason == 3 else {
+            throw I2PWireError.invalidFormat
+        }
+        // Unknown block types are skipped per spec.
+        var withUnknown = I2PWriter()
+        withUnknown.byte(0x7A)
+        withUnknown.short(2)
+        withUnknown.raw(Data([0xAA, 0xBB]))
+        withUnknown.raw(encoded)
+        guard try I2PGarlicBlock.decode(withUnknown.data).count == 5 else {
+            throw I2PWireError.invalidFormat
+        }
+        return "5 block types round-trip byte-for-byte; unknown types skipped per spec"
+    }
+
+    /// Tag-set ratchet per the spec: the chain advances per tag, every tag
+    /// binds to its own ratcheted key, and an exhausted set forces a fresh
+    /// new-session handshake carrying a new seed.
+    private static func garlicTagRatchetSpec() throws -> String {
+        let aliceKey = Curve25519.KeyAgreement.PrivateKey()
+        let alice = I2PGarlicInboundSessionManager(localKey: aliceKey)
+        let bob = I2PGarlicSession(peerPublicKey: aliceKey.publicKey, tagsPerHandshake: 4)
+
+        // First handshake: the tag-set seed rides in the Options block.
+        guard let firstSet = bob.prepareHandshakeTags(), firstSet.seed.count == 32 else {
+            throw I2PGarlicError.invalidPayload
+        }
+        let firstEnvelope = try bob.wrapCloveSet(
+            try sampleCloveSet(messageID: 0x00D1_0001,
+                               tagSetSeed: firstSet.seed, tagCount: firstSet.count).serialize())
+        _ = try alice.unwrapPayload(firstEnvelope)
+        guard alice.tagManager.count == 4 else { throw I2PWireError.invalidFormat }
+
+        // Four tag-based sends consume the set in order; each decrypts with
+        // its own ratcheted key.
+        for index in 0..<4 {
+            let envelope = try bob.wrapCloveSet(
+                try sampleCloveSet(messageID: UInt32(index + 0x00D1_0010)).serialize())
+            let set = try alice.unwrapPayload(envelope)
+            guard set.messageID == UInt32(index + 0x00D1_0010) else {
+                throw I2PWireError.invalidFormat
+            }
+        }
+        guard alice.tagManager.count == 0, bob.isEstablished == false else {
+            throw I2PWireError.invalidFormat
+        }
+
+        // The exhausted set forces a new handshake: the next envelope carries
+        // a FRESH seed and the receiver registers its new ratchet chain.
+        guard let secondSet = bob.prepareHandshakeTags() else { throw I2PGarlicError.invalidPayload }
+        guard secondSet.seed != firstSet.seed else { throw I2PWireError.invalidFormat }
+        let secondEnvelope = try bob.wrapCloveSet(
+            try sampleCloveSet(messageID: 0x00D1_0020,
+                               tagSetSeed: secondSet.seed, tagCount: secondSet.count).serialize())
+        let set = try alice.unwrapPayload(secondEnvelope)
+        guard alice.tagManager.count == 4, set.tagSetSeed == secondSet.seed else {
+            throw I2PWireError.invalidFormat
+        }
+
+        // Tag-based continuation resumes on the new ratchet chain.
+        let resumed = try bob.wrapCloveSet(try sampleCloveSet(messageID: 0x00D1_0021).serialize())
+        _ = try alice.unwrapPayload(resumed)
+        guard alice.tagManager.count == 3 else { throw I2PWireError.invalidFormat }
+        return "tag chain advances per tag over 4 single-use sends; exhausted sets re-handshake with a fresh seed and the ratchet resumes"
     }
 }
