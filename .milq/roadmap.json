@@ -115,6 +115,82 @@
       "status" : "pending",
       "title" : "SAMv3.3 App",
       "updatedAt" : "2026-10-17T01:31:25Z"
+    },
+    {
+      "createdAt" : "2026-10-17T14:20:08Z",
+      "description" : "Stage 1-3 of the alignment program as an in-app data model: a specification truth table covering every implemented structure and protocol (Destination, RouterInfo, LeaseSet, I2NP header and message bodies, NTCP2 handshake phases and frames, tunnel build records, garlic clove sets) with field-by-field wire layout, encoding rules, cryptographic parameters (EncType 4\/5, SigType 7\/11, HKDF labels) and edge-case rules (expiry, replay, signature rejection). Each Swift component is linked to its spec section and its Java I2P reference class (RouterInfo.java, LeaseSet.java, NTCP2Connection.java, TunnelPool.java, GarlicMessageBuilder.java, InNetMessageJob.java), with every known deviation from the compliance review classified as intentional (with rationale) or defect. Delivered as structured data (not prose only) so the alignment report can render coverage and statuses directly from it.",
+      "glyph" : "clipboard with checklist",
+      "id" : "b3fbb966",
+      "mockups" : [
+
+      ],
+      "status" : "pending",
+      "title" : "Build the spec truth table with component traceability",
+      "updatedAt" : "2026-10-17T14:20:08Z"
+    },
+    {
+      "createdAt" : "2026-10-17T14:20:08Z",
+      "description" : "Stage 4 unit-level compliance tests runnable in the app: byte-for-byte round-trip fidelity for RouterInfo, LeaseSet, Destination, I2NP headers and each message body, tunnel build records and NTCP2 payload blocks (serialize, parse, reserialize must produce identical bytes); cryptographic cross-checks (pure Ed25519 vs CryptoKit, Ed25519ph dom2 behavior, BLAKE2b known-answer vector, ChaChaPoly\/HKDF determinism, nonce96 layout); edge cases (expired RouterInfo and LeaseSet rejection, unsigned entry rejection, replayed session tags, short and oversized payloads, tampered frame MACs). Each test is tagged with a truth-table row ID from the baseline so a failure pinpoints the violated requirement. Results surface in the self-test card and feed the alignment report.",
+      "glyph" : "balanced scale",
+      "id" : "d4b43947",
+      "mockups" : [
+
+      ],
+      "status" : "pending",
+      "title" : "Run cross-validation compliance suite",
+      "updatedAt" : "2026-10-17T14:20:08Z"
+    },
+    {
+      "createdAt" : "2026-10-17T14:20:08Z",
+      "description" : "New Alignment tab rendering the truth table live: per-component sections (Crypto, Structures, NetDB, NTCP2, Tunnels, Garlic, I2NP), each row showing its spec section, Java reference class, status (aligned \/ deviation documented \/ pending wire verification) and passing test count from the cross-validation suite; a header summary card with overall alignment coverage and last-run timestamp; a Run alignment suite button refreshing everything; tapping a deviation expands its documented rationale. Dark theme, violet accent, consistent with the I2P Core and Router tabs.",
+      "glyph" : "chart with checkmarks",
+      "id" : "e11d2466",
+      "mockups" : [
+        {
+          "brief" : "Alignment report screen for the I2P router app, a new third tab beside the existing dark 'I2P Core' and 'Router' tabs. Purpose: show how closely the Swift router matches the I2P specification and the Java reference implementation, and let the user run the alignment test suite. Top to bottom: large navigation title 'Alignment' with a subtitle line 'spec truth table · Java I2P reference · Swift router'; a summary card with a big monospaced percentage (e.g. '86% aligned'), a thin progress bar in violet, and the caption 'last run 14:32 · 61 of 71 requirements verified' plus a filled rounded 'Run alignment suite' button; then per-component sections as stacked cards titled CRYPTO, STRUCTURES, NETDB, NTCP2, TUNNELS, GARLIC, I2NP — each card lists rows like 'RouterInfo serialization — spec: common\/routerinfo · Java: RouterInfo.java · 6\/6 tests · aligned' or 'Garlic envelope framing — ECIES-X25519 blocks · deviation documented', each row prefixed with a green checkmark circle, an orange flag circle for documented deviations, or a gray dashed circle for pending wire verification; tapping an orange row reveals an indented rationale paragraph. Palette: near-black blue background, white primary text, violet accent, green\/orange status colors, monospaced numerals for counts and percentages, card corners like the existing tabs. Mood: technical, precise, calm.",
+          "id" : "d8be1f18",
+          "title" : "Alignment report"
+        }
+      ],
+      "status" : "pending",
+      "title" : "Show the alignment report screen",
+      "updatedAt" : "2026-10-17T14:20:08Z"
+    },
+    {
+      "createdAt" : "2026-10-17T14:20:08Z",
+      "description" : "Close the NTCP2 divergences from the compliance review so handshakes match real routers: derive the ephemeral-key obfuscation key and IV per the NTCP2 spec (AES-256-CBC keystream with the spec KDF, replacing the ChaCha20-Poly1305 substitution), add the message-1 options length prefix, and implement the spec's data-phase KDF for the SipHash length-obfuscation keys. All handshake, frame and negotiation tests must round-trip through the new implementation, and the NTCP2 alignment rows flip from deviation documented to aligned.",
+      "glyph" : "network plug with wrench",
+      "id" : "77841738",
+      "mockups" : [
+
+      ],
+      "status" : "pending",
+      "title" : "Align NTCP2 obfuscation and framing with the spec",
+      "updatedAt" : "2026-10-17T14:20:08Z"
+    },
+    {
+      "createdAt" : "2026-10-17T14:20:08Z",
+      "description" : "Align tunnel data layering with the tunnel specification: AES-256-CBC layer encryption with 16-byte tunnel IVs and the full TunnelData payload layout (4-byte tunnel ID, 16-byte IV, 1008-byte body), using the per-hop layer and IV keys the pool already manages. Update the data processor, hop processing and all tunnel tests so tunnel payloads serialize byte-for-byte like real hops; the tunnels alignment rows flip to aligned.",
+      "glyph" : "tunnel with padlock",
+      "id" : "b334a3fb",
+      "mockups" : [
+
+      ],
+      "status" : "pending",
+      "title" : "Align tunnel layer crypto with the tunnel spec",
+      "updatedAt" : "2026-10-17T14:20:08Z"
+    },
+    {
+      "createdAt" : "2026-10-17T14:20:08Z",
+      "description" : "Align the garlic envelope with the ECIES-X25519 specification: three-section new-session framing (ephemeral, static, payload sections), payload blocks (DateTime, I2NP, Options, Termination, Padding), the spec HKDF info strings for session key derivation, and the tag-based continuation rules with 32-byte session tags. Update the garlic wrapping\/unwrapping pipeline and its tests so clove sets serialize to the spec shape; the garlic alignment rows flip to aligned.",
+      "glyph" : "garlic bulb with padlock",
+      "id" : "4015a9f4",
+      "mockups" : [
+
+      ],
+      "status" : "pending",
+      "title" : "Align garlic envelope with ECIES-X25519 framing",
+      "updatedAt" : "2026-10-17T14:20:08Z"
     }
   ],
   "version" : 1
