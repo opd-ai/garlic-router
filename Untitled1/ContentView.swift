@@ -10,6 +10,7 @@ struct ContentView: View {
     @State private var readinessResults: [I2PSelfTestResult] = []
     @State private var stabilityResults: [I2PSelfTestResult] = []
     @State private var hardeningResults: [I2PSelfTestResult] = []
+    @State private var specResults: [I2PSelfTestResult] = []
     @State private var sizes: [(name: String, bytes: Int)] = []
 
     private let accent = Color(red: 0.47, green: 0.44, blue: 0.97)
@@ -48,6 +49,7 @@ struct ContentView: View {
                     readinessCard
                     stabilityCard
                     hardeningCard
+                    specCard
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 4)
@@ -189,6 +191,63 @@ struct ContentView: View {
                 }
 
                 Text("Fail closed: ambiguous states are rejected, quotas bound every resource, secrets are erased and redacted from diagnostics.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// The spec-derived conformance audit: every locally-verifiable phase of
+    /// the official-spec production checklist rides deterministic probes
+    /// (I2NP header format, SSU2 packet-number windows, RFC crypto primitives,
+    /// RouterInfo verification) plus a blanket gate over the local conformance
+    /// suite. Live-network interop probes ride the mainnet suite.
+    private func runSpecAudit() {
+        Task {
+            let fresh = await I2PSpecConformanceAudit.runAll()
+            await MainActor.run { specResults = fresh }
+        }
+    }
+
+    private var specCard: some View {
+        card(title: "Spec conformance") {
+            Button {
+                runSpecAudit()
+            } label: {
+                Label("Run spec conformance audit", systemImage: "checkmark.seal.fill")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .background(accent.opacity(0.15), in: RoundedRectangle(cornerRadius: 12))
+            }
+            .buttonStyle(.plain)
+            .tint(accent)
+
+            if !specResults.isEmpty {
+                let passed = specResults.filter(\.passed).count
+                Text(passed == specResults.count
+                     ? "\(passed) of \(specResults.count) probes passed — official-spec checklist verified"
+                     : "\(passed) of \(specResults.count) probes passed — findings below")
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(passed == specResults.count ? Color.green : Color.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                ForEach(specResults.indices, id: \.self) { index in
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: specResults[index].passed ? "checkmark.circle.fill" : "xmark.circle.fill")
+                            .foregroundStyle(specResults[index].passed ? Color.green : Color.red)
+                            .font(.caption)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(specResults[index].name)
+                                .font(.footnote.weight(.medium))
+                            Text(specResults[index].detail)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                Text("Locally-verifiable checklist phases run as deterministic probes; live-network interop items (Java I2P / i2pd handshakes, framed message flooding) ride the mainnet suite.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
