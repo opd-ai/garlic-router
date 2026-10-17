@@ -18,6 +18,7 @@ struct ContentView: View {
     @State private var hardeningExpanded = false
     @State private var specExpanded = false
     @State private var productionExpanded = false
+    @State private var readinessRunning = false
     @State private var sizes: [(name: String, bytes: Int)] = []
 
     private let accent = Color(red: 0.47, green: 0.44, blue: 0.97)
@@ -95,11 +96,14 @@ struct ContentView: View {
     /// The production readiness audit runs the existing compliance machinery
     /// plus dedicated readiness probes; it performs no mainnet traffic.
     private func runReadinessAudit() {
+        guard !readinessRunning else { return }
+        readinessRunning = true
         Task.detached {
             let fresh = await I2PReadinessAudit.runAll()
             await MainActor.run {
                 readinessResults = fresh
                 readinessExpanded = true
+                readinessRunning = false
             }
         }
     }
@@ -109,7 +113,8 @@ struct ContentView: View {
             Button {
                 runReadinessAudit()
             } label: {
-                Label("Run readiness audit", systemImage: "stethoscope")
+                Label(readinessRunning ? "Running readiness checks…" : "Run readiness audit",
+                      systemImage: readinessRunning ? "hourglass" : "stethoscope")
                     .font(.subheadline.weight(.semibold))
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 10)
@@ -117,6 +122,7 @@ struct ContentView: View {
             }
             .buttonStyle(.plain)
             .tint(accent)
+            .disabled(readinessRunning)
 
             if !readinessResults.isEmpty {
                 let passed = readinessResults.filter(\.passed).count

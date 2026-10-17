@@ -31,38 +31,32 @@ enum I2PReadinessArea: String, CaseIterable {
 
 enum I2PReadinessAudit {
 
-    /// Runs the full audit and returns per-area findings plus the overall
-    /// readiness verdict (the last entry).
+    /// Runs bounded, isolated checks only. The composite self-test suite also
+    /// starts real UDP listeners and mutates shared router state, so it must not
+    /// be nested inside this audit or run from an arbitrary detached task.
     static func runAll() async -> [I2PSelfTestResult] {
         var results: [I2PSelfTestResult] = []
 
-        // 1. Existing suite coverage, bucketed by readiness area. The local
-        //    round-trip/compliance suite already exercises most of the audit
-        //    scope; a failure anywhere in a bucket fails that area's coverage.
-        let local = await I2PSelfTest.runAll()
-        for area in I2PReadinessArea.allCases {
-            let bucketed = local.filter { Self.area(for: $0.name) == area }
-            guard !bucketed.isEmpty else { continue }
-            let passed = bucketed.filter(\.passed).count
-            let failures = bucketed.filter { !$0.passed }.prefix(3).map(\.name)
-            var detail = "\(passed)/\(bucketed.count) existing checks passed in this area"
-            if !failures.isEmpty {
-                detail += "; failures: \(failures.joined(separator: "; "))"
-            }
-            results.append(I2PSelfTestResult(
-                name: "Readiness · \(area.rawValue): existing coverage",
-                passed: passed == bucketed.count,
-                detail: detail))
+        let local = I2PSelfTest.runCoreTests()
+        let localPassed = local.filter(\.passed).count
+        let localFailures = local.filter { !$0.passed }.prefix(3).map(\.name)
+        var localDetail = "\(localPassed)/\(local.count) isolated core checks passed"
+        if !localFailures.isEmpty {
+            localDetail += "; failures: \(localFailures.joined(separator: "; "))"
         }
+        results.append(I2PSelfTestResult(
+            name: "Readiness · isolated core smoke checks",
+            passed: localPassed == local.count,
+            detail: localDetail))
 
-        // 2. Dedicated readiness probes for what the suites don't cover.
+        // Dedicated probes avoid live sockets and do not start, stop, or mutate
+        // the app's shared router instance.
         let dedicated: [(I2PReadinessArea, String, () throws -> String)] = [
             (.networkCompat, "wire type-code table & short-header framing", wireFraming),
             (.crypto, "primitive cross-checks & tamper rejection", cryptoPrimitives),
-            (.identity, "Keychain-backed identity, stable RouterHash, signature verification", identityPersistence),
+            (.identity, "isolated Keychain identity round-trip & signature verification", identityPersistence),
             (.tunnels, "pool lifetime clamping & build bounds", tunnelBounds),
             (.robustness, "malformed-input rejection & resource limits", robustnessProbes),
-            (.iosRuntime, "router lifecycle: clean shutdown & graceful resume", lifecycleCycle),
             (.compliance, "modern-only policy, keychain hygiene, tracked defect posture", compliancePosture),
         ]
         for (area, name, probe) in dedicated {
@@ -191,45 +185,55 @@ enum I2PReadinessAudit {
         return "Ed25519 + Ed25519ph sign/verify with tamper rejection, X25519 ECDH symmetric, AEAD round-trip with MAC rejection, HKDF deterministic (SHA-256/BLAKE2b vectors ride the crypto suite)"
     }
 
-    /// Identity persistence: the private key material lives in the Keychain
-    /// (stable RouterHash across restarts) and RouterInfo signatures verify
-    /// with tamper rejection.
+    /// Exercises Keychain persistence with an isolated throwaway identity. It
+    /// deliberately does not initialize or manipulate the app's shared router.
     private static func identityPersistence() throws -> String {
-        let probe = I2PCrypto.randomBytes(32)
-        I2PRouterKeychain.write(probe, account: "audit-probe")
-        guard I2PRouterKeychain.read(account: "audit-probe") == probe else {
-            throw I2PMainnetFailure(message: "Keychain write/read failed")
+        let signingAccount = "readiness-signing-\(UUID().uuidString)"
+        let encryptionAccount = "readiness-encryption-\(UUID().uuidString)"
+        defer {
+            I2PRouterKeychain.delete(account: signingAccount)
+            I2PRouterKeychain.delete(account: encryptionAccount)
         }
-        I2PRouterKeychain.delete(account: "audit-probe")
 
-        // Restart simulation: re-deriving the identity from the persisted keys
-        // must produce the running router's hash.
-        guard let seed = I2PRouterKeychain.read(account: "signingSeed"),
-              let encryption = I2PRouterKeychain.read(account: "encryptionKey"),
-              seed.count == 32, encryption.count == 32 else {
-            throw I2PMainnetFailure(message: "identity keys not persisted in the Keychain")
+        let signing = Curve25519.Signing.PrivateKey()
+        let encryptionKey = Curve25519.KeyAgreement.PrivateKey()
+        let seed = signing.rawRepresentation
+        let encryption = encryptionKey.rawRepresentation
+        guard I2PRouterKeychain.write(seed, account: signingAccount),
+              I2PRouterKeychain.write(encryption, account: encryptionAccount),
+              let restoredSeed = I2PRouterKeychain.read(account: signingAccount),
+              let restoredEncryption = I2PRouterKeychain.read(account: encryptionAccount),
+              restoredSeed == seed, restoredEncryption == encryption else {
+            throw I2PMainnetFailure(message: "isolated Keychain write/read failed")
         }
-        let signing = try Curve25519.Signing.PrivateKey(rawRepresentation: seed)
-        let encryptionKey = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: encryption)
-        let restored = I2PRouterIdentity(
+
+        let restoredSigning = try Curve25519.Signing.PrivateKey(rawRepresentation: restoredSeed)
+        let restoredEncryptionKey = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: restoredEncryption)
+        let identity = I2PRouterIdentity(
+            encryptionPublicKey: restoredEncryptionKey.publicKey.rawRepresentation,
+            signingPublicKey: restoredSigning.publicKey.rawRepresentation)
+        let originalIdentity = I2PRouterIdentity(
             encryptionPublicKey: encryptionKey.publicKey.rawRepresentation,
             signingPublicKey: signing.publicKey.rawRepresentation)
-        guard restored.hash == I2PRouterAppContext.shared.mainnetRouterHash else {
-            throw I2PMainnetFailure(message: "RouterHash changed across a restart simulation")
+        guard identity.hash == originalIdentity.hash else {
+            throw I2PMainnetFailure(message: "RouterHash changed across an isolated restore")
         }
 
-        // RouterInfo signature verification with tamper rejection.
-        let routerInfo = I2PRouterAppContext.shared.mainnetSignedRouterInfo
+        var routerInfo = I2PRouterInfo(identity: identity, published: Date(), addresses: [], options: ["netid": "2"])
+        try routerInfo.sign(withSeed: restoredSeed)
         let serialized = routerInfo.serialize()
         guard (try? I2PRouterInfo.parse(serialized)) != nil else {
-            throw I2PMainnetFailure(message: "our own RouterInfo failed to parse")
+            throw I2PMainnetFailure(message: "signed RouterInfo failed to parse")
+        }
+        guard serialized.count >= 5 else {
+            throw I2PMainnetFailure(message: "signed RouterInfo unexpectedly short")
         }
         var tampered = serialized
         tampered[tampered.count - 5] ^= 0xFF
         guard (try? I2PRouterInfo.parse(tampered)) == nil else {
             throw I2PMainnetFailure(message: "tampered RouterInfo accepted")
         }
-        return "identity keys persist in the Keychain (RouterHash stable across restarts, never in user defaults); RouterInfo signature verified with tamper rejection"
+        return "throwaway identity round-trips through the Keychain with a stable RouterHash; RouterInfo signature verifies and tampering is rejected"
     }
 
     /// Tunnel pool bounds: lifetimes clamp into the spec 10-30 minute range.
@@ -273,34 +277,6 @@ enum I2PReadinessAudit {
             throw I2PMainnetFailure(message: "replay window semantics broken")
         }
         return "truncated and unsupported-type I2NP rejected; token requests rate-limited per requester; the replay window rejects duplicates and out-of-window packets while accepting in-window reordering"
-    }
-
-    /// Router lifecycle: clean shutdown and graceful resume, idempotent.
-    private static func lifecycleCycle() throws -> String {
-        let context = I2PRouterAppContext.shared
-        context.shutdownForTermination()
-        guard context.lifecycleState == .suspended else {
-            throw I2PMainnetFailure(message: "shutdown did not suspend the router")
-        }
-        guard case .stopped = context.samServer.state else {
-            throw I2PMainnetFailure(message: "SAM socket not stopped on shutdown")
-        }
-        context.resumeAfterBackground()
-        guard context.lifecycleState == .running else {
-            throw I2PMainnetFailure(message: "resume did not restart the router")
-        }
-        // Idempotency: repeated transitions stay consistent.
-        context.shutdownForTermination()
-        context.shutdownForTermination()
-        guard context.lifecycleState == .suspended else {
-            throw I2PMainnetFailure(message: "repeated shutdown not idempotent")
-        }
-        context.resumeAfterBackground()
-        context.resumeAfterBackground()
-        guard context.lifecycleState == .running else {
-            throw I2PMainnetFailure(message: "repeated resume not idempotent")
-        }
-        return "clean shutdown (transports, tunnel pool maintenance, SAM socket) and graceful resume are wired through the app's scene-phase handler (network-interface changes re-run the reachability advertisement); repeated transitions are idempotent"
     }
 
     /// Compliance posture: the modern-only policy audit, keychain hygiene and
