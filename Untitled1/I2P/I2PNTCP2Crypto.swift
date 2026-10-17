@@ -3,12 +3,14 @@
 //  I2P
 //
 //  NTCP2 cryptographic core: Noise_XK_25519_ChaChaPoly_SHA256 chaining state,
-//  ephemeral key obfuscation, SipHash-2-4 length obfuscation, and the NTCP2
-//  payload block codec.
+//  the spec's AES-256-CBC ephemeral-key obfuscation (proposal 111 KDF),
+//  SipHash-2-4 length obfuscation with the spec data-phase KDF, and the
+//  NTCP2 payload block codec.
 //
 
 import Foundation
 import CryptoKit
+import CommonCrypto
 
 enum NTCP2Error: Error {
     case needMoreData
@@ -25,6 +27,12 @@ enum NTCP2Error: Error {
 /// resets the handshake AEAD nonce; `MixHash` folds wire material into `h`.
 struct NTCP2NoiseChain {
     static let protocolName = "Noise_XK_25519_ChaChaPoly_SHA256"
+
+    /// The ephemeral-key obfuscation KDF binds to this initial chaining key
+    /// (the protocol name verbatim), not to any advanced handshake state, so
+    /// both sides derive the obfuscation key and IV before any handshake
+    /// processing.
+    static var initialChainingKey: Data { NTCP2NoiseChain().chainingKey }
 
     private(set) var chainingKey: Data
     private(set) var hash: Data
@@ -88,13 +96,28 @@ struct NTCP2NoiseChain {
         return plaintext
     }
 
-    /// Noise Split(): the final chaining key expands into two independent
-    /// direction AEAD keys plus two SipHash keys for length obfuscation.
+    /// Noise Split(): temp_key = HMAC-SHA256(chaining_key, zerolen);
+    /// k_ab = HMAC-SHA256(temp_key, chaining_key || byte(0x01));
+    /// k_ba = HMAC-SHA256(temp_key, chaining_key || byte(0x02)).
+    /// The SipHash length-obfuscation keys come from the NTCP2 spec's
+    /// data-phase KDF (dataPhaseSipKey), not from the split output directly.
     func split() -> (ab: NTCP2DirectionKeys, ba: NTCP2DirectionKeys) {
-        let derived = Self.hkdf(chainingKey, Data(), outputs: 4)
-        let ab = NTCP2DirectionKeys(aeadKey: derived[0], sipKey: Data(derived[2].prefix(16)))
-        let ba = NTCP2DirectionKeys(aeadKey: derived[1], sipKey: Data(derived[3].prefix(16)))
-        return (ab, ba)
+        let temp = Self.hmac(Data(), key: chainingKey)
+        let k_ab = Self.hmac(chainingKey + Data([0x01]), key: temp)
+        let k_ba = Self.hmac(chainingKey + Data([0x02]), key: temp)
+        return (NTCP2DirectionKeys(aeadKey: k_ab, sipKey: Self.dataPhaseSipKey(k_ab)),
+                NTCP2DirectionKeys(aeadKey: k_ba, sipKey: Self.dataPhaseSipKey(k_ba)))
+    }
+
+    /// NTCP2 spec data-phase KDF for one direction's SipHash length-obfuscation key:
+    /// temp_key = HMAC-SHA256(k_direction, zerolen);
+    /// sipkey = first 16 bytes of HMAC-SHA256(temp_key, zerolen).
+    static func dataPhaseSipKey(_ directionKey: Data) -> Data {
+        Data(hmac(Data(), key: hmac(Data(), key: directionKey)).prefix(16))
+    }
+
+    private static func hmac(_ message: Data, key: Data) -> Data {
+        Data(HMAC<SHA256>.authenticationCode(for: message, using: SymmetricKey(data: key)))
     }
 
     /// Noise HKDF: HMAC(chain, ikm), then chained HMAC(temp, previous || counter).
@@ -136,26 +159,69 @@ struct NTCP2SessionKeys {
     let recvKeys: NTCP2DirectionKeys
 }
 
-/// NTCP2 ephemeral key obfuscation on the wire. The spec's AES-CBC layer is
-/// realized as a ChaCha20 keystream keyed from the responder's static key;
-/// message 1 uses keystream counter 0 and message 2 counter 1 under the IV
-/// carried in message 1 (both sides derive the same keystreams).
+/// NTCP2 spec ephemeral-key obfuscation (proposal 111): the 32-byte ephemeral
+/// keys in messages 1 and 2 are AES-256-CBC-encrypted with a key and IV derived
+/// by the spec KDF — temp_key = HMAC-SHA256(chaining_key, remote_material), then
+/// the HKDF chain expansion of temp_key yields the 32-byte AES key and the
+/// 16-byte IV. `remote_material` is the responder's static public key for
+/// message 1 and the initiator's deobfuscated ephemeral key for message 2; both
+/// bind to the initial chaining key (protocol name verbatim) so both sides can
+/// derive them before any handshake state advances. Deterministic: the same
+/// inputs always produce the same wire bytes.
 enum NTCP2KeyObfuscation {
-    static func key(remoteStatic: Data) -> Data {
-        NTCP2NoiseChain.sha256(Data("NTCP2 ephemeral key obfuscation".utf8) + remoteStatic)
+    static func keyAndIV(material: Data, chainingKey: Data) -> (key: Data, iv: Data) {
+        let temp = hmac(material, key: chainingKey)
+        let blocks = NTCP2NoiseChain.hkdf(temp, Data(), outputs: 2)
+        return (blocks[0], Data(blocks[1].prefix(16)))
     }
 
-    static func keystream(key: Data, counter: UInt64, length: Int) -> Data {
-        let zeros = Data(repeating: 0, count: length)
-        let box = try! ChaChaPoly.seal(zeros,
-                                       using: SymmetricKey(data: key),
-                                       nonce: NTCP2NoiseChain.nonce96(counter))
-        return box.ciphertext // ciphertext of zeros is the raw keystream
+    static func encrypt(_ key32: Data, chainingKey: Data, material: Data) throws -> Data {
+        let (k, iv) = keyAndIV(material: material, chainingKey: chainingKey)
+        return I2PAESCBC.encrypt(key32, key: k, iv: iv)
     }
 
-    static func apply(_ key32: Data, obfuscationKey: Data, counter: UInt64) -> Data {
-        let stream = keystream(key: obfuscationKey, counter: counter, length: key32.count)
-        return Data(zip(key32, stream).map { $0 ^ $1 })
+    static func decrypt(_ key32: Data, chainingKey: Data, material: Data) throws -> Data {
+        let (k, iv) = keyAndIV(material: material, chainingKey: chainingKey)
+        return I2PAESCBC.decrypt(key32, key: k, iv: iv)
+    }
+
+    private static func hmac(_ message: Data, key: Data) -> Data {
+        Data(HMAC<SHA256>.authenticationCode(for: message, using: SymmetricKey(data: key)))
+    }
+}
+
+/// AES-256-CBC without padding (CommonCrypto), as required by the NTCP2 spec's
+/// ephemeral-key obfuscation (block-aligned 32-byte input, 32-byte output).
+enum I2PAESCBC {
+    static func encrypt(_ data: Data, key: Data, iv: Data) -> Data {
+        crypt(data, key: key, iv: iv, operation: kCCEncrypt)
+    }
+
+    static func decrypt(_ data: Data, key: Data, iv: Data) -> Data {
+        crypt(data, key: key, iv: iv, operation: kCCDecrypt)
+    }
+
+    private static func crypt(_ data: Data, key: Data, iv: Data, operation: CCOperation) -> Data {
+        precondition(key.count == Int(kCCKeySizeAES256), "AES-256 key required")
+        precondition(iv.count == Int(kCCBlockSizeAES128), "16-byte IV required")
+        precondition(data.count % Int(kCCBlockSizeAES128) == 0, "AES-CBC input must be block-aligned")
+        var output = Data(repeating: 0, count: data.count)
+        var moved = 0
+        let status = output.withUnsafeMutableBytes { outputBuffer -> CCCryptorStatus in
+            key.withUnsafeBytes { keyBuffer -> CCCryptorStatus in
+                iv.withUnsafeBytes { ivBuffer -> CCCryptorStatus in
+                    data.withUnsafeBytes { dataBuffer -> CCCryptorStatus in
+                        CCCrypt(operation, CCAlgorithm(kCCAlgorithmAES), CCOptions(0),
+                                keyBuffer.baseAddress, key.count,
+                                ivBuffer.baseAddress,
+                                dataBuffer.baseAddress, data.count,
+                                outputBuffer.baseAddress, outputBuffer.count, &moved)
+                    }
+                }
+            }
+        }
+        precondition(status == kCCSuccess, "AES-CBC failed with status \(status)")
+        return output
     }
 }
 

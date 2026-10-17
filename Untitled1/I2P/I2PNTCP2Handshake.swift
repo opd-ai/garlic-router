@@ -20,7 +20,6 @@ final class NTCP2InitiatorHandshake {
     private let localStatic: Curve25519.KeyAgreement.PrivateKey
     private let remoteStatic: Curve25519.KeyAgreement.PublicKey
     private var ephemeral: Curve25519.KeyAgreement.PrivateKey?
-    private let obfuscationKey: Data
     private var ourRouterInfo = Data()
     private var sessionKeys: NTCP2SessionKeys?
 
@@ -30,12 +29,12 @@ final class NTCP2InitiatorHandshake {
         }
         localStatic = localStaticKey
         remoteStatic = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: remoteStaticKey)
-        obfuscationKey = NTCP2KeyObfuscation.key(remoteStatic: remoteStaticKey)
         // Noise pre-message: <- s
         chain.mixHash(remoteStaticKey)
     }
 
-    /// Message 1 (SessionRequest): IV || obfuscated e || AEAD(options) || padding.
+    /// Message 1 (SessionRequest): obfuscated e (AES-256-CBC per the spec KDF)
+    /// + 2-byte options length prefix + AEAD(options) + padding.
     /// Options (16 bytes): version(1)=12, paddingLen(1), m3p2len(2), timestamp(8), reserved(4).
     func makeSessionRequest(routerInfo: Data, padding: Int = 0) throws -> Data {
         guard stage == .awaitingSessionCreated else {
@@ -46,12 +45,10 @@ final class NTCP2InitiatorHandshake {
         }
         ourRouterInfo = routerInfo
 
-        let iv = I2PCrypto.randomBytes(16)
-        chain.mixHash(iv)
-
         let e = Curve25519.KeyAgreement.PrivateKey()
         ephemeral = e
-        chain.mixHash(e.publicKey.rawRepresentation)
+        let ephemeralPublic = e.publicKey.rawRepresentation
+        chain.mixHash(ephemeralPublic)
         // "es": MixKey(DH(e, rs))
         let es = try e.sharedSecretFromKeyAgreement(with: remoteStatic)
         chain.mixKey(es.withUnsafeBytes { Data($0) })
@@ -65,34 +62,49 @@ final class NTCP2InitiatorHandshake {
         options.replaceSubrange(4..<12, with: NTCP2Time.milliseconds(Date()))
         let ciphertext = try chain.encrypt(options)
 
-        let obfuscatedE = NTCP2KeyObfuscation.apply(e.publicKey.rawRepresentation,
-                                                    obfuscationKey: obfuscationKey,
-                                                    counter: 0)
-        var message = iv + obfuscatedE + ciphertext
+        // Spec obfuscation: AES-256-CBC under the KDF derived from the
+        // responder's static key, bound to the initial chaining key.
+        let obfuscatedE = try NTCP2KeyObfuscation.encrypt(ephemeralPublic,
+                                                          chainingKey: NTCP2NoiseChain.initialChainingKey,
+                                                          material: remoteStaticKey)
+        var message = obfuscatedE
+        message += Data([UInt8((ciphertext.count >> 8) & 0xff), UInt8(ciphertext.count & 0xff)])
+        message += ciphertext
         if padding > 0 { message += I2PCrypto.randomBytes(padding) }
         return message
     }
 
-    /// Consumes message 2 (SessionCreated); returns message 3 bytes to send.
+    /// Consumes message 2 (SessionCreated): obfuscated e' + 2-byte options length
+    /// prefix + AEAD(options) + padding. Returns message 3 bytes to send.
     /// Message 3 = part 1 (AEAD of our static key, 48 bytes) + part 2 (AEAD of our RouterInfo).
     func processSessionCreated(_ data: Data) throws -> (message: Data, consumed: Int) {
         let bytes = Array(data)
-        guard bytes.count >= 64 else { throw NTCP2Error.needMoreData }
+        guard bytes.count >= 66 else { throw NTCP2Error.needMoreData }
+        guard let ephemeral else {
+            throw NTCP2Error.handshakeFailed("no session request sent")
+        }
 
-        // Run on a scratch copy so an incomplete message leaves the chain untouched.
+        // Deobfuscate the responder's ephemeral key via the spec KDF bound to
+        // our plaintext ephemeral. Run on a scratch copy so an incomplete
+        // message leaves the chain untouched.
         var work = chain
-        let e2raw = NTCP2KeyObfuscation.apply(Data(bytes[0..<32]), obfuscationKey: obfuscationKey, counter: 1)
+        let e2raw = try NTCP2KeyObfuscation.decrypt(Data(bytes[0..<32]),
+                                                    chainingKey: NTCP2NoiseChain.initialChainingKey,
+                                                    material: ephemeral.publicKey.rawRepresentation)
         let e2 = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: e2raw)
         work.mixHash(e2raw)
         // "ee": MixKey(DH(e, re))
-        let ee = try ephemeral!.sharedSecretFromKeyAgreement(with: e2)
+        let ee = try ephemeral.sharedSecretFromKeyAgreement(with: e2)
         work.mixKey(ee.withUnsafeBytes { Data($0) })
-        let options = try work.decrypt(Data(bytes[32..<64]))
+        // 2-byte options length prefix, then the AEAD-encrypted options block.
+        let optionsLength = (Int(bytes[32]) << 8) | Int(bytes[33])
+        guard bytes.count >= 34 + optionsLength else { throw NTCP2Error.needMoreData }
+        let options = try work.decrypt(Data(bytes[34..<34 + optionsLength]))
         guard options.count == 16, options[0] == 12 else {
             throw NTCP2Error.handshakeFailed("unsupported NTCP2 version")
         }
         let paddingLength = Int(options[1])
-        let total = 64 + paddingLength
+        let total = 34 + optionsLength + paddingLength
         guard bytes.count >= total else { throw NTCP2Error.needMoreData }
         chain = work
 
@@ -126,7 +138,6 @@ final class NTCP2ResponderHandshake {
 
     private var chain = NTCP2NoiseChain()
     private let localStatic: Curve25519.KeyAgreement.PrivateKey
-    private let obfuscationKey: Data
     private var ephemeral: Curve25519.KeyAgreement.PrivateKey?
     private var pendingPart2Length: UInt16 = 0
     private var staticKeyProcessed = false
@@ -136,26 +147,31 @@ final class NTCP2ResponderHandshake {
 
     init(localStaticKey: Curve25519.KeyAgreement.PrivateKey) {
         localStatic = localStaticKey
-        obfuscationKey = NTCP2KeyObfuscation.key(remoteStatic: localStatic.publicKey.rawRepresentation)
         // Noise pre-message: <- s (our own static key)
         chain.mixHash(localStatic.publicKey.rawRepresentation)
     }
 
-    /// Consumes message 1 (SessionRequest); returns message 2 (SessionCreated) bytes.
+    /// Consumes message 1 (SessionRequest): obfuscated e + 2-byte options length
+    /// prefix + AEAD(options) + padding. Returns message 2 (SessionCreated) bytes.
     func processSessionRequest(_ data: Data, padding: Int = 0) throws -> (reply: Data, consumed: Int) {
         let bytes = Array(data)
-        guard bytes.count >= 80 else { throw NTCP2Error.needMoreData }
+        guard bytes.count >= 66 else { throw NTCP2Error.needMoreData }
 
         var work = chain
-        let iv = Data(bytes[0..<16])
-        work.mixHash(iv)
-        let e1raw = NTCP2KeyObfuscation.apply(Data(bytes[16..<48]), obfuscationKey: obfuscationKey, counter: 0)
+        // Deobfuscate the initiator's ephemeral key: AES-256-CBC under the spec
+        // KDF bound to our static key and the initial chaining key.
+        let e1raw = try NTCP2KeyObfuscation.decrypt(Data(bytes[0..<32]),
+                                                    chainingKey: NTCP2NoiseChain.initialChainingKey,
+                                                    material: localStatic.publicKey.rawRepresentation)
         let e1 = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: e1raw)
         work.mixHash(e1raw)
         // "es": MixKey(DH(rs, re))
         let shared = try localStatic.sharedSecretFromKeyAgreement(with: e1)
         work.mixKey(shared.withUnsafeBytes { Data($0) })
-        let options = try work.decrypt(Data(bytes[48..<80]))
+        // 2-byte options length prefix, then the AEAD-encrypted options block.
+        let optionsLength = (Int(bytes[32]) << 8) | Int(bytes[33])
+        guard bytes.count >= 34 + optionsLength else { throw NTCP2Error.needMoreData }
+        let options = try work.decrypt(Data(bytes[34..<34 + optionsLength]))
         guard options.count == 16, options[0] == 12 else {
             throw NTCP2Error.handshakeFailed("unsupported NTCP2 version")
         }
@@ -164,12 +180,14 @@ final class NTCP2ResponderHandshake {
         guard announcedPart2 >= 16 else {
             throw NTCP2Error.handshakeFailed("invalid message 3 part 2 length")
         }
-        let total = 80 + paddingLength
+        let total = 34 + optionsLength + paddingLength
         guard bytes.count >= total else { throw NTCP2Error.needMoreData }
         chain = work
         pendingPart2Length = announcedPart2
 
-        // Message 2: obfuscated e' || AEAD(options) || padding
+        // Message 2: obfuscated e' (AES-256-CBC under the KDF bound to the
+        // initiator's plaintext ephemeral) + 2-byte options length prefix
+        // + AEAD(options) + padding.
         let e2 = Curve25519.KeyAgreement.PrivateKey()
         ephemeral = e2
         chain.mixHash(e2.publicKey.rawRepresentation)
@@ -182,10 +200,12 @@ final class NTCP2ResponderHandshake {
         options2[1] = UInt8(padding)
         options2.replaceSubrange(4..<12, with: NTCP2Time.milliseconds(Date()))
         let ciphertext = try chain.encrypt(options2)
-        let obfuscatedE2 = NTCP2KeyObfuscation.apply(e2.publicKey.rawRepresentation,
-                                                     obfuscationKey: obfuscationKey,
-                                                     counter: 1)
-        var reply = obfuscatedE2 + ciphertext
+        let obfuscatedE2 = try NTCP2KeyObfuscation.encrypt(e2.publicKey.rawRepresentation,
+                                                           chainingKey: NTCP2NoiseChain.initialChainingKey,
+                                                           material: e1raw)
+        var reply = obfuscatedE2
+        reply += Data([UInt8((ciphertext.count >> 8) & 0xff), UInt8(ciphertext.count & 0xff)])
+        reply += ciphertext
         if padding > 0 { reply += I2PCrypto.randomBytes(padding) }
         stage = .awaitingConfirm
         return (reply, total)

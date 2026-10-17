@@ -161,8 +161,14 @@ enum I2PCrossValidation {
         run("T4-NT-FRAME-RT", rowID: "NT-FRAME", "Frame codec: round trip, incremental delivery, tampered MAC rejected") {
             try ntcp2FrameRoundTrip()
         }
-        run("T4-NT-FRAME-SIPHASH", rowID: "NT-FRAME", "SipHash length obfuscation: deterministic per counter; frame math verified") {
+        run("T4-NT-FRAME-SIPHASH", rowID: "NT-FRAME", "SipHash length obfuscation: keys from the data-phase KDF; deterministic per counter; frame math verified") {
             try sipHashDeterminism()
+        }
+        run("T4-NT-M1-OBFS", rowID: "NT-M1", "SessionRequest/Created: AES-256-CBC ephemeral-key obfuscation per the spec KDF; full handshake round trip") {
+            try ntcp2KeyObfuscationSpec()
+        }
+        run("T4-NT-M1-OPTIONS", rowID: "NT-M1", "Both handshake messages carry the 2-byte options length prefix before the encrypted options") {
+            try ntcp2OptionsPrefixSpec()
         }
 
         // MARK: Crypto cross-checks
@@ -984,7 +990,101 @@ enum I2PCrossValidation {
         guard expectThrow({ _ = try codec.unframe(zeroFrame) }) else {
             throw I2PCrossValidationError.unexpectedSuccess
         }
-        return "masks deterministic per counter, distinct across frames; frame length math verified; short frames rejected"
+        // The SipHash key comes from the NTCP2 spec's data-phase KDF, not from
+        // the split output: deterministic, 16 bytes, distinct from the raw
+        // direction-key prefix, and distinct per direction.
+        let directionKey = I2PCrypto.randomBytes(32)
+        let derivedSipKey = NTCP2NoiseChain.dataPhaseSipKey(directionKey)
+        guard derivedSipKey == NTCP2NoiseChain.dataPhaseSipKey(directionKey),
+              derivedSipKey.count == 16 else {
+            throw I2PWireError.invalidFormat
+        }
+        guard derivedSipKey != Data(directionKey.prefix(16)) else { throw I2PWireError.invalidFormat }
+        guard derivedSipKey != NTCP2NoiseChain.dataPhaseSipKey(I2PCrypto.randomBytes(32)) else {
+            throw I2PWireError.invalidFormat
+        }
+        return "masks deterministic per counter, distinct across frames; SipHash keys derived by the data-phase KDF; frame length math verified; short frames rejected"
+    }
+
+    /// Fresh in-memory handshake engines over X25519 static keys.
+    private static func ntcp2HandshakeEngines() throws -> (initiator: NTCP2InitiatorHandshake,
+                                                            responder: NTCP2ResponderHandshake,
+                                                            routerInfo: Data,
+                                                            responderStatic: Data) {
+        let alice = Curve25519.KeyAgreement.PrivateKey()
+        let bob = Curve25519.KeyAgreement.PrivateKey()
+        let routerInfo = try I2PSamples.sampleRouterInfo().serialize()
+        let initiator = try NTCP2InitiatorHandshake(localStaticKey: alice,
+                                                    remoteStaticKey: bob.publicKey.rawRepresentation)
+        let responder = NTCP2ResponderHandshake(localStaticKey: bob)
+        return (initiator, responder, routerInfo, bob.publicKey.rawRepresentation)
+    }
+
+    /// The spec's AES-256-CBC ephemeral-key obfuscation end-to-end: messages 1
+    /// and 2 round-trip through the KDF-obfuscated wire, the full handshake
+    /// completes, and the obfuscation is deterministic and reversible.
+    private static func ntcp2KeyObfuscationSpec() throws -> String {
+        let (initiator, responder, routerInfo, responderStatic) = try ntcp2HandshakeEngines()
+        let request = try initiator.makeSessionRequest(routerInfo: routerInfo, padding: 13)
+        let created = try responder.processSessionRequest(request, padding: 7)
+        guard created.consumed == request.count else {
+            throw NTCP2Error.handshakeFailed("message 1 consumed length mismatch")
+        }
+        let confirm = try initiator.processSessionCreated(created.reply)
+        _ = try responder.processSessionConfirm(confirm.message)
+        let aliceKeys = try initiator.complete()
+        let bobKeys = try responder.complete()
+        guard aliceKeys.sendKeys.aeadKey == bobKeys.recvKeys.aeadKey,
+              aliceKeys.recvKeys.aeadKey == bobKeys.sendKeys.aeadKey,
+              aliceKeys.sendKeys.sipKey == bobKeys.recvKeys.sipKey else {
+            throw NTCP2Error.handshakeFailed("direction keys disagree")
+        }
+        // The obfuscation itself: AES-256-CBC output that is deterministic and
+        // reversible under the spec KDF.
+        let sample = I2PCrypto.randomBytes(32)
+        let sealed = try NTCP2KeyObfuscation.encrypt(sample,
+                                                     chainingKey: NTCP2NoiseChain.initialChainingKey,
+                                                     material: responderStatic)
+        guard sealed != sample, sealed.count == 32 else {
+            throw NTCP2Error.handshakeFailed("obfuscation degenerate")
+        }
+        let resealed = try NTCP2KeyObfuscation.encrypt(sample,
+                                                       chainingKey: NTCP2NoiseChain.initialChainingKey,
+                                                       material: responderStatic)
+        guard sealed == resealed else {
+            throw NTCP2Error.handshakeFailed("obfuscation not deterministic")
+        }
+        guard try NTCP2KeyObfuscation.decrypt(sealed, chainingKey: NTCP2NoiseChain.initialChainingKey,
+                                              material: responderStatic) == sample else {
+            throw NTCP2Error.handshakeFailed("obfuscation not reversible")
+        }
+        // The message-1 wire bytes deobfuscate to a valid curve point under the same KDF.
+        let wireEphemeral = Data(request.prefix(32))
+        let recovered = try NTCP2KeyObfuscation.decrypt(wireEphemeral,
+                                                        chainingKey: NTCP2NoiseChain.initialChainingKey,
+                                                        material: responderStatic)
+        _ = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: recovered)
+        return "messages 1 and 2 framed per spec: AES-256-CBC ephemeral-key obfuscation (spec KDF), handshake completes with matching direction keys"
+    }
+
+    /// The 2-byte options length prefix: present on both handshake messages and
+    /// consistent with the encrypted options block plus the trailing padding.
+    private static func ntcp2OptionsPrefixSpec() throws -> String {
+        let (initiator, responder, routerInfo, _) = try ntcp2HandshakeEngines()
+        let request = try initiator.makeSessionRequest(routerInfo: routerInfo, padding: 0)
+        // Layout: obfuscated e (32) + options length (2 BE) + AEAD options + padding.
+        let requestOptionsLength = (Int(request[32]) << 8) | Int(request[33])
+        guard requestOptionsLength >= 16, requestOptionsLength == request.count - 34 else {
+            throw NTCP2Error.handshakeFailed("message 1 options prefix mismatch")
+        }
+        let created = try responder.processSessionRequest(request, padding: 5)
+        let replyOptionsLength = (Int(created.reply[32]) << 8) | Int(created.reply[33])
+        guard replyOptionsLength >= 16, replyOptionsLength == created.reply.count - 34 - 5 else {
+            throw NTCP2Error.handshakeFailed("message 2 options prefix mismatch")
+        }
+        let confirm = try initiator.processSessionCreated(created.reply)
+        _ = try responder.processSessionConfirm(confirm.message)
+        return "both handshake messages carry the options length prefix consistent with the encrypted options + padding"
     }
 
     // MARK: Crypto cross-checks
