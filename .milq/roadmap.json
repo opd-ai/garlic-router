@@ -284,9 +284,77 @@
       "mockups" : [
 
       ],
-      "status" : "pending",
+      "status" : "done",
       "title" : "Audit",
-      "updatedAt" : "2026-10-17T20:59:20Z"
+      "updatedAt" : "2026-10-17T21:06:12Z"
+    },
+    {
+      "createdAt" : "2026-10-17T21:06:57Z",
+      "description" : "Add configurable send\/receive bandwidth limits applied at the transport layer: a tokens-per-second budget checked before NTCP2 frame sends and SSU2 packet sends, with a bounded burst allowance and graceful queuing rather than silent drops. Expose the configuration as controls on the Router dashboard with a live throughput-vs-limit display fed by the running router's counters.",
+      "glyph" : "valve on a pipe",
+      "id" : "d4699af3",
+      "mockups" : [
+
+      ],
+      "status" : "pending",
+      "title" : "Add a bandwidth limiter",
+      "updatedAt" : "2026-10-17T21:06:57Z"
+    },
+    {
+      "createdAt" : "2026-10-17T21:06:57Z",
+      "description" : "New screen opened from the Router dashboard's session list: a per-peer detail view showing the peer's identity hash, transport (NTCP2 or SSU2), session uptime, bytes exchanged in each direction, XOR distance in the Kademlia keyspace, and whether the peer is a floodfill or participates in one of our tunnels. Data comes from the running router's status engine. Dark theme, violet accent, consistent with the existing tabs.",
+      "glyph" : "magnifying glass over a router node",
+      "id" : "d3136461",
+      "mockups" : [
+        {
+          "brief" : "Peer detail screen for the pure Swift I2P router app. Purpose: inspect a single connected peer after tapping its row on the Router dashboard. Style: dark background (near-black navy), violet accent, consistent with the Router dashboard and I2P Core tabs; generous whitespace, monospaced numerals for hashes and byte counters, native iOS design language. Layout top to bottom: large navigation title 'Peer'; a hero card with the peer's identity hash truncated in monospaced text with a copy affordance and a transport badge (NTCP2 or SSU2) plus a colored connection-status dot; a metrics grid of two columns of stat cells — session uptime, bytes sent, bytes received, and round-trip latency — each with a small caption label and large monospaced value; a Kademlia section card showing the XOR distance in the keyspace as a short bit-prefix visualization plus the numeric distance; a roles card listing chips such as 'Floodfill', 'Tunnel participant', 'Exploratory hop' when applicable, with muted styling when a role does not apply; a footer row of quick actions — 'Refresh' and 'Disconnect' as subtle destructive secondary buttons. Sample data: a realistic 44-character identity hash, uptime 22 min, bytes sent 1.2 MB, bytes received 840 KB, latency 310 ms, distance prefix 0b00101.",
+          "id" : "5b300eb9",
+          "title" : "Peer detail"
+        }
+      ],
+      "status" : "pending",
+      "title" : "Add a peer inspector screen",
+      "updatedAt" : "2026-10-17T21:06:57Z"
+    },
+    {
+      "createdAt" : "2026-10-17T21:06:57Z",
+      "description" : "New screen shown on first launch: a guided connection flow that walks through identity creation (RouterHash revealed), reachability advertisement (external address published to floodfills), reseed progress (RouterInfos ingested from live servers), and establishing sessions to real floodfills with a live count. Ends with a 'Connect to mainnet' action that starts the router and hands off to the Router dashboard. Skippable; the dashboard works regardless.",
+      "glyph" : "power button with signal waves",
+      "id" : "967170bc",
+      "mockups" : [
+        {
+          "brief" : "Router onboarding flow for the pure Swift I2P router app, shown on first launch. Purpose: guide the user from identity creation to a live mainnet connection. Style: dark background, violet accent, consistent with the I2P Core, Router and Alignment tabs; calm, confident, native iOS design language. Layout top to bottom: a compact step indicator (four dots labeled Identity, Reachability, Reseed, Floodfills) with the current step highlighted in violet; a hero area with a step title and one-sentence explanation; the step content region that changes per step — step 1 shows the freshly created RouterHash in a monospaced rounded card with a copy button and a 'Your router identity is permanent' caption; step 2 shows reachability advertisement status ('External address published to floodfills') with a checkmark list; step 3 shows a reseed progress bar with a count of RouterInfos ingested from live reseed servers; step 4 shows a live count of established floodfill sessions with signal-strength rows; a prominent primary button pinned at the bottom that reads 'Connect to mainnet' and a smaller 'Skip for now' text button beneath it. Sample data: RouterHash 'uQ8m…Xk2pJ7w', 47 RouterInfos ingested, 3 of 4 floodfill sessions established.",
+          "id" : "6e0f9d0c",
+          "title" : "Router onboarding"
+        }
+      ],
+      "status" : "pending",
+      "title" : "Add router onboarding",
+      "updatedAt" : "2026-10-17T21:06:57Z"
+    },
+    {
+      "createdAt" : "2026-10-17T21:06:57Z",
+      "description" : "Extend the SSU2 transport to use the ML-KEM hybrid establishment module for the version 3\/4 long-header handshake variants: offer and accept hybrid sessions with ML-KEM-512\/768 encapsulation, mix the encapsulation output into the session KDF via the existing dual-leg binding, and negotiate down to the classical handshake only when the peer does not advertise PQ support. Add transport tests covering hybrid session establishment over the UDP loopback.",
+      "glyph" : "shield with circuit key",
+      "id" : "005b1ce6",
+      "mockups" : [
+
+      ],
+      "status" : "pending",
+      "title" : "Roll out the ML-KEM hybrid handshake",
+      "updatedAt" : "2026-10-17T21:06:57Z"
+    },
+    {
+      "createdAt" : "2026-10-17T21:06:57Z",
+      "description" : "Complete the encrypted LeaseSet2 (b33) path: derive the blinded destination key and blinded netdb key per the blinding spec so encrypted LS2 entries are looked up under their blinded keys, decrypt authenticated inner bodies for destinations we hold credentials for, and surface the resolved leases through the same delivery path plain LS2s already use. Flip the remaining encrypted-LS2 caveat in the spec truth table once resolution works end-to-end.",
+      "glyph" : "sealed envelope with keyhole",
+      "id" : "de00dda1",
+      "mockups" : [
+
+      ],
+      "status" : "pending",
+      "title" : "Resolve encrypted LeaseSets via b33 blinding",
+      "updatedAt" : "2026-10-17T21:06:57Z"
     }
   ],
   "version" : 1

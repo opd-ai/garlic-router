@@ -11,6 +11,7 @@ struct ContentView: View {
     @State private var stabilityResults: [I2PSelfTestResult] = []
     @State private var hardeningResults: [I2PSelfTestResult] = []
     @State private var specResults: [I2PSelfTestResult] = []
+    @State private var productionResults: [I2PSelfTestResult] = []
     @State private var sizes: [(name: String, bytes: Int)] = []
 
     private let accent = Color(red: 0.47, green: 0.44, blue: 0.97)
@@ -50,6 +51,7 @@ struct ContentView: View {
                     stabilityCard
                     hardeningCard
                     specCard
+                    productionCard
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 4)
@@ -248,6 +250,62 @@ struct ContentView: View {
                 }
 
                 Text("Locally-verifiable checklist phases run as deterministic probes; live-network interop items (Java I2P / i2pd handshakes, framed message flooding) ride the mainnet suite.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// The final production-readiness audit & remediation pass: every checklist
+    /// section (NTCP2/SSU2 transports, RFC crypto vectors, structure trust
+    /// boundaries, wire primitives, PQ hybrid leg, modern-crypto policy) runs as
+    /// an executable probe against the live mechanisms.
+    private func runProductionAudit() {
+        Task {
+            let fresh = await I2PProductionAudit.runAll()
+            await MainActor.run { productionResults = fresh }
+        }
+    }
+
+    private var productionCard: some View {
+        card(title: "Production audit") {
+            Button {
+                runProductionAudit()
+            } label: {
+                Label("Run production audit", systemImage: "seal.fill")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .background(accent.opacity(0.15), in: RoundedRectangle(cornerRadius: 12))
+            }
+            .buttonStyle(.plain)
+            .tint(accent)
+
+            if !productionResults.isEmpty {
+                let passed = productionResults.filter(\.passed).count
+                Text(passed == productionResults.count
+                     ? "\(passed) of \(productionResults.count) checklist sections verified — production readiness closed"
+                     : "\(passed) of \(productionResults.count) sections verified — findings below")
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(passed == productionResults.count ? Color.green : Color.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                ForEach(productionResults.indices, id: \.self) { index in
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: productionResults[index].passed ? "checkmark.circle.fill" : "xmark.circle.fill")
+                            .foregroundStyle(productionResults[index].passed ? Color.green : Color.red)
+                            .font(.caption)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(productionResults[index].name)
+                                .font(.footnote.weight(.medium))
+                            Text(productionResults[index].detail)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                Text("Transport handshakes run end-to-end over real Noise chains and UDP sockets; RFC known-answer vectors are exact; the ML-KEM hybrid leg (FIPS 203) is remediated in with dual-leg KDF binding.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
