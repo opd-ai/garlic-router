@@ -1,0 +1,97 @@
+{
+  "items" : [
+    {
+      "createdAt" : "2026-10-17T00:41:22Z",
+      "description" : "Implement the full I2P cryptographic foundation and binary serialization in pure Swift with CryptoKit: X25519 key agreement (EncType 4\/5), Ed25519 signing (SigType 7) with Ed25519ph (SigType 11), ChaCha20-Poly1305 AEAD, HKDF-SHA256 key derivation, and SHA-256\/BLAKE2b hashing. Build the I2P big-endian binary encoder\/decoder for all primitive types (byte, short, integer, long, hash, string, mapping, signature, public\/private keys, certificates) and the core structures: Destination, RouterInfo (identity, publication date, NTCP2\/SSU2 addresses, options, signature with verification), and LeaseSet (destination, published date, leases, signature). Include round-trip serialization tests and RouterInfo signature verification.",
+      "glyph" : "padlock with key",
+      "id" : "f232363f",
+      "mockups" : [
+        {
+          "brief" : "Status screen for the I2P router core, dark technical aesthetic with deep charcoal background and a single electric indigo accent. Large nav title 'I2P Core'. Below, a stack of frosted glass cards: 'Cryptographic Suite' listing X25519, Ed25519 (SigType 7), ChaCha20-Poly1305, HKDF-SHA256, each with a green checkmark status dot; 'Serialization' card listing Destination, RouterInfo, LeaseSet with byte sizes from a sample encode; a bottom card 'Self-test' with a 'Run round-trip tests' button and last result '128 tests passed'. Monospaced type for byte counts, SF Pro for labels. Confident hierarchy, generous whitespace, App Store quality.",
+          "id" : "2a1e79dd",
+          "title" : "I2P Core"
+        }
+      ],
+      "status" : "done",
+      "title" : "Build the crypto and serialization core",
+      "updatedAt" : "2026-10-17T00:51:22Z"
+    },
+    {
+      "createdAt" : "2026-10-17T00:41:22Z",
+      "description" : "Implement the I2P Network Database: the Kademlia-style floodfill model with XOR distance metric, DatabaseLookup and DatabaseStore message handling (query key, from hash, reply tunnels, flags, reply tokens), floodfill selection and querying of 3-5 floodfill routers, store\/lookup\/refresh operations, replication handling, expiration (RouterInfo ~1h, LeaseSet ~1h with 10-15 min leases), persistent on-disk storage plus in-memory cache, and startup bootstrapping that iteratively discovers peers via DatabaseLookup. Entries are only accepted after signature verification.",
+      "glyph" : "database cylinder",
+      "id" : "b035e7df",
+      "mockups" : [
+
+      ],
+      "status" : "done",
+      "title" : "Implement the Network Database and floodfill DHT",
+      "updatedAt" : "2026-10-17T01:01:34Z"
+    },
+    {
+      "createdAt" : "2026-10-17T00:41:22Z",
+      "description" : "Implement the NTCP2 transport per I2P spec: the Noise_XK_25519_ChaChaPoly_SHA256 handshake with SessionRequest, SessionCreated and SessionConfirm phases over TCP using the Network framework, ephemeral\/static X25519 keys, padding, and key derivation into two independent ChaCha20-Poly1305 direction streams. Implement message framing (2-byte big-endian length, encrypted payload, 16-byte MAC) and the payload block types: data, time, options, padding. Support graceful session termination, connection management, and multiple concurrent peer sessions.",
+      "glyph" : "two connected network plugs",
+      "id" : "3b0f2074",
+      "mockups" : [
+
+      ],
+      "status" : "pending",
+      "title" : "Implement the NTCP2 transport",
+      "updatedAt" : "2026-10-17T00:41:22Z"
+    },
+    {
+      "createdAt" : "2026-10-17T00:41:22Z",
+      "description" : "Implement tunnel establishment: outbound and inbound unidirectional tunnels through multiple hops, VariableTunnelBuild messages with 528-byte encrypted request records (receive tunnel ID, next hop identity and port, layer key, IV key, reply key, reply IV, flags, padding) layered so only each hop can decrypt its record, and BuildReply handling with per-hop accept\/reject codes. Build the tunnel pool per destination: 3-5 outbound and 3-5 inbound tunnels, staggered creation, expiration after 10-30 minutes, pre-building replacements, latency monitoring and tunnel selection.",
+      "glyph" : "tunnel entrance",
+      "id" : "cf35e268",
+      "mockups" : [
+
+      ],
+      "status" : "pending",
+      "title" : "Build tunnels and the tunnel pool",
+      "updatedAt" : "2026-10-17T00:41:22Z"
+    },
+    {
+      "createdAt" : "2026-10-17T00:41:22Z",
+      "description" : "Implement the complete I2NP message layer: serialization and parsing of all standard message types including DatabaseStore (67), DatabaseLookup (98), TunnelBuild\/BuildReply, TunnelData (18), GarlicMessage (94), TunnelGateway (15) and status\/options messages, with the type byte, big-endian length, payload and expiry header format. Implement delivery instructions for local, tunnel and router delivery, plus the tunnel message processing pipeline that hops use to decrypt one layer and forward.",
+      "glyph" : "envelope with routing arrows",
+      "id" : "e97ba619",
+      "mockups" : [
+
+      ],
+      "status" : "pending",
+      "title" : "Implement the I2NP message layer",
+      "updatedAt" : "2026-10-17T00:41:22Z"
+    },
+    {
+      "createdAt" : "2026-10-17T00:41:22Z",
+      "description" : "Implement garlic routing and end-to-end encryption: ECIES-X25519 garlic clove sets with ChaCha20-Poly1305, clove structure (encapsulated I2NP message, delivery instructions for local\/tunnel\/router delivery with optional delay, certificates), clove set framing with message ID and expiration, session tag management for tag-based encryption, and the wrapping\/unwrapping pipeline so a destination can send garlic messages through its outbound tunnel pool to a LeaseSet's inbound tunnels.",
+      "glyph" : "garlic bulb",
+      "id" : "c059f79f",
+      "mockups" : [
+
+      ],
+      "status" : "pending",
+      "title" : "Implement garlic routing and end-to-end encryption",
+      "updatedAt" : "2026-10-17T00:41:22Z"
+    },
+    {
+      "createdAt" : "2026-10-17T00:41:22Z",
+      "description" : "Add a polished dashboard screen showing live router state: router identity hash, floodfill connectivity, NTCP2 session count, netdb entry counts (RouterInfo\/LeaseSet), active tunnel pools with hop counts and expiry countdowns, and message throughput. Data comes from the running router's event stream.",
+      "glyph" : "speedometer gauge",
+      "id" : "448de6b6",
+      "mockups" : [
+        {
+          "brief" : "Router dashboard, dark charcoal background with electric indigo accent, matching the I2P Core screen's frosted glass card style. Large nav title 'Router'. Top row of three compact stat cards: 'Sessions 12', 'NetDB 3,412', 'Tunnels 8'. Below, a 'Tunnel Pools' card listing outbound and inbound tunnels as rows with hop dots (3 hops shown as three connected circles), remaining lifetime like '18m 42s', and latency; a 'Throughput' card with in\/out bytes per second shown in monospaced type; a bottom 'Identity' card with the 44-character base64 router identity truncated with copy button. Generous whitespace, one accent color, monospaced figures, SF Pro labels.",
+          "id" : "23dd2e07",
+          "title" : "Router dashboard"
+        }
+      ],
+      "status" : "pending",
+      "title" : "Add a router status dashboard",
+      "updatedAt" : "2026-10-17T00:41:22Z"
+    }
+  ],
+  "version" : 1
+}
