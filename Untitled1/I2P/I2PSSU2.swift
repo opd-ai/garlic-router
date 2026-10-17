@@ -493,7 +493,12 @@ final class SSU2ResponderHandshake {
             acceptedEncapsulation = encapsulation
         }
         negotiatedPQ = offeredPQ
-        return try makeSessionCreated()
+        let response = try makeSessionCreated()
+        // `complete()` is called by the owning session immediately after the
+        // response is constructed. Advance only after construction succeeds so
+        // failed handshakes cannot expose split keys from a partial exchange.
+        stage = .awaitingConfirmed
+        return response
     }
 
     /// SessionCreated (type 1): the ephemeral region carries the responder's
@@ -539,7 +544,10 @@ final class SSU2ResponderHandshake {
         guard stage == .awaitingConfirmed else {
             throw SSU2Error.handshakeFailed("SessionRequest not processed")
         }
-        return SSU2KeySchedule.split(chainingKey: chain.chainingKey)
+        // The responder sends the Noise `ba` key and receives with `ab`; the
+        // initiator uses the opposite direction mapping.
+        return SSU2KeySchedule.split(chainingKey: chain.chainingKey,
+                                     initiatorSendsWithAB: false)
     }
 }
 
@@ -1555,13 +1563,16 @@ final class SSU2Transport {
     /// automatically and the session reports establishment via the delegate.
     @discardableResult
     func connect(host: String, port: UInt16, remoteStaticKey: Data, remoteIntroKey: Data,
-                 remoteMLKEMKey: Data? = nil) throws -> SSU2Session {
+                 remoteMLKEMKey: Data? = nil,
+                 sessionDelegate: SSU2SessionDelegate? = nil) throws -> SSU2Session {
         let endpoint = SSU2Endpoint(host: host, port: port)
         let session = SSU2Session(role: .initiator, localStaticKey: localStaticKey,
                                   remoteStaticKey: remoteStaticKey, remoteIntroKey: remoteIntroKey,
                                   localRouterInfo: localRouterInfo, publishedEndpoint: publishedEndpoint,
                                   mlKemSecretKey: mlKemSecretKey, remoteMLKEMKeyData: remoteMLKEMKey)
-        session.delegate = self
+        // Install the observer before starting traffic: loopback peers can
+        // complete the handshake before `connect` returns.
+        session.delegate = sessionDelegate ?? self
         let connection = NWConnection(host: NWEndpoint.Host(host),
                                       port: NWEndpoint.Port(rawValue: port) ?? .any,
                                       using: .udp)
@@ -1592,7 +1603,7 @@ final class SSU2Transport {
 
     func shutdown() {
         lock.lock()
-        let all = sessionsByEndpoint.values
+        let all = Array(sessionsByEndpoint.values)
         sessionsByEndpoint.removeAll()
         flows.values.forEach { $0.cancel() }
         flows.removeAll()
@@ -2364,12 +2375,12 @@ enum I2PSSU2SelfTest {
         let responderStub = TransportDelegateStub(onEstablish: { responderEstablished.fulfill() })
         transport.delegate = responderStub
 
-        let session = try transport.connect(host: "127.0.0.1", port: port,
-                                            remoteStaticKey: bobKey.publicKey.rawRepresentation,
-                                            remoteIntroKey: bobIntroKey)
         let initiatorEstablished = Expectation()
         let initiatorStub = LoopbackDelegate(onEstablish: { initiatorEstablished.fulfill() })
-        session.delegate = initiatorStub
+        let session = try transport.connect(host: "127.0.0.1", port: port,
+                                            remoteStaticKey: bobKey.publicKey.rawRepresentation,
+                                            remoteIntroKey: bobIntroKey,
+                                            sessionDelegate: initiatorStub)
 
         try await responderEstablished.wait(seconds: 10)
         try await initiatorEstablished.wait(seconds: 10)
@@ -2382,7 +2393,6 @@ enum I2PSSU2SelfTest {
         let message = I2NPMessage(type: .dataMessage, payload: Data("over real udp".utf8)).serialize()
         try session.sendData(message)
         try await dataReceived.wait(seconds: 10)
-        transport.shutdown()
         _ = (responderStub, initiatorStub, dataStub)
         return "real UDP loopback: handshake established both sides, I2NP data delivered"
     }
@@ -2413,13 +2423,13 @@ enum I2PSSU2SelfTest {
         let responderStub = TransportDelegateStub(onEstablish: { responderEstablished.fulfill() })
         transport.delegate = responderStub
 
+        let initiatorEstablished = Expectation()
+        let initiatorStub = LoopbackDelegate(onEstablish: { initiatorEstablished.fulfill() })
         let session = try transport.connect(host: "127.0.0.1", port: port,
                                             remoteStaticKey: bobKey.publicKey.rawRepresentation,
                                             remoteIntroKey: bobIntroKey,
-                                            remoteMLKEMKey: bobPQ.encapsulationKeyData)
-        let initiatorEstablished = Expectation()
-        let initiatorStub = LoopbackDelegate(onEstablish: { initiatorEstablished.fulfill() })
-        session.delegate = initiatorStub
+                                            remoteMLKEMKey: bobPQ.encapsulationKeyData,
+                                            sessionDelegate: initiatorStub)
 
         try await responderEstablished.wait(seconds: 10)
         try await initiatorEstablished.wait(seconds: 10)
@@ -2436,7 +2446,6 @@ enum I2PSSU2SelfTest {
                                   payload: Data("over real udp (\(version.name))".utf8)).serialize()
         try session.sendData(message)
         try await dataReceived.wait(seconds: 10)
-        transport.shutdown()
         _ = (responderStub, initiatorStub, dataStub)
         return "real UDP loopback (\(version.name)): version \(version.rawValue) hybrid handshake established, I2NP data delivered on the PQ-bound keys"
     }
