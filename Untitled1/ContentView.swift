@@ -26,6 +26,10 @@ struct ContentView: View {
                 .tabItem {
                     Label("SAM", systemImage: "terminal")
                 }
+            AlignmentView()
+                .tabItem {
+                    Label("Alignment", systemImage: "checkmark.seal")
+                }
         }
         .tint(accent)
         .preferredColorScheme(.dark)
