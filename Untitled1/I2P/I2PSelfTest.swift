@@ -94,6 +94,7 @@ enum I2PSelfTest {
         results.append(contentsOf: await I2PRouterStatusSelfTest.runAll())
         results.append(contentsOf: I2PSpecComplianceSelfTest.runAll())
         results.append(contentsOf: await I2PSAMConformanceTest.runAll())
+        results.append(contentsOf: await I2PMainnetVerification.runAll())
         return results
     }
 

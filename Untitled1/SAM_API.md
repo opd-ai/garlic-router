@@ -147,3 +147,12 @@ SESSION CREATE STYLE=STREAM ID=echo DESTINATION=TRANSIENT PERSISTENT=true
 ## Load characteristics
 
 The conformance suite includes a load validation: three concurrent stream pairs (each on its own connection, per SAM v3's one-stream-per-connection model) run at the same time over the loopback router rig. Each stream performs six latency probes (32-byte round-trips, reported as average RTT in ms) and one 8 KB bidirectional bulk transfer (reported in KB/s). The results appear in the app's self-test card alongside the other SAM conformance results, giving a baseline throughput/latency reference for the bridge as tunnels and transports evolve.
+## CI mainnet verification
+
+The automated self-test suite includes a live-network stage (`I2PMainnetVerification`) that connects the router to the main I2P network from CI — reseed and floodfill connectivity are ordinary router behavior:
+
+1. **Reseed** — fetches an `i2pseeds.su3` file from public reseed servers over HTTPS (five known hosts with fallback), parses the SU3 container and the embedded zip archive (EOCD scan, central directory, stored/raw-deflate entries via the Compression framework), and ingests every RouterInfo into the netdb after Ed25519 signature verification; `caps: f` entries register as floodfills. A couple of non-floodfill RouterInfos are deliberately withheld from the local cache as live DHT lookup targets. The SU3 container signature itself is not verified — documented deviation (RSA/ECDSA container signatures sit outside the modern crypto stack); integrity rides on the HTTPS transport and every RouterInfo inside is signature-verified on ingestion.
+2. **Baseline connectivity** — dials NTCP2 to up to five mainnet floodfill routers from the reseeded netdb and requires the spec's 3-5 floodfill connections; per-peer handshake results are reported.
+3. **DHT round-trip** — sends a real DatabaseLookup for a withheld RouterInfo over a live floodfill session and verifies the mainnet answer (signature-verified and cached), reporting measured latency.
+
+Until the NTCP2 obfuscation/framing alignment work lands, stages 2 and 3 report the transport divergences honestly in the CI results while stage 1 validates the reseed, parsing and verification pipeline end-to-end.

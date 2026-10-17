@@ -46,6 +46,10 @@ final class I2PRouterAppContext {
         return I2PSAMServer(core: core, port: 7656)
     }()
 
+    /// Live-network verification handles for the CI mainnet suite.
+    var mainnetNetDB: I2PNetworkDatabase { netDB }
+    var mainnetNTCP2: NTCP2Transport { ntcp2 }
+
     private init() {
         // Router identity: an Ed25519 signing key plus an X25519 encryption
         // key, generated once per installation and reused on later launches.
