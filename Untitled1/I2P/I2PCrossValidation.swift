@@ -2148,7 +2148,7 @@ enum I2PCrossValidation {
         guard window.checkAndInsert(10), window.checkAndInsert(9),
               !window.checkAndInsert(9), !window.checkAndInsert(10),
               window.checkAndInsert(80) else { throw SSU2Error.replayedPacket }
-        guard expectThrow({ _ = try cipher.seal(Data("tiny"), header: header.serialize(), packetNumber: 6) }) else {
+        guard expectThrow({ _ = try cipher.seal(Data("tiny".utf8), header: header.serialize(), packetNumber: 6) }) else {
             throw I2PCrossValidationError.unexpectedSuccess
         }
         guard expectThrow({
