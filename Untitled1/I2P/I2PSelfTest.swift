@@ -83,10 +83,11 @@ enum I2PSamples {
 // MARK: - Self-test suite
 
 enum I2PSelfTest {
-    /// Runs the synchronous core checks plus the async Network Database suite.
+    /// Runs the synchronous core checks plus the async Network Database and NTCP2 suites.
     static func runAll() async -> [I2PSelfTestResult] {
         var results = runCoreTests()
         results.append(contentsOf: await I2PNetDBSelfTest.runAll())
+        results.append(contentsOf: await I2PNTCP2SelfTest.runAll())
         return results
     }
 
