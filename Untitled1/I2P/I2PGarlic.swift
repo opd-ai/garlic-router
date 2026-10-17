@@ -57,7 +57,7 @@ struct I2PGarlicDeliveryInstructions {
         var offset = 1
         var tunnelID: UInt32?
         var routerHash: Data?
-        var delay: Int?
+        var delay: UInt32?
         if flag & 0x80 != 0 {
             guard bytes.count >= offset + 36 else { throw I2PGarlicError.invalidPayload }
             tunnelID = (UInt32(bytes[offset]) << 24) | (UInt32(bytes[offset + 1]) << 16)
@@ -72,13 +72,25 @@ struct I2PGarlicDeliveryInstructions {
         }
         if flag & 0x02 != 0 {
             guard bytes.count >= offset + 4 else { throw I2PGarlicError.invalidPayload }
-            delay = Int((UInt32(bytes[offset]) << 24) | (UInt32(bytes[offset + 1]) << 16)
-                | (UInt32(bytes[offset + 2]) << 8) | UInt32(bytes[offset + 3]))
+            let high = UInt32(bytes[offset])
+            let midHigh = UInt32(bytes[offset + 1])
+            let midLow = UInt32(bytes[offset + 2])
+            let low = UInt32(bytes[offset + 3])
+            delay = high << 24 | midHigh << 16 | midLow << 8 | low
             offset += 4
         }
-        let mode: I2PDeliveryInstructions.Mode = flag & 0x80 != 0 ? .tunnel : (flag & 0x40 != 0 ? .router : .local)
-        return (I2PDeliveryInstructions(mode: mode, tunnelID: tunnelID,
-                                        routerHash: routerHash, delayMilliseconds: delay),
+        if flag & 0x80 != 0 {
+            return (I2PDeliveryInstructions(mode: .tunnel, tunnelID: tunnelID,
+                                            routerHash: routerHash, delayMilliseconds: delay),
+                    offset)
+        }
+        if flag & 0x40 != 0 {
+            return (I2PDeliveryInstructions(mode: .router, tunnelID: nil,
+                                            routerHash: routerHash, delayMilliseconds: delay),
+                    offset)
+        }
+        return (I2PDeliveryInstructions(mode: .local, tunnelID: nil,
+                                        routerHash: nil, delayMilliseconds: delay),
                 offset)
     }
 }
@@ -315,7 +327,7 @@ enum I2PGarlicCrypto {
     //   static section key = HMAC(temp, ck1)
     //   MixHash: h2 = SHA-256(h1 ‖ static section ciphertext)
     //   ss = DH(sender static, receiver static); temp2 = HMAC(ck1, ss)
-    //   ck2 = HMAC(temp2, 0x01); payload key = HMAC(temp2, ck2)
+    //   ck2 = HMAC(temp2, 0x01); payload key = HMAC(temp2, ck2 ‖ h2)
 
     /// The new-session envelope: [ephemeral (32)][static section (48)][payload section].
     /// Static section: ChaChaPoly(k_static, nonce 0, sender static public key ‖ zero pad
@@ -339,7 +351,7 @@ enum I2PGarlicCrypto {
         let ss = try senderStatic.sharedSecretFromKeyAgreement(with: peerStatic)
         let temp2 = hmac(ss.withUnsafeBytes { Data($0) }, key: ck1)
         let ck2 = hmac(Data([0x01]), key: temp2)
-        let payloadKey = hmac(ck2, key: temp2)
+        let payloadKey = hmac(ck2 + h2, key: temp2)
         var paddedPayload = payloadBlocks
         while paddedPayload.count % 16 != 0 { paddedPayload.append(0) }
         let payloadBox = try ChaChaPoly.seal(paddedPayload, using: SymmetricKey(data: payloadKey))
@@ -371,7 +383,7 @@ enum I2PGarlicCrypto {
         let ss = try localKey.sharedSecretFromKeyAgreement(with: senderStatic)
         let temp2 = hmac(ss.withUnsafeBytes { Data($0) }, key: ck1)
         let ck2 = hmac(Data([0x01]), key: temp2)
-        let payloadKey = hmac(ck2, key: temp2)
+        let payloadKey = hmac(ck2 + h2, key: temp2)
         let payloadSection = payload.subdata(in: 80..<payload.count)
         let payloadBox = try ChaChaPoly.SealedBox(combined: payloadSection)
         guard let blocks = try? ChaChaPoly.open(payloadBox, using: SymmetricKey(data: payloadKey)) else {

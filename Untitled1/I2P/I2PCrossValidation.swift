@@ -1772,7 +1772,6 @@ enum I2PCrossValidation {
                                                           senderStatic: senderStatic)
         let ephemeralPublic = Data(envelope.prefix(32))
         let h0 = I2PCrypto.sha256(Data(I2PGarlicCrypto.protocolName.utf8))
-        let h1 = I2PCrypto.sha256(h0 + ephemeralPublic)
         let es = try senderStatic.sharedSecretFromKeyAgreement(
             with: Curve25519.KeyAgreement.PublicKey(rawRepresentation: ephemeralPublic))
         let temp = Data(HMAC<SHA256>.authenticationCode(for: es.withUnsafeBytes { Data($0) },
@@ -1794,10 +1793,11 @@ enum I2PCrossValidation {
         guard set.count == 3, set.allSatisfy({ $0.tag.count == 32 && $0.key.count == 32 }) else {
             throw I2PWireError.invalidFormat
         }
-        guard set == I2PGarlicCrypto.tagSet(seed: seed, count: 3) else {
+        guard set.map(\.tag) == I2PGarlicCrypto.tagSet(seed: seed, count: 3).map(\.tag),
+              set.map(\.key) == I2PGarlicCrypto.tagSet(seed: seed, count: 3).map(\.key) else {
             throw I2PWireError.invalidFormat
         }
-        guard set != I2PGarlicCrypto.tagSet(seed: I2PCrypto.randomBytes(32), count: 3) else {
+        guard set.map(\.tag) != I2PGarlicCrypto.tagSet(seed: I2PCrypto.randomBytes(32), count: 3).map(\.tag) else {
             throw I2PWireError.invalidFormat
         }
         guard Set(set.map(\.tag.hex)).count == 3 else { throw I2PWireError.invalidFormat }
