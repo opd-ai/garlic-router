@@ -207,14 +207,10 @@ final class I2NPMessageRouter {
         onMessageRouted?(message, source)
         guard !message.isExpired() else { return } // expiry enforcement
         guard let body = try? message.parseBody() else { return }
+        let participants = self.participantsSnapshot()
         switch body {
         case .tunnelData(let payload):
-            let snapshot: [I2PTunnelParticipant] = {
-                lock.lock()
-                defer { lock.unlock() }
-                return participants
-            }()
-            for participant in snapshot {
+            for participant in participants {
                 guard let action = try? participant.processTunnelData(payload) else { continue }
                 await perform(action)
                 return
@@ -232,11 +228,32 @@ final class I2NPMessageRouter {
             } else {
                 notifyBodyHandlers(innerMessage, source)
             }
+        case .tunnelBuild(let buildMessage):
+            notifyBodyHandlers(message, source)
+            // Tunnel participants attempt to decrypt their own record from the
+            // build (the same dispatch the local build hub performs for loopback
+            // traffic). This completes organic inbound tunnel participation —
+            // real hops build through us over live sessions — and routes build
+            // replies back to our originators.
+            for participant in participants {
+                participant.handleBuild(buildMessage, from: source)
+            }
+        case .tunnelBuildReply(let reply):
+            notifyBodyHandlers(message, source)
+            let body = reply.serialize()
+            for participant in participants {
+                participant.handleBuildReply(body, from: source)
+            }
         case .deliveryStatus, .options, .dataMessage, .garlic,
-             .databaseStore, .databaseLookup, .databaseSearchReply,
-             .tunnelBuild, .tunnelBuildReply:
+             .databaseStore, .databaseLookup, .databaseSearchReply:
             notifyBodyHandlers(message, source)
         }
+    }
+
+    private func participantsSnapshot() -> [I2PTunnelParticipant] {
+        lock.lock()
+        defer { lock.unlock() }
+        return participants
     }
 
     private func perform(_ action: I2PTunnelHopAction) async {

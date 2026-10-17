@@ -15,17 +15,17 @@ final class I2PRouterAppContext {
 
     private let routerHash: Data
     private let signingSeed: Data
+    private let encryptionKey: Curve25519.KeyAgreement.PrivateKey
     private let identity: I2PRouterIdentity
     private let netDB: I2PNetworkDatabase
     private let ntcp2: NTCP2Transport
     private let deliveryTransport: I2PNTCP2DeliveryTransport
     private let i2npRouter: I2NPMessageRouter
     private let tunnelPool: I2PTunnelPool
-    private let tunnelBuildHub: I2PTunnelBuildHub
     private let tunnelBuildTransport: I2PTunnelBuildTransport
     private let tunnelParticipant: I2PTunnelParticipant
     private let tunnelPeerProvider: I2PTunnelPeerProvider
-    private let mainnetRouterInfo: I2PRouterInfo
+    private(set) var mainnetRouterInfo: I2PRouterInfo
     private var started = false
     private var ntcp2Bridge: NTCP2I2NPBridge?
 
@@ -54,6 +54,8 @@ final class I2PRouterAppContext {
     var mainnetI2NPRouter: I2NPMessageRouter { i2npRouter }
     var mainnetRouterHash: Data { routerHash }
     var mainnetSignedRouterInfo: I2PRouterInfo { mainnetRouterInfo }
+    var mainnetTunnelParticipant: I2PTunnelParticipant { tunnelParticipant }
+    var mainnetEncryptionKey: Curve25519.KeyAgreement.PrivateKey { encryptionKey }
 
     private init() {
         // Router identity: an Ed25519 signing key plus an X25519 encryption
@@ -66,7 +68,7 @@ final class I2PRouterAppContext {
            let storedEnc = defaults.string(forKey: "i2p.router.encryptionKey"),
            let encData = Data(base64Encoded: storedEnc), encData.count == 32,
            let restoredSigning = try? Curve25519.Signing.PrivateKey(rawRepresentation: seed),
-           let restoredEncryption = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: encData) {
+           let restoredEncryption = try? Curve25519.Signing.PrivateKey(rawRepresentation: encData) {
             signingKey = restoredSigning
             encryptionKey = restoredEncryption
         } else {
@@ -75,6 +77,7 @@ final class I2PRouterAppContext {
             defaults.set(signingKey.rawRepresentation.base64EncodedString(), forKey: "i2p.router.signingSeed")
             defaults.set(encryptionKey.rawRepresentation.base64EncodedString(), forKey: "i2p.router.encryptionKey")
         }
+        self.encryptionKey = encryptionKey
         signingSeed = signingKey.rawRepresentation
         identity = I2PRouterIdentity(
             encryptionPublicKey: encryptionKey.publicKey.rawRepresentation,
@@ -116,16 +119,19 @@ final class I2PRouterAppContext {
         engine.attach(netDB: netDB)
         engine.attach(to: i2npRouter)
 
-        // Tunnel pool: participants + build bus until NTCP2 peers carry builds.
-        let buildHub = I2PTunnelBuildHub()
-        let buildTransport = I2PTunnelLoopbackTransport(hub: buildHub, localRouterHash: routerHash)
+        // Tunnel pool + hop participation: build messages and build replies
+        // ride live NTCP2 sessions (surfaced by the mainnet CI suite — the
+        // loopback build bus could never carry tunnel-build traffic to or
+        // from real hops). The I2NP router dispatches tunnel builds and build
+        // replies arriving over live sessions to the registered participant,
+        // completing organic inbound acceptance and the originator reply path.
+        let buildTransport = I2PNTCP2TunnelBuildTransport(ntcp2: transport)
         let participant = I2PTunnelParticipant(
             localRouterHash: routerHash,
             localEncryptionKey: encryptionKey,
             transport: buildTransport
         )
-        buildHub.register(participant)
-        tunnelBuildHub = buildHub
+        i2npRouter.addTunnelParticipant(participant)
         tunnelBuildTransport = buildTransport
         tunnelParticipant = participant
         tunnelPeerProvider = EmptyTunnelPeerProvider()
@@ -148,22 +154,47 @@ final class I2PRouterAppContext {
         ntcp2Bridge = bridge
         ntcp2.delegate = bridge
         Task { await netDB.startMaintenance() }
+        // Reachability advertisement (surfaced by the mainnet CI suite): a
+        // real router publishes its external address so mainnet peers can
+        // dial us for inbound tunnel participation.
+        Task { await advertiseReachableAddress() }
         tunnelPool.start()
         engine.start()
         samServer.start()
     }
 
+    /// Binds the NTCP2 listener, discovers our public IPv4 address over
+    /// clearnet HTTPS, re-signs the RouterInfo with that address and
+    /// re-publishes it to the floodfills. A no-op when the listener, the
+    /// address probe or the floodfill set is unavailable.
+    private func advertiseReachableAddress() async {
+        try? await Task.sleep(for: .seconds(2))
+        guard let port = ntcp2.listenerPort, port > 0 else { return }
+        guard let address = try? await I2PExternalAddressDiscovery.publicIPv4Address() else { return }
+        guard let advertised = try? Self.makeRouterInfo(
+            identity: identity,
+            encryptionPublicKey: identity.encryptionPublicKey,
+            signingSeed: signingSeed,
+            ntcp2Host: address,
+            ntcp2Port: port
+        ) else { return }
+        mainnetRouterInfo = advertised
+        _ = await netDB.publish(routerInfo: advertised)
+    }
+
     /// A signed RouterInfo for our own identity (real key material).
     private static func makeRouterInfo(identity: I2PRouterIdentity,
                                        encryptionPublicKey: Data,
-                                       signingSeed: Data) throws -> I2PRouterInfo {
+                                       signingSeed: Data,
+                                       ntcp2Host: String = "127.0.0.1",
+                                       ntcp2Port: UInt16 = 0) throws -> I2PRouterInfo {
         let address = I2PRouterAddress(
             cost: 5,
             transportStyle: "NTCP2",
             expiration: nil,
             options: [
-                "host": "127.0.0.1",
-                "port": "0",
+                "host": ntcp2Host,
+                "port": String(ntcp2Port),
                 "s": Self.urlSafeBase64(encryptionPublicKey)
             ]
         )
@@ -196,24 +227,12 @@ private final class NTCP2I2NPBridge: NTCP2TransportDelegate {
 
     func transport(_ transport: NTCP2Transport, session: NTCP2Session, didReceiveData data: Data) {
         let source = session.remoteRouterHash ?? Data()
-        for message in Self.i2npMessages(in: data) {
+        // Data blocks carry one short-header I2NP message (converted to the
+        // full internal framing by the session) or raw test payloads.
+        if let message = try? I2NPMessage.parse(data) {
             Task { await router.handleIncoming(message, from: source) }
         }
     }
 
     func transport(_ transport: NTCP2Transport, sessionDidClose session: NTCP2Session) {}
-
-    /// NTCP2 data blocks carry one or more concatenated I2NP messages.
-    private static func i2npMessages(in data: Data) -> [I2NPMessage] {
-        var out: [I2NPMessage] = []
-        var buffer = data
-        while buffer.count >= I2NPMessage.headerLength {
-            guard let header = try? I2NPMessage.parseHeader(buffer) else { break }
-            let total = I2NPMessage.headerLength + header.size
-            guard buffer.count >= total, let message = try? I2NPMessage.parse(buffer.prefix(total)) else { break }
-            out.append(message)
-            buffer = Data(buffer.dropFirst(total))
-        }
-        return out
-    }
 }

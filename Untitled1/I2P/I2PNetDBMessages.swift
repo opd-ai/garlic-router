@@ -1,9 +1,9 @@
 //
 //  I2PNetDBMessages.swift
 //  Network Database messages per the I2P I2NP specification:
-//  DatabaseStore (type 0), DatabaseLookup (type 1) and DatabaseSearchReply (type 2).
-//  These payloads are wrapped by the I2NP layer (later milestone); the serialization
-//  here covers each message's spec-defined body.
+//  DatabaseStore (I2NP type 1), DatabaseLookup (I2NP type 2) and
+//  DatabaseSearchReply (I2NP type 3). These payloads are wrapped by the I2NP
+//  layer; the serialization here covers each message's spec-defined body.
 //
 
 import Foundation
@@ -211,12 +211,14 @@ enum I2PNetDBMessage {
     case lookup(I2PDatabaseLookup)
     case searchReply(I2PDatabaseSearchReply)
 
-    /// I2NP message type code for this payload.
+    /// I2NP message type code for this payload (spec codes: DatabaseStore 1,
+    /// DatabaseLookup 2, DatabaseSearchReply 3 — corrected after the live
+    /// suite surfaced that the router previously rode provisional codes).
     var i2npType: UInt8 {
         switch self {
-        case .store: return 0
-        case .lookup: return 1
-        case .searchReply: return 2
+        case .store: return 1
+        case .lookup: return 2
+        case .searchReply: return 3
         }
     }
 
@@ -230,9 +232,9 @@ enum I2PNetDBMessage {
 
     static func parse(_ data: Data, i2npType: UInt8) throws -> I2PNetDBMessage {
         switch i2npType {
-        case 0: return .store(try I2PDatabaseStore.parse(data))
-        case 1: return .lookup(try I2PDatabaseLookup.parse(data))
-        case 2: return .searchReply(try I2PDatabaseSearchReply.parse(data))
+        case 1: return .store(try I2PDatabaseStore.parse(data))
+        case 2: return .lookup(try I2PDatabaseLookup.parse(data))
+        case 3: return .searchReply(try I2PDatabaseSearchReply.parse(data))
         default: throw I2PWireError.unsupportedAlgorithm
         }
     }

@@ -63,6 +63,15 @@ struct ContentView: View {
         }
     }
 
+    /// The live mainnet suite runs explicitly (it performs real network
+    /// exchanges with reseed servers and floodfill routers), never on launch.
+    private func runMainnetAudit() {
+        Task {
+            let fresh = await I2PMainnetVerification.runAll()
+            await MainActor.run { results = fresh }
+        }
+    }
+
     private var cryptoSuiteCard: some View {
         card(title: "Cryptographic Suite") {
             suiteRow("X25519", subtitle: "EncType 4 · key agreement")
@@ -108,6 +117,18 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 10)
                     .background(accent.opacity(0.18), in: RoundedRectangle(cornerRadius: 12))
+            }
+            .buttonStyle(.plain)
+            .tint(accent)
+
+            Button {
+                runMainnetAudit()
+            } label: {
+                Label("Run mainnet audit (live network)", systemImage: "antenna.radiowaves.left.and.right")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .background(accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
             }
             .buttonStyle(.plain)
             .tint(accent)

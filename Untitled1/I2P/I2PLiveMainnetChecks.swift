@@ -213,3 +213,109 @@ final class I2PLiveInboundMonitor {
         return "\(routedBodies) routed bodies: \(tunnelBuildMessages) tunnel builds, \(tunnelBuildReplyMessages) build replies"
     }
 }
+// MARK: - Reachability advertisement (public IPv4 discovery)
+
+/// Discovers our public IPv4 address over clearnet HTTPS — the CI-friendly
+/// equivalent of the SSU2 peer test (the simulator cannot receive inbound
+/// peer-test datagrams). Real routers learn the same information from peer
+/// tests; both feed the RouterInfo's published transport address.
+enum I2PExternalAddressDiscovery {
+    static let sources = [
+        "https://api.ipify.org",
+        "https://checkip.amazonaws.com",
+    ]
+
+    static func publicIPv4Address() async throws -> String {
+        var lastError: Error = I2PMainnetFailure(message: "no address source reachable")
+        for source in sources {
+            do {
+                guard let url = URL(string: source) else { continue }
+                var request = URLRequest(url: url)
+                request.timeoutInterval = 10
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                    throw I2PMainnetFailure(message: "address probe returned a non-200 status")
+                }
+                let text = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+                let parts = text.split(separator: ".")
+                guard parts.count == 4,
+                      parts.allSatisfy({ !$0.isEmpty && (0...255).contains(Int($0) ?? -1) }) else {
+                    throw I2PMainnetFailure(message: "address probe returned non-IPv4 content")
+                }
+                return text
+            } catch {
+                lastError = error
+            }
+        }
+        throw lastError
+    }
+}
+
+// MARK: - Mainnet tunnel build plumbing (surfaced by the live suite)
+
+/// Carries VariableTunnelBuild / BuildReply I2NP envelopes over live NTCP2
+/// sessions — the wire path the loopback build bus could never serve.
+final class I2PNTCP2TunnelBuildTransport: I2PTunnelBuildTransport {
+    private weak var ntcp2: NTCP2Transport?
+
+    init(ntcp2: NTCP2Transport) {
+        self.ntcp2 = ntcp2
+    }
+
+    func sendBuild(_ message: I2PTunnelBuildMessage, to routerHash: Data) {
+        let envelope = I2NPMessage(type: .tunnelBuild,
+                                   messageID: message.messageID,
+                                   expiration: Date().addingTimeInterval(120),
+                                   payload: message.serialize())
+        try? ntcp2?.send(to: routerHash, data: envelope.serialize())
+    }
+
+    func sendBuildReply(_ body: Data, to routerHash: Data) {
+        let envelope = I2NPMessage(type: .tunnelBuildReply,
+                                   expiration: Date().addingTimeInterval(120),
+                                   payload: body)
+        try? ntcp2?.send(to: routerHash, data: envelope.serialize())
+    }
+}
+
+/// Supplies real mainnet routers as tunnel-hop candidates: modern-identity
+/// routers already ingested and signature-verified by the netdb. Build
+/// records encrypt to each hop's X25519 identity key.
+final class I2PMainnetTunnelPeerProvider: I2PTunnelPeerProvider {
+    private let netDB: I2PNetworkDatabase
+    private let lock = NSLock()
+    private var candidates: [I2PTunnelPeer] = []
+
+    init(netDB: I2PNetworkDatabase) {
+        self.netDB = netDB
+    }
+
+    /// Refreshes the hop candidates from the live netdb (cache-first RouterInfo
+    /// reads; only modern identities survive the netdb's signature-verified
+    /// ingest, so every candidate carries a usable X25519 encryption key).
+    func refreshCandidates(limit: Int = 8) async {
+        let probeKey = I2PCrypto.randomBytes(32)
+        let hashes = await netDB.selectFloodfills(for: probeKey, count: limit)
+        var peers: [I2PTunnelPeer] = []
+        for hash in hashes {
+            guard let info = await netDB.lookupRouterInfo(hash, timeoutPerRound: 1, maxRounds: 1) else {
+                continue
+            }
+            let key = info.identity.encryptionPublicKey
+            guard key.count == 32 else { continue }
+            peers.append(I2PTunnelPeer(routerHash: hash, encryptionPublicKey: key))
+        }
+        lock.lock()
+        candidates = peers
+        lock.unlock()
+    }
+
+    func peers(count: Int, excluding: Set<Data>) -> [I2PTunnelPeer] {
+        lock.lock()
+        defer { lock.unlock() }
+        return candidates
+            .filter { !excluding.contains($0.routerHash) }
+            .prefix(count)
+            .map { $0 }
+    }
+}

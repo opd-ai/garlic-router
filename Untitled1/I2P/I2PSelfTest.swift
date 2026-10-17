@@ -96,7 +96,8 @@ enum I2PSelfTest {
         results.append(contentsOf: I2PSpecComplianceSelfTest.runAll())
         results.append(contentsOf: await I2PCrossValidation.selfTestEntries())
         results.append(contentsOf: await I2PSAMConformanceTest.runAll())
-        results.append(contentsOf: await I2PMainnetVerification.runAll())
+        // The live mainnet verification suite runs explicitly (via the mainnet
+        // audit button / the CI job), not on every app launch.
         return results
     }
 
@@ -372,23 +373,24 @@ enum I2PSpecComplianceSelfTest {
         }
 
         run("I2NP wire type codes match the spec table") {
+            // The live mainnet suite surfaced that the router previously rode
+            // provisional codes (67/98/99/…) that real routers drop as unknown
+            // types; these are the spec's codes.
             let expected: [I2NPMessageType: UInt8] = [
-                .databaseStore: 67, .databaseLookup: 98, .databaseSearchReply: 99,
-                .deliveryStatus: 10, .garlic: 21, .tunnelData: 18,
-                .dataMessage: 31, .tunnelBuild: 123, .tunnelBuildReply: 124
+                .databaseStore: 1, .databaseLookup: 2, .databaseSearchReply: 3,
+                .deliveryStatus: 4, .garlic: 5, .tunnelData: 6,
+                .tunnelGateway: 7, .dataMessage: 8, .tunnelBuild: 21,
+                .tunnelBuildReply: 22
             ]
             for (messageType, code) in expected {
                 guard messageType.rawValue == code else {
                     throw I2PWireError.invalidFormat
                 }
             }
-            guard I2NPMessageType.options.rawValue == 6 else {
-                throw I2PWireError.invalidFormat // router-internal, unused mainnet code
+            guard I2NPMessageType.options.rawValue == 12 else {
+                throw I2PWireError.invalidFormat // router-internal, obsolete slot
             }
-            guard I2NPMessageType.tunnelGateway.rawValue == 15 else {
-                throw I2PWireError.invalidFormat // provisional, pending live verification
-            }
-            return "9 mainnet codes verified; options/gateway flagged in the review"
+            return "10 mainnet codes verified; options documented as router-internal"
         }
 
         run("I2NP header round trip + expiry enforcement") {

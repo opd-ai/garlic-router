@@ -12,23 +12,26 @@ enum I2NPError: Error {
     case unknownTunnel
 }
 
-/// I2NP message type codes on the wire per the I2P common message spec
-/// (spec.i2p.io/common/i2np), reconciled during the compliance review.
-/// `options` is a router-internal status message on an unused mainnet code;
-/// `tunnelGateway` keeps this router's provisional code pending live-network
-/// verification (both are noted in COMPLIANCE_REVIEW.md).
+/// I2NP message type codes on the wire per the I2P common message spec.
+/// The live mainnet suite surfaced that the router previously rode provisional
+/// codes (67/98/99/21/18/15/31/123/124) that real routers drop as unknown
+/// types; these are the spec's codes — DatabaseStore 1, DatabaseLookup 2,
+/// DatabaseSearchReply 3, DeliveryStatus 4, Garlic 5, TunnelData 6,
+/// TunnelGateway 7, DataMessage 8, VariableTunnelBuild 21 and its reply 22.
+/// `options` keeps a router-internal status channel on the obsolete type-12
+/// slot (TunnelCreateStatus); it is never sent to mainnet peers.
 enum I2NPMessageType: UInt8, CaseIterable {
-    case databaseStore = 67
-    case databaseLookup = 98
-    case databaseSearchReply = 99
-    case deliveryStatus = 10
-    case options = 6
-    case garlic = 21
-    case tunnelData = 18
-    case tunnelGateway = 15
-    case dataMessage = 31
-    case tunnelBuild = 123
-    case tunnelBuildReply = 124
+    case databaseStore = 1
+    case databaseLookup = 2
+    case databaseSearchReply = 3
+    case deliveryStatus = 4
+    case garlic = 5
+    case tunnelData = 6
+    case tunnelGateway = 7
+    case dataMessage = 8
+    case options = 12
+    case tunnelBuild = 21
+    case tunnelBuildReply = 22
 }
 
 /// I2NP wire header: type byte, message ID, expiry and big-endian size.
@@ -114,6 +117,42 @@ struct I2NPMessage {
     /// Expiry enforcement: stale messages are dropped on receipt.
     func isExpired(now: Date = Date()) -> Bool {
         expiration.timeIntervalSince(now) <= 0
+    }
+
+    /// The 5-byte short tunnel header used by NTCP2 data blocks and tunnel
+    /// messages: type (1) + expiration (4 BE, seconds). The payload rides
+    /// ungated after it; the receiving transport bounds it by its framing.
+    func serializeShort() -> Data {
+        var w = I2PWriter()
+        w.byte(type.rawValue)
+        w.integer(UInt32(max(0, (expiration.timeIntervalSince1970).rounded())))
+        w.raw(payload)
+        return w.data
+    }
+
+    /// Parses one short-header I2NP message: [type (1)][expiration (4 BE s)][payload].
+    /// The message ID is regenerated for internal handling (it never rode the
+    /// short header; every protocol that correlates by ID — build messages,
+    /// reply tokens, garlic tags — carries its own identifier in the body).
+    static func parseShort(_ data: Data) throws -> I2NPMessage {
+        guard data.count >= 5, let type = I2NPMessageType(rawValue: data[0]) else {
+            throw I2NPError.unsupportedType
+        }
+        let seconds = (UInt32(data[1]) << 24) | (UInt32(data[2]) << 16)
+                      | (UInt32(data[3]) << 8) | UInt32(data[4])
+        return I2NPMessage(
+            type: type,
+            messageID: UInt32.random(in: 1...UInt32.max),
+            expiration: Date(timeIntervalSince1970: TimeInterval(seconds)),
+            payload: data.subdata(in: 5..<data.count)
+        )
+    }
+
+    /// True when `data` begins with a valid short header (a known type code and
+    /// at least the 5-byte header). Transport receivers use this to distinguish
+    /// mainnet short-header messages from raw non-I2NP payloads.
+    static func looksLikeShortHeaderMessage(_ data: Data) -> Bool {
+        data.count >= 5 && I2NPMessageType(rawValue: data[0]) != nil
     }
 
     /// Typed payload parsing for every standard message type.

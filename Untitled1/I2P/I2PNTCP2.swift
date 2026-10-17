@@ -233,7 +233,14 @@ final class NTCP2Session: NSObject {
                     return
                 }
             case .data(let data):
-                delegate?.session(self, didReceiveData: data)
+                // Mainnet framing: one short-header I2NP message per data block.
+                // Non-I2NP raw payloads (loopback/test traffic) pass through.
+                if I2NPMessage.looksLikeShortHeaderMessage(data),
+                   let message = try? I2NPMessage.parseShort(data) {
+                    delegate?.session(self, didReceiveData: message.serialize())
+                } else {
+                    delegate?.session(self, didReceiveData: data)
+                }
             case .termination:
                 // Graceful close requested by the peer.
                 finish(error: nil)
@@ -248,7 +255,20 @@ final class NTCP2Session: NSObject {
         guard state == .established, let codec = sendCodec else {
             throw NTCP2Error.notEstablished
         }
-        var payload = try NTCP2Block.encode([.data(data), .time(Date())])
+        // Data blocks carry exactly one I2NP message in the 5-byte short tunnel
+        // header (mainnet NTCP2 framing). Full internal (17-byte-header) messages
+        // are re-framed to the short header; anything that is not a parsable
+        // I2NP message (test/loopback payloads) rides the block ungated.
+        let shortMessage: Data
+        if let message = try? I2NPMessage.parse(data) {
+            shortMessage = message.serializeShort()
+        } else {
+            shortMessage = data
+        }
+        guard shortMessage.count <= 65519 else {
+            throw NTCP2Error.notEstablished
+        }
+        var payload = try NTCP2Block.encode([.data(shortMessage), .time(Date())])
         payload = NTCP2Block.aligned(payload)
         sendRaw(try codec.frame(payload))
     }

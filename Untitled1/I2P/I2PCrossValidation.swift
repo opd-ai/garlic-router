@@ -119,6 +119,9 @@ enum I2PCrossValidation {
         run("T4-NP-HEADER-RT", rowID: "NP-HEADER", "I2NP header + message: round trip identical; short/oversize payload rejected") {
             try i2npRoundTrip()
         }
+        run("T4-NP-HEADER-SHORT", rowID: "NP-HEADER", "Short tunnel header (5 bytes, seconds-level expiry): the wire framing NTCP2 data blocks carry; seconds truncation and type validation verified") {
+            try i2npShortHeaderSpec()
+        }
         run("T4-NP-HEADER-EXPIRY", rowID: "NP-HEADER", "I2NP expiry enforcement: fresh accepted, stale flagged dropped") {
             try i2npExpiryEnforcement()
         }
@@ -666,6 +669,44 @@ enum I2PCrossValidation {
             throw I2PCrossValidationError.unexpectedSuccess
         }
         return "17-byte header round trip identical; oversize and truncated payloads rejected"
+    }
+
+    /// The 5-byte short tunnel header that NTCP2 data blocks carry: type (1) +
+    /// expiration (4 BE seconds) + payload, with the payload bounded by the
+    /// transport block framing. This is the wire shape mainnet routers use.
+    private static func i2npShortHeaderSpec() throws -> String {
+        let payload = I2PCrypto.randomBytes(180)
+        let expiration = Date(timeIntervalSince1970: 1_800_000_123.456)
+        let message = I2NPMessage(type: .garlic, messageID: 0x0123_4567,
+                                  expiration: expiration, payload: payload)
+        let short = message.serializeShort()
+        // Layout: type (1) + expiration seconds (4 BE) + payload; the message
+        // ID does not ride the short header (it is regenerated internally).
+        guard short.count == 5 + payload.count, short[0] == I2NPMessageType.garlic.rawValue else {
+            throw I2PWireError.invalidFormat
+        }
+        let seconds = (UInt32(short[1]) << 24) | (UInt32(short[2]) << 16)
+                      | (UInt32(short[3]) << 8) | UInt32(short[4])
+        guard abs(TimeInterval(seconds) - expiration.timeIntervalSince1970.rounded()) < 1 else {
+            throw I2PWireError.invalidFormat
+        }
+        let parsed = try I2NPMessage.parseShort(short)
+        guard parsed.type == .garlic, parsed.payload == payload,
+              parsed.messageID != message.messageID else {
+            throw I2PWireError.invalidFormat
+        }
+        // The transport round trip: full internal framing → short wire framing
+        // → parse back; the payload and type survive byte-for-byte.
+        guard try I2NPMessage.parseShort(message.serializeShort()).payload == payload else {
+            throw I2PWireError.invalidFormat
+        }
+        // Unknown type codes reject at the short-header boundary.
+        var unknown = short
+        unknown[0] = 200
+        guard expectThrow({ _ = try I2NPMessage.parseShort(unknown) }) else {
+            throw I2PCrossValidationError.unexpectedSuccess
+        }
+        return "5-byte short header (type + seconds-level expiry) parses; payload rides ungated; unknown types rejected"
     }
 
     private static func i2npExpiryEnforcement() throws -> String {

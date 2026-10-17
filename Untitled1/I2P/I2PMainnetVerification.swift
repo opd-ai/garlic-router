@@ -249,33 +249,65 @@ enum I2PMainnetVerification {
             // sessions is dispatched through the I2NP router while we watch.
             try? await Task.sleep(for: .seconds(20))
             let detail = "monitored \(ntcp2.sessionCount()) established mainnet session(s) for 20s — \(monitor.summary)"
-            // Organic inbound tunnel participation requires our published
-            // transport address to be reachable from the mainnet; the CI
-            // simulator publishes no reachable address (NAT, ephemeral listener),
-            // so zero organic builds is an environment property, not a defect.
+            // Organic inbound tunnel participation now has every mechanical
+            // ingredient: the router publishes its real external address
+            // (listener + public IPv4 discovery) and the I2NP router dispatches
+            // tunnel builds and build replies to the registered participant.
+            // What remains is mainnet timescale: other routers must first
+            // re-discover our freshly advertised address, select us as a hop,
+            // and dial in — plus NAT port mapping in the CI environment.
             guard monitor.tunnelBuildMessages + monitor.tunnelBuildReplyMessages > 0 else {
-                throw I2PMainnetFailure(message: detail + " — no organic inbound tunnel participation: the CI environment publishes no reachable transport address (inbound acceptance machinery is armed and dispatching through the I2NP router)")
+                throw I2PMainnetFailure(message: detail + " — no organic inbound tunnel participation within the window: our external address was only just advertised (peer selection on mainnet lags by minutes) and the CI environment sits behind NAT; the acceptance machinery (listener, I2NP build dispatch, participant handling) is live")
             }
             await checkpoints.capture(netDB: netDB, ntcp2: ntcp2, pool: tunnelPool)
             return detail
         }
 
-        await run("Mainnet tunnel pool liveness and build metrics") {
-            let outbound = tunnelPool.outboundCount
-            let inbound = tunnelPool.inboundCount
-            let attempts = tunnelPool.buildStartTimes.count
-            let latency = tunnelPool.averageBuildLatency.map { String(format: "%.1fs", $0) } ?? "n/a"
-            let detail = String(format: "pool targets 3-5 per direction (lifetime clamped to the spec's 10-30 min): %d outbound + %d inbound active, %d build attempt(s), mean build latency %@",
-                                outbound, inbound, attempts, latency)
-            // The pool fills from real mainnet peers selected by the builder's
-            // peer provider; with no mainnet peers provisioned, builds cannot
-            // complete and the pool cannot reach its targets — reported as an
-            // implementation gap, not a network flake.
-            guard outbound + inbound > 0 else {
-                throw I2PMainnetFailure(message: detail + " — no active tunnels: the builder's peer provider supplies no mainnet peers, so no live hop has ever acknowledged a build record")
+        await run("Mainnet outbound tunnel creation attempt through real hops") {
+            guard let reseed, reseed.floodfillCount > 0 else {
+                throw I2PMainnetFailure(message: "no mainnet routers known — no hop candidates for a build attempt")
             }
-            await checkpoints.capture(netDB: netDB, ntcp2: ntcp2, pool: tunnelPool)
-            return detail
+            guard ntcp2.sessionCount() > 0 else {
+                throw I2PMainnetFailure(message: "no established mainnet sessions — build messages could never reach a hop")
+            }
+            // Real build plumbing: build records ride live NTCP2 sessions to the
+            // hops, and the I2NP router routes any build reply back to the
+            // dedicated participant (registered on the router).
+            let buildTransport = I2PNTCP2TunnelBuildTransport(ntcp2: ntcp2)
+            let participant = I2PTunnelParticipant(
+                localRouterHash: context.mainnetRouterHash,
+                localEncryptionKey: context.mainnetEncryptionKey,
+                transport: buildTransport)
+            context.mainnetI2NPRouter.addTunnelParticipant(participant)
+            let peerProvider = I2PMainnetTunnelPeerProvider(netDB: netDB)
+            await peerProvider.refreshCandidates(limit: 8)
+            let peers = peerProvider.peers(count: 2, excluding: [context.mainnetRouterHash])
+            guard peers.count == 2 else {
+                throw I2PMainnetFailure(message: "only \(peers.count) of the probed mainnet routers carry a usable modern encryption identity")
+            }
+            let builder = I2PTunnelBuilder(
+                localRouterHash: context.mainnetRouterHash,
+                participant: participant,
+                transport: buildTransport)
+            let attemptStarted = Date()
+            do {
+                let tunnel = try await builder.buildTunnel(
+                    direction: .outbound, hops: peers, lifetime: 900, timeout: 12)
+                tunnelPool.adopt(tunnel)
+                await checkpoints.capture(netDB: netDB, ntcp2: ntcp2, pool: tunnelPool)
+                return String(format: "outbound tunnel built through %d real mainnet hops in %.1fs (gateway %@, endpoint tunnel %d); pool now holds %d outbound + %d inbound",
+                              tunnel.hopCount, Date().timeIntervalSince(attemptStarted),
+                              String(tunnel.hops.first?.routerHash.hex.prefix(12) ?? "-"),
+                              tunnel.gatewayTunnelID, tunnelPool.outboundCount, tunnelPool.inboundCount)
+            } catch {
+                // Real mainnet hops drop records they cannot decrypt with their
+                // own key. Our build records use the documented ECIES-X25519
+                // record design inside the VariableTunnelBuild envelope (truth-
+                // table row TN-RECORD: record layout pending alignment to the
+                // mainnet record shape), so the request never comes back and the
+                // build times out — an implementation gap, not a network flake.
+                throw I2PMainnetFailure(message: "outbound tunnel build through \(peers.count) real mainnet hops did not complete in 12s (\(String(describing: error))); hops drop the documented ECIES record shape pending the TN-RECORD record-layout alignment; pool liveness: \(tunnelPool.outboundCount) outbound + \(tunnelPool.inboundCount) inbound active, \(tunnelPool.buildStartTimes.count) pool build attempt(s) logged")
+            }
         }
 
         await run("Mainnet post-run analysis against mainnet norms") {
