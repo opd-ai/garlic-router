@@ -366,6 +366,7 @@ enum I2PSAMConformanceTest {
         await run("SAM RAW anonymous datagram delivery", rawTest)
         await run("SAM session persistence (save/restore private keys)", persistenceTest)
         await run("SAM load: 3 concurrent streams · latency + throughput", loadTest)
+        await run("SAM session parameters (SIGNATURE_TYPE / ENCRYPTION_TYPE)", parametersTest)
         return results
     }
 
@@ -786,6 +787,48 @@ enum I2PSAMConformanceTest {
         let elapsed = Date().timeIntervalSince(started)
         return String(format: "3 concurrent streams verified · avg RTT %.1f ms · %.0f KB/s aggregate · %.1f s workout",
                       totalRTTms / Double(pairs), aggregateKBps, elapsed)
+    }
+
+    private static func parametersTest() async throws -> String {
+        let rig = try SAMTestRig(label: "params")
+        rig.start()
+        defer { rig.stop() }
+        guard let port = await waitForPort(rig) else { throw I2PSAMError.timeout }
+
+        let client = SAMTestClient()
+        try await client.connect(port: port)
+        defer { client.close() }
+
+        client.send("HELLO VERSION MIN=3.0 MAX=3.3")
+        _ = try await client.readLine()
+
+        // The router's native modern types are accepted, numeric and named.
+        client.send("SESSION CREATE STYLE=STREAM ID=t1 DESTINATION=TRANSIENT SIGNATURE_TYPE=7 ENCRYPTION_TYPE=4")
+        let ok = try await client.readLine()
+        guard ok.hasPrefix("SESSION STATUS RESULT=OK") else {
+            throw I2PSAMError.invalidCommand("modern types rejected: \(ok)")
+        }
+        client.send("SESSION CREATE STYLE=STREAM ID=t2 DESTINATION=TRANSIENT SIGNATURE_TYPE=EdDSA_SHA512_Ed25519 ENCRYPTION_TYPE=ECIES_X25519")
+        let ok2 = try await client.readLine()
+        guard ok2.hasPrefix("SESSION STATUS RESULT=OK") else {
+            throw I2PSAMError.invalidCommand("named types rejected: \(ok2)")
+        }
+
+        // Legacy crypto is rejected: the router is modern-crypto only.
+        client.send("SESSION CREATE STYLE=STREAM ID=t3 DESTINATION=TRANSIENT SIGNATURE_TYPE=DSA_SHA1")
+        let legacySig = try await client.readLine()
+        guard legacySig.hasPrefix("SESSION STATUS RESULT=I2P_ERROR"),
+              legacySig.contains("unsupported_signature_type") else {
+            throw I2PSAMError.invalidCommand("legacy signature type accepted: \(legacySig)")
+        }
+        client.send("SESSION CREATE STYLE=STREAM ID=t4 DESTINATION=TRANSIENT ENCRYPTION_TYPE=ELGAMAL_2048")
+        let legacyEnc = try await client.readLine()
+        guard legacyEnc.hasPrefix("SESSION STATUS RESULT=I2P_ERROR"),
+              legacyEnc.contains("unsupported_encryption_type") else {
+            throw I2PSAMError.invalidCommand("legacy encryption type accepted: \(legacyEnc)")
+        }
+
+        return "modern signature/encryption types accepted (numeric + named); legacy DSA/ElGamal rejected"
     }
 
     private static func waitForPort(_ rig: SAMTestRig, timeout: TimeInterval = 10) async -> UInt16? {

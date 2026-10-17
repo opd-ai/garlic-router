@@ -513,6 +513,21 @@ final class I2PSAMConnection {
         lock.unlock()
         // Optional session persistence: PERSISTENT=true saves the destination's
         // private keys under the nickname and restores them on re-creation.
+        // Session parameters: signature and encryption types are validated
+        // against the router's modern-only destination stack (Ed25519 SigType 7
+        // + X25519 EncType 4/5); legacy crypto types are rejected outright.
+        if let requested = options["SIGNATURE_TYPE"], !requested.isEmpty {
+            let supported = ["7", "eddsa_sha512_ed25519"]
+            guard supported.contains(requested.lowercased()) else {
+                throw I2PSAMError.invalidCommand("unsupported_signature_type_\(requested)")
+            }
+        }
+        if let requested = options["ENCRYPTION_TYPE"], !requested.isEmpty {
+            let supported = ["4", "5", "x25519", "ecies_x25519"]
+            guard supported.contains(requested.lowercased()) else {
+                throw I2PSAMError.invalidCommand("unsupported_encryption_type_\(requested)")
+            }
+        }
         let keys: I2PSAMDestinationKeys
         let persistent = options["PERSISTENT"] == "true"
         if destinationSpec == "TRANSIENT" {
