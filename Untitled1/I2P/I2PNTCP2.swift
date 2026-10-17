@@ -354,6 +354,7 @@ final class NTCP2Transport {
     private var listener: NWListener?
     private var sessions: [NTCP2Session] = []
     private var sessionsByHash: [Data: NTCP2Session] = [:]
+    private let sessionLedger = I2PResourceLedger()
 
     init(localRouterInfo: I2PRouterInfo, staticKey: Curve25519.KeyAgreement.PrivateKey) {
         self.localRouterInfo = localRouterInfo
@@ -445,6 +446,14 @@ final class NTCP2Transport {
     }
 
     private func register(_ session: NTCP2Session) {
+        // Resource quota: session slots are bounded. A connection arriving at
+        // the cap is aborted fail-closed rather than admitted; every
+        // exhaustion is recorded in the security audit log.
+        guard sessionLedger.tryReserve(name: "ntcp2.sessions") else {
+            session.abort()
+            I2PSecurityAuditLog.append(category: "transport", detail: "ntcp2 session cap reached; inbound connection aborted")
+            return
+        }
         sessions.append(session)
     }
 
@@ -453,6 +462,7 @@ final class NTCP2Transport {
         sessions.removeAll { $0 === session }
         sessionsByHash = sessionsByHash.filter { $0.value !== session }
         lock.unlock()
+        sessionLedger.release(name: "ntcp2.sessions")
     }
 }
 

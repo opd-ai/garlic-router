@@ -73,34 +73,56 @@ final class I2PRouterAppContext {
         // (never in unprotected user-defaults storage) and reused on later
         // launches so the RouterHash is stable for the router's lifetime.
         let defaults = UserDefaults.standard
-        let signingKey: Curve25519.Signing.PrivateKey
-        let encryptionKey: Curve25519.KeyAgreement.PrivateKey
         // Migration: keys persisted in UserDefaults by earlier builds move into
         // the Keychain and are removed from the unprotected store.
         if I2PRouterKeychain.read(account: "signingSeed") == nil,
            let legacy = defaults.string(forKey: "i2p.router.signingSeed"),
-           let data = Data(base64Encoded: legacy), data.count == 32 {
+           var data = Data(base64Encoded: legacy), data.count == 32 {
             I2PRouterKeychain.write(data, account: "signingSeed")
+            I2PHardenedMemory.zeroize(&data)
             defaults.removeObject(forKey: "i2p.router.signingSeed")
         }
         if I2PRouterKeychain.read(account: "encryptionKey") == nil,
            let legacy = defaults.string(forKey: "i2p.router.encryptionKey"),
-           let data = Data(base64Encoded: legacy), data.count == 32 {
+           var data = Data(base64Encoded: legacy), data.count == 32 {
             I2PRouterKeychain.write(data, account: "encryptionKey")
+            I2PHardenedMemory.zeroize(&data)
             defaults.removeObject(forKey: "i2p.router.encryptionKey")
         }
-        if let storedSeed = I2PRouterKeychain.read(account: "signingSeed"),
-           let storedEncryption = I2PRouterKeychain.read(account: "encryptionKey"),
-           let restoredSigning = try? Curve25519.Signing.PrivateKey(rawRepresentation: storedSeed),
-           let restoredEncryption = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: storedEncryption) {
-            signingKey = restoredSigning
-            encryptionKey = restoredEncryption
-        } else {
-            signingKey = Curve25519.Signing.PrivateKey()
-            encryptionKey = Curve25519.KeyAgreement.PrivateKey()
-            I2PRouterKeychain.write(signingKey.rawRepresentation, account: "signingSeed")
-            I2PRouterKeychain.write(encryptionKey.rawRepresentation, account: "encryptionKey")
+        func hardenedIdentityKeys() -> (signingKey: Curve25519.Signing.PrivateKey,
+                                         encryptionKey: Curve25519.KeyAgreement.PrivateKey) {
+            if let storedSeed = I2PRouterKeychain.read(account: "signingSeed"),
+               let storedEncryption = I2PRouterKeychain.read(account: "encryptionKey") {
+                do {
+                    // Zero trust for restored key material: length and degenerate-key
+                    // checks run before the keys are used for anything. A poisoned
+                    // or corrupted Keychain entry fails closed.
+                    try I2PHardenedKeys.validate(storedSeed, context: "restored signing seed")
+                    try I2PHardenedKeys.validate(storedEncryption, context: "restored encryption key")
+                    let restoredSigning = try Curve25519.Signing.PrivateKey(rawRepresentation: storedSeed)
+                    let restoredEncryption = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: storedEncryption)
+                    I2PSecurityAuditLog.append(category: "identity", detail: "persisted identity restored and validated")
+                    return (restoredSigning, restoredEncryption)
+                } catch {
+                    // Fail closed: unusable persisted identity is replaced with a
+                    // freshly generated one rather than operated on.
+                    let freshSigning = Curve25519.Signing.PrivateKey()
+                    let freshEncryption = Curve25519.KeyAgreement.PrivateKey()
+                    I2PRouterKeychain.write(freshSigning.rawRepresentation, account: "signingSeed")
+                    I2PRouterKeychain.write(freshEncryption.rawRepresentation, account: "encryptionKey")
+                    I2PSecurityAuditLog.append(category: "identity", detail: "persisted identity failed validation; regenerated fresh keys")
+                    return (freshSigning, freshEncryption)
+                }
+            }
+            let freshSigning = Curve25519.Signing.PrivateKey()
+            let freshEncryption = Curve25519.KeyAgreement.PrivateKey()
+            I2PRouterKeychain.write(freshSigning.rawRepresentation, account: "signingSeed")
+            I2PRouterKeychain.write(freshEncryption.rawRepresentation, account: "encryptionKey")
+            return (freshSigning, freshEncryption)
         }
+        let identityKeys = hardenedIdentityKeys()
+        let signingKey = identityKeys.signingKey
+        let encryptionKey = identityKeys.encryptionKey
         self.encryptionKey = encryptionKey
         signingSeed = signingKey.rawRepresentation
         identity = I2PRouterIdentity(

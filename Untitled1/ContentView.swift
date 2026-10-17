@@ -9,6 +9,7 @@ struct ContentView: View {
     @State private var results: [I2PSelfTestResult] = []
     @State private var readinessResults: [I2PSelfTestResult] = []
     @State private var stabilityResults: [I2PSelfTestResult] = []
+    @State private var hardeningResults: [I2PSelfTestResult] = []
     @State private var sizes: [(name: String, bytes: Int)] = []
 
     private let accent = Color(red: 0.47, green: 0.44, blue: 0.97)
@@ -46,6 +47,7 @@ struct ContentView: View {
                     selfTestCard
                     readinessCard
                     stabilityCard
+                    hardeningCard
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 4)
@@ -136,6 +138,60 @@ struct ContentView: View {
         Task {
             let fresh = await I2PStabilityAudit.runAll()
             await MainActor.run { stabilityResults = fresh }
+        }
+    }
+
+    /// The defensive-hardening audit probes every dimension of the hardening
+    /// checklist against the live mechanisms. No mainnet traffic involved.
+    private func runHardeningAudit() {
+        Task {
+            let fresh = await I2PHardeningAudit.runAll()
+            await MainActor.run { hardeningResults = fresh }
+        }
+    }
+
+    private var hardeningCard: some View {
+        card(title: "Security hardening") {
+            Button {
+                runHardeningAudit()
+            } label: {
+                Label("Run hardening audit", systemImage: "lock.shield")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .background(accent.opacity(0.15), in: RoundedRectangle(cornerRadius: 12))
+            }
+            .buttonStyle(.plain)
+            .tint(accent)
+
+            if !hardeningResults.isEmpty {
+                let passed = hardeningResults.filter(\.passed).count
+                Text(passed == hardeningResults.count
+                     ? "\(passed) of \(hardeningResults.count) probes passed — defensive posture verified"
+                     : "\(passed) of \(hardeningResults.count) probes passed — findings below")
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(passed == hardeningResults.count ? Color.green : Color.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                ForEach(hardeningResults.indices, id: \.self) { index in
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: hardeningResults[index].passed ? "checkmark.circle.fill" : "xmark.circle.fill")
+                            .foregroundStyle(hardeningResults[index].passed ? Color.green : Color.red)
+                            .font(.caption)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(hardeningResults[index].name)
+                                .font(.footnote.weight(.medium))
+                            Text(hardeningResults[index].detail)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                Text("Fail closed: ambiguous states are rejected, quotas bound every resource, secrets are erased and redacted from diagnostics.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
