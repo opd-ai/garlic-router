@@ -48,9 +48,9 @@
       "mockups" : [
 
       ],
-      "status" : "pending",
+      "status" : "in_progress",
       "title" : "Build tunnels and the tunnel pool",
-      "updatedAt" : "2026-10-17T00:41:22Z"
+      "updatedAt" : "2026-10-17T01:19:55Z"
     },
     {
       "createdAt" : "2026-10-17T00:41:22Z",
@@ -91,6 +91,18 @@
       "status" : "pending",
       "title" : "Add a router status dashboard",
       "updatedAt" : "2026-10-17T00:41:22Z"
+    },
+    {
+      "createdAt" : "2026-10-17T01:29:48Z",
+      "description" : "**Spec Compliance & Network Interoperability Review: Pure Swift I2P Router**\n\n**Objective**\nEvaluate a pure Swift I2P router implementation against current I2P specifications to verify modern cryptographic compliance, exclusion of legacy systems, and functional interoperability with the live I2P network.\n\n**Scope: Modern Crypto Only**\n- Encryption: ECIES (X25519 + ChaCha20-Poly1305)\n- Transport: NTCP2 with Noise_XK_25519_ChaChaPoly_SHA256\n- Signatures: Ed25519 (SigType 7) and Ed25519ph (SigType 11)\n- Hashing: SHA-256 and BLAKE2b\n- Key Derivation: HKDF-SHA256\n- Exclude: ElGamal, DSA, 3DES, legacy signature types\n\n**Core Compliance Areas**\n\n1. **Data Structures & Binary Format**\n   - RouterInfo serialization and certificate validation\n   - LeaseSet structure and expiration handling\n   - Big-endian encoding for all primitives\n   - Certificate chain verification\n\n2. **Network Database (NetDB) & Peer Discovery**\n   - Kademlia DHT implementation and bucket management\n   - Floodfill router identification and fallback handling\n   - DatabaseLookup and DatabaseStore request\/response cycles\n   - Peer distribution consistency with mainnet topology\n\n3. **Transport Protocol (NTCP2)**\n   - Noise handshake phases (SessionRequest → SessionCreated → SessionConfirm)\n   - Frame encryption and MAC validation\n   - Session establishment and reuse\n   - Interoperability with existing NTCP2 peers\n\n4. **Tunnel Architecture**\n   - Tunnel Build Message construction with encrypted TunnelBuildRecords\n   - Tunnel ID assignment and management\n   - Inbound and outbound tunnel pool orchestration\n   - Build reply handling and failure recovery\n\n5. **I2NP Message Protocol**\n   - Correct message type encoding and routing\n   - DatabaseStore, DatabaseLookup, BuildRequest, TunnelData, GarlicMessage handling\n   - Message serialization and deserialization\n   - Protocol version compatibility\n\n6. **Garlic Routing & End-to-End Encryption**\n   - Clove structure and nested encryption layers\n   - Delivery instruction types (local, tunnel, router)\n   - Expiration timestamp enforcement\n   - Reply token and hop count management\n\n7. **Router Behavior & Network Participation**\n   - Proper peer selection and connection pooling\n   - Lease publication and renewal cycles\n   - Graceful handling of timeouts and peer failures\n   - Bandwidth limiting and congestion awareness\n\n**Validation Criteria**\n- All modern crypto primitives correctly implemented via Apple CryptoKit\n- Zero use of deprecated algorithms\n- Successful peer handshakes with mainnet routers\n- Correct DHT operations (lookup, store, peer exchange)\n- Tunnel creation and data routing across real network paths\n- Garlic message encryption and delivery confirmation\n- Proper handling of edge cases (timeout, replay, invalid signatures)\n\n**Testing & Verification**\n- Protocol conformance against I2P specification documents\n- Network connectivity tests with live floodfill routers\n- Tunnel creation and data throughput validation\n- Message serialization round-trip verification\n- Peer reputation and bandwidth tracking accuracy",
+      "glyph" : "Spectacles",
+      "id" : "8392947b",
+      "mockups" : [
+
+      ],
+      "status" : "pending",
+      "title" : "Code Review",
+      "updatedAt" : "2026-10-17T01:29:48Z"
     }
   ],
   "version" : 1
