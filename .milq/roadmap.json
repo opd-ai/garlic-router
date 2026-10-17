@@ -278,18 +278,6 @@
     },
     {
       "createdAt" : "2026-10-17T20:28:59Z",
-      "description" : "Add configurable send\/receive bandwidth limits applied at the transport layer: a tokens-per-second budget checked before NTCP2 frame sends and SSU2 packet sends, with a bounded burst allowance and graceful queuing rather than silent drops. Expose the configuration as controls on the Router dashboard with live throughput vs. limit display.",
-      "glyph" : "valve on a pipe",
-      "id" : "dca8f415",
-      "mockups" : [
-
-      ],
-      "status" : "pending",
-      "title" : "Add a bandwidth limiter",
-      "updatedAt" : "2026-10-17T20:28:59Z"
-    },
-    {
-      "createdAt" : "2026-10-17T20:28:59Z",
       "description" : "New screen opened from the Router dashboard's session list: a per-peer detail view showing the peer's identity hash, transport (NTCP2 or SSU2), session uptime, bytes exchanged both directions, XOR distance in the Kademlia keyspace, and whether the peer is a floodfill or participates in one of our tunnels. Data comes from the running router's status engine. Dark theme, violet accent, consistent with the existing tabs.",
       "glyph" : "magnifying glass over a router node",
       "id" : "7615c8cf",
