@@ -432,10 +432,11 @@ final class I2PTunnelBuilder {
         }
     }
 
-    /// Builds a unidirectional tunnel through the given peers. For outbound
-    /// tunnels the peers are in tunnel data-path order; for inbound tunnels
-    /// the peers are in build message-path order (nearest the originator
-    /// first, the inbound gateway last).
+    /// Builds a unidirectional tunnel through the given peers, listed in
+    /// tunnel data-path order: the first hop is the tunnel's gateway; for an
+    /// inbound tunnel the last hop is the one nearest the originator. The
+    /// build message follows this same order, so each hop's state, layer key
+    /// and next-hop info describe the data path it will actually process.
     func buildTunnel(direction: I2PTunnel.Direction,
                      hops: [I2PTunnelPeer],
                      lifetime: TimeInterval,
@@ -617,30 +618,23 @@ final class I2PTunnelBuilder {
             )
         }
 
-        for k in 0..<count {
-            let messageIndex = count - 1 - k
-            let nextID: UInt32
-            let isEnd: Bool
-            if messageIndex == 0 {
-                nextID = context.originatorEndpointID
-                isEnd = true
-            } else {
-                nextID = context.receiveIDs[messageIndex - 1]
-                isEnd = false
-            }
+        // Inbound tunnels list hops in data-path order too: the inbound
+        // gateway first, the hop nearest the originator last. The final
+        // entry's next tunnel ID is the originator's local endpoint ID.
+        for index in 0..<count {
             hops.append(I2PTunnelHop(
-                routerHash: context.peerHashes[messageIndex],
-                receiveTunnelID: context.receiveIDs[messageIndex],
-                nextTunnelID: nextID,
-                isTunnelEndpoint: isEnd
+                routerHash: context.peerHashes[index],
+                receiveTunnelID: context.receiveIDs[index],
+                nextTunnelID: index + 1 < count ? context.receiveIDs[index + 1] : context.originatorEndpointID,
+                isTunnelEndpoint: index == count - 1
             ))
         }
-        layerKeys = Array(context.layerKeys.reversed())
-        ivKeys = Array(context.ivKeys.reversed())
+        layerKeys = context.layerKeys
+        ivKeys = context.ivKeys
         return I2PTunnel(
             direction: .inbound,
             hops: hops,
-            gatewayTunnelID: context.receiveIDs[count - 1],
+            gatewayTunnelID: context.receiveIDs[0],
             endpointTunnelID: context.originatorEndpointID,
             layerKeys: layerKeys,
             ivKeys: ivKeys,

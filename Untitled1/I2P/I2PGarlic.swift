@@ -313,6 +313,21 @@ final class I2PGarlicSession {
         return sessionKey == nil || pendingTags.isEmpty
     }
 
+    /// Prepares the tag pool for a pending new-session handshake and returns
+    /// the tags to offer in the session-tags record. Returns nil when the
+    /// next send will use an existing session tag instead.
+    func prepareHandshakeTags() -> [Data]? {
+        lock.lock()
+        defer { lock.unlock() }
+        if sessionKey != nil, !pendingTags.isEmpty { return nil }
+        if pendingTags.isEmpty {
+            pendingTags = (0..<tagsPerHandshake).map { _ in
+                I2PCrypto.randomBytes(I2PGarlicCrypto.tagLength)
+            }
+        }
+        return pendingTags
+    }
+
     /// Tags to embed in the next session-tags record.
     func offeredTags() -> [Data] {
         lock.lock()
@@ -332,15 +347,20 @@ final class I2PGarlicSession {
             return tag + box.combined
         }
         lock.unlock()
-        // New session: fresh ephemeral exchange and a fresh tag pool.
+        // New session: fresh ephemeral exchange. Keep any tag pool already
+        // prepared by prepareHandshakeTags() so the offered tags match the
+        // session key derived in this handshake.
         let ephemeral = Curve25519.KeyAgreement.PrivateKey()
         let key = try I2PGarlicCrypto.sessionKey(ephemeral: ephemeral, peerPublicKey: peerPublicKey)
-        let freshTags = (0..<tagsPerHandshake).map { _ in I2PCrypto.randomBytes(I2PGarlicCrypto.tagLength) }
-        let box = try ChaChaPoly.seal(cloveSetBytes, using: SymmetricKey(data: key))
         lock.lock()
+        if pendingTags.isEmpty {
+            pendingTags = (0..<tagsPerHandshake).map { _ in
+                I2PCrypto.randomBytes(I2PGarlicCrypto.tagLength)
+            }
+        }
         sessionKey = key
-        pendingTags = freshTags
         lock.unlock()
+        let box = try ChaChaPoly.seal(cloveSetBytes, using: SymmetricKey(data: key))
         return ephemeral.publicKey.rawRepresentation + box.combined
     }
 }
@@ -364,13 +384,16 @@ enum I2PGarlicEndToEndPipeline {
                             session: I2PGarlicSession,
                             expiration: Date? = nil) throws -> I2PGarlicTransmission {
         let expiry = expiration ?? Date().addingTimeInterval(300)
-        let delivery = I2PDeliveryInstructions(mode: .tunnel,
-                                               tunnelID: lease.tunnelID,
-                                               routerHash: lease.gatewayRouterHash,
+        // The lease routes the garlic envelope itself (the TunnelGateway
+        // wrapper below carries the lease's tunnel ID and gateway); the
+        // clove's own delivery is local to the destination.
+        let delivery = I2PDeliveryInstructions(mode: .local,
+                                               tunnelID: nil,
+                                               routerHash: nil,
                                                delayMilliseconds: nil)
         var cloves = [I2PGarlicClove(deliveryInstructions: delivery, message: message)]
-        if session.nextSendEmbedsTagsRecord() {
-            let tagsRecord = I2PGarlicSessionTagsRecord(tags: session.offeredTags()).serialize()
+        if let offered = session.prepareHandshakeTags() {
+            let tagsRecord = I2PGarlicSessionTagsRecord(tags: offered).serialize()
             let tagsMessage = I2NPMessage(type: .dataMessage, payload: tagsRecord)
             cloves.append(I2PGarlicClove(
                 deliveryInstructions: I2PDeliveryInstructions(mode: .local,
@@ -469,7 +492,252 @@ enum I2PGarlicSelfTest {
             do { results.append(I2PSelfTestResult(name: name, passed: true, detail: try await body())) }
             catch { results.append(I2PSelfTestResult(name: name, passed: false, detail: "\(error)")) }
         }
-        _ = results.count
+        await run("Garlic clove set framing round-trip", garlicCloveSetTest)
+        await run("ECIES session tags: single-use enforcement", garlicSessionTagsTest)
+        await run("Garlic end-to-end via tunnel pools", garlicEndToEndTest)
         return results
     }
+}
+
+// Garlic suite harness and tests (file-scoped).
+
+private enum I2PGarlicTestTimeout: Error { case timedOut }
+
+private func garlicWaitUntil(timeout: TimeInterval = 20,
+                             _ condition: () -> Bool) async throws {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if condition() { return }
+        try await Task.sleep(for: .milliseconds(50))
+    }
+    if condition() { return }
+    throw I2PGarlicTestTimeout.timedOut
+}
+
+private func sameMessage(_ a: I2NPMessage, _ b: I2NPMessage) -> Bool {
+    a.type == b.type && a.messageID == b.messageID && a.payload == b.payload
+}
+// Test: clove set framing round-trip across all delivery modes.
+
+private func garlicCloveSetTest() async throws -> String {
+    let payloadA = Data("clove A".utf8)
+    let payloadB = Data("clove B".utf8)
+    let payloadC = Data("clove C".utf8)
+    let messageA = I2NPMessage(type: .dataMessage, payload: payloadA)
+    let messageB = I2NPMessage(type: .dataMessage, payload: payloadB)
+    let messageC = I2NPMessage(type: .deliveryStatus, messageID: 7, payload: payloadC)
+
+    let local = I2PDeliveryInstructions(mode: .local, tunnelID: nil,
+                                        routerHash: nil, delayMilliseconds: nil)
+    let tunnel = I2PDeliveryInstructions(mode: .tunnel, tunnelID: 0x11223344,
+                                         routerHash: I2PCrypto.randomBytes(32),
+                                         delayMilliseconds: 500)
+    let router = I2PDeliveryInstructions(mode: .router, tunnelID: nil,
+                                         routerHash: I2PCrypto.randomBytes(32),
+                                         delayMilliseconds: nil)
+    let cert = I2PGarlicCertificate(type: 5, payload: Data([0xAA, 0xBB]))
+
+    let expiration = Date().addingTimeInterval(120)
+    let set = try I2PGarlicCloveSet(expiration: expiration, messageID: 0x00C10AFF,
+                                    certificate: cert,
+                                    cloves: [
+                                        I2PGarlicClove(deliveryInstructions: local, message: messageA),
+                                        I2PGarlicClove(deliveryInstructions: tunnel, message: messageB,
+                                                       certificate: I2PGarlicCertificate(type: 1, payload: Data([0x01]))),
+                                        I2PGarlicClove(deliveryInstructions: router, message: messageC),
+                                    ])
+    let parsed = try I2PGarlicCloveSet.parse(try set.serialize())
+
+    guard abs(parsed.expiration.timeIntervalSince(expiration)) < 1 else { throw I2PGarlicError.invalidPayload }
+    guard parsed.messageID == 0x00C10AFF else { throw I2PGarlicError.invalidPayload }
+    guard parsed.certificate.type == 5 && parsed.certificate.payload == Data([0xAA, 0xBB]) else { throw I2PGarlicError.invalidPayload }
+    guard parsed.cloves.count == 3 else { throw I2PGarlicError.invalidPayload }
+
+    let modes = parsed.cloves.map { $0.deliveryInstructions.mode }
+    guard modes == [.local, .tunnel, .router] else { throw I2PGarlicError.invalidPayload }
+    guard parsed.cloves[1].deliveryInstructions.tunnelID == 0x11223344,
+          parsed.cloves[1].deliveryInstructions.delayMilliseconds == 500,
+          parsed.cloves[1].deliveryInstructions.routerHash == tunnel.routerHash else { throw I2PGarlicError.invalidPayload }
+    guard parsed.cloves[1].certificate.type == 1 else { throw I2PGarlicError.invalidPayload }
+    guard sameMessage(parsed.cloves[0].message, messageA),
+          sameMessage(parsed.cloves[1].message, messageB),
+          sameMessage(parsed.cloves[2].message, messageC) else { throw I2PGarlicError.invalidPayload }
+    return "3 cloves across all delivery modes, delay + certificates intact"
+}
+// Test: ECIES-X25519 sessions — new-session handshake, tag-based follow-up,
+// single-use tag enforcement.
+
+private func garlicSessionTagsTest() async throws -> String {
+    let aliceKey = Curve25519.KeyAgreement.PrivateKey()
+    let aliceManager = I2PGarlicInboundSessionManager(localKey: aliceKey)
+    let bobSession = I2PGarlicSession(peerPublicKey: aliceKey.publicKey, tagsPerHandshake: 4)
+    let localDelivery = I2PDeliveryInstructions(mode: .local, tunnelID: nil,
+                                                routerHash: nil, delayMilliseconds: nil)
+
+    func dataClove(_ id: UInt32, _ text: String) throws -> I2PGarlicClove {
+        I2PGarlicClove(deliveryInstructions: localDelivery,
+                       message: I2NPMessage(type: .dataMessage, payload: Data(text.utf8)))
+    }
+
+    guard bobSession.nextSendEmbedsTagsRecord() else { throw I2PGarlicError.invalidPayload }
+    // First message: new-session handshake carrying the session-tags record.
+    let tagsRecord = I2PGarlicSessionTagsRecord(tags: bobSession.prepareHandshakeTags() ?? []).serialize()
+    let firstSet = try I2PGarlicCloveSet(expiration: Date().addingTimeInterval(300),
+                                         messageID: 0x1234,
+                                         cloves: [try dataClove(0x1234, "first"),
+                                                  I2PGarlicClove(deliveryInstructions: localDelivery,
+                                                                 message: I2NPMessage(type: .dataMessage,
+                                                                                      payload: tagsRecord))])
+    let first = try bobSession.wrapCloveSet(try firstSet.serialize())
+    let set1 = try aliceManager.unwrapPayload(first)
+    guard set1.messageID == 0x1234 else { throw I2PGarlicError.invalidPayload }
+    guard aliceManager.tagManager.count == 4 else { throw I2PGarlicError.invalidPayload }
+    guard aliceManager.establishedPeers == 1 else { throw I2PGarlicError.invalidPayload }
+    guard bobSession.isEstablished, !bobSession.nextSendEmbedsTagsRecord() else { throw I2PGarlicError.invalidPayload }
+
+    // Second message: tag-based encryption over the established session.
+    let secondSet = try I2PGarlicCloveSet(expiration: Date().addingTimeInterval(300),
+                                          messageID: 0x5678,
+                                          cloves: [try dataClove(0x5678, "second")])
+    let second = try bobSession.wrapCloveSet(try secondSet.serialize())
+    let set2 = try aliceManager.unwrapPayload(second)
+    guard set2.messageID == 0x5678 else { throw I2PGarlicError.invalidPayload }
+    guard aliceManager.tagManager.count == 3 else { throw I2PGarlicError.invalidPayload }
+
+    // A replayed tag-based payload must fail: the tag was consumed.
+    do {
+        _ = try aliceManager.unwrapPayload(second)
+        throw I2PGarlicError.invalidPayload
+    } catch let error as I2PGarlicError {
+        guard case .decryptFailed = error else { throw error }
+    }
+    guard aliceManager.tagManager.count == 3 else { throw I2PGarlicError.invalidPayload }
+    return "new-session handshake registered 4 tags, tag follow-up decrypted, replay rejected"
+}
+// Test: full end-to-end chain — garlic through Bob's outbound tunnel pool
+// to a LeaseSet gateway, injected into Alice's inbound tunnel and unwrapped.
+
+private final class GarlicTestBox {
+    private let lock = NSLock()
+    private var items: [I2NPMessage] = []
+    func add(_ message: I2NPMessage) {
+        lock.lock(); defer { lock.unlock() }
+        items.append(message)
+    }
+    var count: Int { lock.lock(); defer { lock.unlock() }; return items.count }
+    func contains(_ needle: I2NPMessage) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return items.contains { sameMessage($0, needle) }
+    }
+}
+
+private final class GarlicTestNode {
+    let routerHash: Data
+    let encryptionKey: Curve25519.KeyAgreement.PrivateKey
+    let participant: I2PTunnelParticipant
+    let router: I2NPMessageRouter
+    let deliveryTransport: I2NPLoopbackDeliveryTransport
+
+    init(buildHub: I2PTunnelBuildHub, deliveryHub: I2NPLoopbackDeliveryHub) {
+        routerHash = I2PCrypto.randomBytes(32)
+        encryptionKey = Curve25519.KeyAgreement.PrivateKey()
+        let buildTransport = I2PTunnelLoopbackTransport(hub: buildHub, localRouterHash: routerHash)
+        participant = I2PTunnelParticipant(localRouterHash: routerHash,
+                                           localEncryptionKey: encryptionKey,
+                                           transport: buildTransport)
+        buildHub.register(participant)
+        router = I2NPMessageRouter(localRouterHash: routerHash)
+        deliveryTransport = I2NPLoopbackDeliveryTransport(hub: deliveryHub,
+                                                          localRouterHash: routerHash)
+        router.deliveryTransport = deliveryTransport
+        deliveryHub.attach(router)
+    }
+
+    var peer: I2PTunnelPeer {
+        I2PTunnelPeer(routerHash: routerHash,
+                      encryptionPublicKey: encryptionKey.publicKey.rawRepresentation)
+    }
+}
+private func garlicEndToEndTest() async throws -> String {
+    let buildHub = I2PTunnelBuildHub()
+    let deliveryHub = I2NPLoopbackDeliveryHub()
+    let alice = GarlicTestNode(buildHub: buildHub, deliveryHub: deliveryHub)
+    let g1 = GarlicTestNode(buildHub: buildHub, deliveryHub: deliveryHub)
+    let g2 = GarlicTestNode(buildHub: buildHub, deliveryHub: deliveryHub)
+    let bob = GarlicTestNode(buildHub: buildHub, deliveryHub: deliveryHub)
+    let b1 = GarlicTestNode(buildHub: buildHub, deliveryHub: deliveryHub)
+    let b2 = GarlicTestNode(buildHub: buildHub, deliveryHub: deliveryHub)
+
+    let aliceBuilder = I2PTunnelBuilder(localRouterHash: alice.routerHash,
+                                        participant: alice.participant,
+                                        transport: I2PTunnelLoopbackTransport(hub: buildHub,
+                                                                              localRouterHash: alice.routerHash))
+    let aliceTunnel = try await aliceBuilder.buildTunnel(
+        direction: .inbound, hops: [g1.peer, g2.peer], lifetime: 900, timeout: 10)
+    let bobBuilder = I2PTunnelBuilder(localRouterHash: bob.routerHash,
+                                      participant: bob.participant,
+                                      transport: I2PTunnelLoopbackTransport(hub: buildHub,
+                                                                            localRouterHash: bob.routerHash))
+    let bobTunnel = try await bobBuilder.buildTunnel(
+        direction: .outbound, hops: [b1.peer, b2.peer], lifetime: 900, timeout: 10)
+
+    g1.router.addTunnelParticipant(g1.participant)
+    g2.router.addTunnelParticipant(g2.participant)
+    b1.router.addTunnelParticipant(b1.participant)
+    b2.router.addTunnelParticipant(b2.participant)
+
+    let lease = I2PGarlicLease(gatewayRouterHash: g1.routerHash,
+                               tunnelID: aliceTunnel.gatewayTunnelID,
+                               expiration: Date().addingTimeInterval(600))
+    let aliceKey = Curve25519.KeyAgreement.PrivateKey()
+    let aliceManager = I2PGarlicInboundSessionManager(localKey: aliceKey)
+    let aliceHandler = I2PGarlicMessageHandler(
+        sessionManager: aliceManager,
+        deliveryTransport: I2NPLoopbackDeliveryTransport(hub: deliveryHub,
+                                                         localRouterHash: alice.routerHash))
+    let box = GarlicTestBox()
+    aliceHandler.addLocalConsumer { message, _ in box.add(message) }
+    alice.router.addBodyHandler { message, source in aliceHandler.handle(message, from: source) }
+// OBEP glue: Bob's outbound endpoint hands the inner message to the
+    // lease's gateway router (the inter-router hop in production).
+    b1.router.registerGateway(tunnelID: bobTunnel.hops[0].receiveTunnelID) { inner, _ in
+        Task {
+            try? await b1.router.deliveryTransport?.deliver(inner.serialize(),
+                                                            to: lease.gatewayRouterHash)
+        }
+    }
+    // IBGW glue: the lease gateway injects the garlic message into Alice's
+    // inbound tunnel, applying the remaining hop layers.
+    g1.router.registerGateway(tunnelID: lease.tunnelID) { inner, _ in
+        Task {
+            do {
+                let pre = try I2PTunnelDataProcessor.preprocess(inner.serialize(), via: aliceTunnel)
+                let envelope = I2NPMessage(type: .tunnelData, payload: pre.serialize())
+                try? await g1.router.deliveryTransport?.deliver(envelope.serialize(), to: g1.routerHash)
+            } catch {}
+        }
+    }
+
+    let bobSession = I2PGarlicSession(peerPublicKey: aliceKey.publicKey, tagsPerHandshake: 4)
+    let messageA = I2NPMessage(type: .dataMessage, payload: Data("garlic payload A".utf8))
+    let messageB = I2NPMessage(type: .dataMessage, payload: Data("garlic payload B".utf8))
+
+    // First message: new-session handshake through the full chain.
+    let transmissionA = try I2PGarlicEndToEndPipeline.sendMessage(messageA, to: lease, session: bobSession)
+    let (payloadA, firstHopA) = try I2PGarlicEndToEndPipeline.routeThroughTunnelPool(transmissionA, via: bobTunnel)
+    let dataA = I2NPMessage(type: .tunnelData, payload: payloadA.serialize())
+    await deliveryHub.deliver(from: bob.routerHash, dataA.serialize(), to: firstHopA)
+    guard bobSession.isEstablished else { throw I2PGarlicError.invalidPayload }
+    try await garlicWaitUntil { box.count >= 1 }
+
+    // Second message: tag-based encryption over the established session.
+    let transmissionB = try I2PGarlicEndToEndPipeline.sendMessage(messageB, to: lease, session: bobSession)
+    let (payloadB, firstHopB) = try I2PGarlicEndToEndPipeline.routeThroughTunnelPool(transmissionB, via: bobTunnel)
+    let dataB = I2NPMessage(type: .tunnelData, payload: payloadB.serialize())
+    await deliveryHub.deliver(from: bob.routerHash, dataB.serialize(), to: firstHopB)
+    try await garlicWaitUntil { box.count >= 2 }
+
+    guard box.contains(messageA), box.contains(messageB) else { throw I2PGarlicError.invalidPayload }
+    guard aliceManager.tagManager.count == 3 else { throw I2PGarlicError.invalidPayload }
+    return "garlic via outbound pool -> lease gateway -> inbound tunnel -> ECIES unwrap; new-session + tag sends"
 }

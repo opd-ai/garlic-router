@@ -191,8 +191,8 @@ private static func outboundBuildTest() async throws -> String {
     private static func inboundBuildTest() async throws -> String {
         let hub = I2PTunnelBuildHub()
         let originator = I2PTunnelTestNode(hub: hub)
-        let nearest = I2PTunnelTestNode(hub: hub)   // build message-path first hop
-        let gateway = I2PTunnelTestNode(hub: hub)   // inbound gateway, message-path last hop
+        let gateway = I2PTunnelTestNode(hub: hub)   // inbound gateway (data-path first hop)
+        let nearest = I2PTunnelTestNode(hub: hub)   // hop nearest the originator (data-path last hop)
         let builder = I2PTunnelBuilder(
             localRouterHash: originator.routerHash,
             participant: originator.participant,
@@ -200,11 +200,11 @@ private static func outboundBuildTest() async throws -> String {
         )
         let tunnel = try await builder.buildTunnel(
             direction: .inbound,
-            hops: [nearest.peer, gateway.peer],
+            hops: [gateway.peer, nearest.peer],
             lifetime: 900,
             timeout: 10
         )
-        // Tunnel data path is the reversed build message path: gateway first.
+        // Hops are listed and built in tunnel data-path order: gateway first.
         guard tunnel.direction == .inbound,
               tunnel.hops.map(\.routerHash) == [gateway.routerHash, nearest.routerHash] else {
             throw I2PWireError.invalidFormat
@@ -219,8 +219,14 @@ private static func outboundBuildTest() async throws -> String {
               tunnel.hops[1].nextTunnelID == tunnel.endpointTunnelID else {
             throw I2PWireError.invalidFormat
         }
-        guard gateway.participant.hopState(receiveTunnelID: tunnel.hops[0].receiveTunnelID)?.nextHopHash == originator.routerHash,
-              gateway.participant.hopState(receiveTunnelID: tunnel.hops[0].receiveTunnelID)?.nextTunnelID == tunnel.endpointTunnelID else {
+        // Hop states mirror the data path: the gateway forwards to the next
+        // hop; the last hop delivers the inner payload to the originator.
+        guard gateway.participant.hopState(receiveTunnelID: tunnel.hops[0].receiveTunnelID)?.nextHopHash == nearest.routerHash,
+              gateway.participant.hopState(receiveTunnelID: tunnel.hops[0].receiveTunnelID)?.nextTunnelID == tunnel.hops[1].receiveTunnelID else {
+            throw I2PWireError.invalidFormat
+        }
+        guard nearest.participant.hopState(receiveTunnelID: tunnel.hops[1].receiveTunnelID)?.nextHopHash == originator.routerHash,
+              nearest.participant.hopState(receiveTunnelID: tunnel.hops[1].receiveTunnelID)?.nextTunnelID == tunnel.endpointTunnelID else {
             throw I2PWireError.invalidFormat
         }
         guard gateway.participant.hopState(receiveTunnelID: tunnel.hops[0].receiveTunnelID)?.layerKey == tunnel.layerKeys[0] else {

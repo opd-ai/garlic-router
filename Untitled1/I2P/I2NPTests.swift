@@ -274,8 +274,8 @@ private static func inboundPipelineTest() async throws -> String {
     let buildHub = I2PTunnelBuildHub()
     let deliveryHub = I2NPLoopbackDeliveryHub()
     let originator = I2NPTestNode(buildHub: buildHub, deliveryHub: deliveryHub)
-    let nearest = I2NPTestNode(buildHub: buildHub, deliveryHub: deliveryHub)
     let gateway = I2NPTestNode(buildHub: buildHub, deliveryHub: deliveryHub)
+    let nearest = I2NPTestNode(buildHub: buildHub, deliveryHub: deliveryHub)
 
     let builder = I2PTunnelBuilder(
         localRouterHash: originator.routerHash,
@@ -283,7 +283,7 @@ private static func inboundPipelineTest() async throws -> String {
         transport: originator.buildTransport
     )
     let tunnel = try await builder.buildTunnel(
-        direction: .inbound, hops: [nearest.peer, gateway.peer], lifetime: 900, timeout: 10
+        direction: .inbound, hops: [gateway.peer, nearest.peer], lifetime: 900, timeout: 10
     )
 
     let box = I2NPTestGatewayBox()
