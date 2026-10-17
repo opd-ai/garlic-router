@@ -119,7 +119,23 @@ actor I2PNetworkDatabase {
         self.localRouterHash = localRouterHash
         self.transport = transport
         self.storage = storage
-        self.entries = Self.restoredEntries(from: storage)
+        // The persisted-netdb restore used to run synchronously inside this actor
+        // init — on the caller's thread, which is the MAIN thread during app launch.
+        // A netdb grown by mainnet audit runs (each restored entry re-parses and
+        // re-verifies its Ed25519 signature) then blocked the launch window long
+        // enough for the launch watchdog to kill the process (white flash, then dead).
+        // The restore now streams in asynchronously on the actor after launch.
+        entries = [:]
+        let storageForRestore = storage
+        Task { [weak self] in
+            let restored = Self.restoredEntries(from: storageForRestore)
+            await self?.adoptRestored(restored)
+        }
+    }
+
+    /// Adopts asynchronously restored entries onto the actor (isolated mutation).
+    private func adoptRestored(_ restored: [Data: StoredEntry]) {
+        entries = restored
     }
 
     // MARK: Kademlia XOR distance metric
