@@ -189,6 +189,7 @@ final class SSU2InitiatorHandshake {
     private let introKey: Data
     private let ephemeral = Curve25519.KeyAgreement.PrivateKey()
     private var aliceHeader: Data?
+    private var localConnectionID: Data?
 
     /// The responder's demultiplex connection ID, derived from its static key
     /// so inbound handshake packets land without prior state.
@@ -213,6 +214,7 @@ final class SSU2InitiatorHandshake {
     /// derived connection ID, asking for a Retry with a fresh token. The header
     /// is masked with the session-request phase key (token requests share it).
     func makeTokenRequest(localConnectionID: Data) throws -> Data {
+        self.localConnectionID = localConnectionID
         let header = SSU2PacketHeader(
             destinationConnectionID: SSU2InitiatorHandshake.responderConnectionID(for: remoteStaticKey),
             packetNumber: 0, type: .tokenRequest,
@@ -234,6 +236,7 @@ final class SSU2InitiatorHandshake {
     /// header MixHash binding, ephemeral key in the obfuscated region, encrypted
     /// static section (48 bytes), encrypted options payload.
     func makeSessionRequest(localConnectionID: Data, token: Data) throws -> Data {
+        self.localConnectionID = localConnectionID
         chain = NTCP2NoiseChain()
         let header = SSU2PacketHeader(
             destinationConnectionID: SSU2InitiatorHandshake.responderConnectionID(for: remoteStaticKey),
@@ -288,7 +291,8 @@ final class SSU2InitiatorHandshake {
         guard header.type == .retry, header.isLong, let token = header.token else {
             throw SSU2Error.invalidPacket
         }
-        guard header.destinationConnectionID == aliceHeader?.subdata(in: 16..<24) else {
+        guard let localConnectionID,
+              header.destinationConnectionID == localConnectionID else {
             throw SSU2Error.invalidPacket
         }
         return token
@@ -1085,7 +1089,10 @@ final class SSU2Session {
             if let header = try? SSU2PacketHeader.parse(created),
                header.type == .sessionCreated, header.isLong,
                header.destinationConnectionID == localConnectionID {
-                try engine.processSessionCreated(created)
+                // The handshake engine owns header unmasking. Pass the original
+                // datagram; `created` is only a temporary copy for phase/type
+                // detection and is already unmasked here.
+                try engine.processSessionCreated(Data(datagram))
                 try establishAsInitiator()
                 return
             }
@@ -1094,7 +1101,9 @@ final class SSU2Session {
             if let header = try? SSU2PacketHeader.parse(retry),
                header.type == .retry, header.isLong,
                header.destinationConnectionID == localConnectionID {
-                let token = try engine.processRetry(retry)
+                // `retry` was unmasked above only to identify the packet. The
+                // engine must receive the original wire bytes and unmask once.
+                let token = try engine.processRetry(Data(datagram))
                 if let remoteStaticKey {
                     tokenCache.store(token: token, for: remoteStaticKey)
                 }
@@ -1133,10 +1142,14 @@ final class SSU2Session {
             }
             switch header.type {
             case .tokenRequest:
-                guard let retry = try responder!.processTokenRequest(unmasked) else { return }
+                // `unmasked` is for dispatch only; processTokenRequest applies
+                // its own phase unmask to the original datagram.
+                guard let retry = try responder!.processTokenRequest(Data(datagram)) else { return }
                 try enqueue(retry)
             case .sessionRequest:
-                let created = try responder!.processSessionRequest(unmasked)
+                // Avoid feeding an already-unmasked header into the handshake
+                // engine, which performs its own unmask before Noise processing.
+                let created = try responder!.processSessionRequest(Data(datagram))
                 guard !created.isEmpty else { return } // rate-limited, silent drop
                 guard let requesterID = responder!.requesterConnectionID else {
                     // A no-PQ downgrade Retry: no handshake state advanced, so
@@ -2333,6 +2346,7 @@ enum I2PSSU2SelfTest {
         let transport = SSU2Transport(localStaticKey: bobKey, introKey: bobIntroKey,
                                       localRouterInfo: bobRI,
                                       publishedEndpoint: SSU2Endpoint(host: "127.0.0.1", port: 8888))
+        defer { transport.shutdown() }
         _ = try transport.startListener(port: 0)
         // The listener binds asynchronously; wait for the state handler to
         // publish the assigned ephemeral port (near-instant on the simulator,
@@ -2384,6 +2398,7 @@ enum I2PSSU2SelfTest {
                                       localRouterInfo: bobRI,
                                       publishedEndpoint: SSU2Endpoint(host: "127.0.0.1", port: 8888),
                                       mlKemSecretKey: bobPQ)
+        defer { transport.shutdown() }
         _ = try transport.startListener(port: 0)
         var port = transport.listenerPort ?? 0
         var waited = 0.0
