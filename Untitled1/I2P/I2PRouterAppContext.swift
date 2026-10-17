@@ -25,6 +25,7 @@ final class I2PRouterAppContext {
     private let tunnelBuildTransport: I2PTunnelBuildTransport
     private let tunnelParticipant: I2PTunnelParticipant
     private let tunnelPeerProvider: I2PTunnelPeerProvider
+    private let mainnetRouterInfo: I2PRouterInfo
     private var started = false
     private var ntcp2Bridge: NTCP2I2NPBridge?
 
@@ -49,6 +50,10 @@ final class I2PRouterAppContext {
     /// Live-network verification handles for the CI mainnet suite.
     var mainnetNetDB: I2PNetworkDatabase { netDB }
     var mainnetNTCP2: NTCP2Transport { ntcp2 }
+    var mainnetTunnelPool: I2PTunnelPool { tunnelPool }
+    var mainnetI2NPRouter: I2NPMessageRouter { i2npRouter }
+    var mainnetRouterHash: Data { routerHash }
+    var mainnetSignedRouterInfo: I2PRouterInfo { mainnetRouterInfo }
 
     private init() {
         // Router identity: an Ed25519 signing key plus an X25519 encryption
@@ -86,6 +91,7 @@ final class I2PRouterAppContext {
             encryptionPublicKey: encryptionKey.publicKey.rawRepresentation,
             signingSeed: signingSeed
         )
+        mainnetRouterInfo = routerInfo
         let transport = NTCP2Transport(localRouterInfo: routerInfo, staticKey: encryptionKey)
         ntcp2 = transport
         deliveryTransport = I2PNTCP2DeliveryTransport(ntcp2: transport)
