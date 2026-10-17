@@ -12,7 +12,13 @@ import Foundation
 import CryptoKit
 
 enum I2PProductionAudit {
-    static func runAll() async -> [I2PSelfTestResult] {
+    /// Runs each production probe serially and reports both its start and its
+    /// completed result. Serial execution keeps the pure-Swift crypto workload
+    /// from overlapping other probes and gives the UI a durable checkpoint if
+    /// iOS terminates the process mid-probe.
+    static func runAll(
+        onProgress: (String, I2PSelfTestResult?) async -> Void = { _, _ in }
+    ) async -> [I2PSelfTestResult] {
         let probes: [(String, () async throws -> String)] = [
             ("Transport · NTCP2 handshake end-to-end (m3p2len, version, key agreement)", ntcp2Handshake),
             ("Transport · SSU2 packet integrity, replay windows and token economics", ssu2Transport),
@@ -28,21 +34,30 @@ enum I2PProductionAudit {
 
         var results: [I2PSelfTestResult] = []
         for (name, probe) in probes {
+            await onProgress(name, nil)
+            let result: I2PSelfTestResult
             do {
-                results.append(I2PSelfTestResult(name: name, passed: true, detail: try await probe()))
+                result = I2PSelfTestResult(name: name, passed: true, detail: try await probe())
             } catch {
-                results.append(I2PSelfTestResult(name: name, passed: false, detail: String(describing: error)))
+                result = I2PSelfTestResult(name: name, passed: false, detail: String(describing: error))
             }
+            results.append(result)
+            await onProgress(name, result)
+            // Give other cooperative work a scheduling opportunity between
+            // probes; no two audit probes run concurrently.
+            await Task.yield()
         }
 
         let passing = results.filter(\.passed).count
-        results.append(I2PSelfTestResult(
+        let summary = I2PSelfTestResult(
             name: "Production audit · overall",
             passed: passing == results.count,
             detail: passing == results.count
                 ? "\(passing) checklist sections verified — production readiness closed"
                 : "\(passing) of \(results.count) sections verified — findings above"
-        ))
+        )
+        results.append(summary)
+        await onProgress(summary.name, summary)
         return results
     }
 

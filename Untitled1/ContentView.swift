@@ -19,6 +19,9 @@ struct ContentView: View {
     @State private var specExpanded = false
     @State private var productionExpanded = false
     @State private var readinessRunning = false
+    @State private var readinessCurrentProbe = ""
+    @State private var readinessCompletedChecks = 0
+    @State private var readinessLastInterruptedPhase: String?
     @State private var sizes: [(name: String, bytes: Int)] = []
 
     private let accent = Color(red: 0.47, green: 0.44, blue: 0.97)
@@ -67,6 +70,11 @@ struct ContentView: View {
             .background(background.ignoresSafeArea())
             .navigationTitle("I2P Core")
             .navigationBarTitleDisplayMode(.large)
+            .onAppear {
+                if readinessLastInterruptedPhase == nil {
+                    readinessLastInterruptedPhase = I2PReadinessAudit.interruptedPhase
+                }
+            }
         }
     }
 
@@ -93,17 +101,35 @@ struct ContentView: View {
         }
     }
 
-    /// Runs the bounded mobile-safe readiness checks. Expensive cryptographic,
-    /// Keychain-mutating and live-transport suites are intentionally excluded.
+    /// Runs the complete production probe set once, sequentially. Intermediate
+    /// outcomes are surfaced immediately; the audit stores its active probe in
+    /// case iOS terminates the process before completion.
     private func runReadinessAudit() {
         guard !readinessRunning else { return }
         readinessRunning = true
-        Task.detached {
-            let fresh = await I2PReadinessAudit.runAll()
+        readinessResults = []
+        readinessCurrentProbe = "Preparing production checks"
+        readinessCompletedChecks = 0
+        readinessLastInterruptedPhase = nil
+        Task.detached(priority: .utility) {
+            let fresh = await I2PReadinessAudit.runAll { phase, result in
+                await MainActor.run {
+                    readinessCurrentProbe = phase
+                    if let result {
+                        readinessResults.append(I2PSelfTestResult(
+                            name: "Readiness · \(result.name)",
+                            passed: result.passed,
+                            detail: result.detail))
+                        readinessCompletedChecks += 1
+                    }
+                }
+            }
             await MainActor.run {
                 readinessResults = fresh
                 readinessExpanded = true
+                readinessCurrentProbe = ""
                 readinessRunning = false
+                readinessLastInterruptedPhase = I2PReadinessAudit.interruptedPhase
             }
         }
     }
@@ -113,7 +139,7 @@ struct ContentView: View {
             Button {
                 runReadinessAudit()
             } label: {
-                Label(readinessRunning ? "Running safe checks…" : "Run readiness audit",
+                Label(readinessRunning ? "Running check \(readinessCompletedChecks + 1) of 11…" : "Run readiness audit",
                       systemImage: readinessRunning ? "hourglass" : "stethoscope")
                     .font(.subheadline.weight(.semibold))
                     .frame(maxWidth: .infinity)
@@ -124,11 +150,29 @@ struct ContentView: View {
             .tint(accent)
             .disabled(readinessRunning)
 
+            if readinessRunning {
+                VStack(alignment: .leading, spacing: 6) {
+                    ProgressView(value: Double(readinessCompletedChecks), total: 11)
+                        .tint(accent)
+                    Text("\(readinessCompletedChecks) of 11 checks complete · \(readinessCurrentProbe)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            if let readinessLastInterruptedPhase {
+                Text("The previous run stopped during: \(readinessLastInterruptedPhase). The active probe is saved so interruptions can be diagnosed.")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .textSelection(.enabled)
+            }
+
             if !readinessResults.isEmpty {
                 let passed = readinessResults.filter(\.passed).count
                 auditResultsSection(passed, of: readinessResults.count,
-                                    allPassedSummary: "Bounded checks passed · extended probes not run",
-                                    findingsSummary: "\(passed) of \(readinessResults.count) checks passed — findings below",
+                                    allPassedSummary: "\(passed) of \(readinessResults.count) readiness checks passed",
+                                    findingsSummary: "\(passed) of \(readinessResults.count) readiness checks passed — findings below",
                                     isExpanded: $readinessExpanded) {
                     ForEach(readinessResults.indices, id: \.self) { index in
                         HStack(alignment: .top, spacing: 8) {
