@@ -61,13 +61,31 @@ struct Fe {
     /// a - b via a per-limb borrow chain with the correct direction: d = a_i - b_i - borrow,
     /// r_i = d mod 2^51, and borrow = 1 when d < 0 (the borrow flows into the next limb
     /// as a subtraction). A final borrow means V = a - b + 2^255; since 2^255 ≡ 19 (mod p),
-    /// the residue is V - 19 — for canonical inputs V ≥ 2^255 - p = 19, because a ≥ 0
-    /// and b ≤ p give V = a + (2^255 - b) ≥ 19.
+    /// the residue is V - 19 for every input whose value exceeds -p (always true when
+    /// a ≥ 0 and b ≤ 2^255 - 1). The subtrahend's limbs are carry-normalized into
+    /// [0, 2^51) first, so d never dips below -2^51 and the conversions cannot trap
+    /// even for lazily reduced inputs (mul leaves limbs up to 2^51 + carry).
     static func sub(_ a: Fe, _ b: Fe) -> Fe {
+        var bLimbs = b.l
+        for i in 0..<4 {
+            let carry = bLimbs[i] >> 51
+            bLimbs[i] &= Self.mask51
+            bLimbs[i + 1] = bLimbs[i + 1] &+ carry
+        }
+        bLimbs[4] &= Self.mask51
+        let top = bLimbs[4] >> 51
+        if top > 0 {
+            bLimbs[4] &= Self.mask51
+            bLimbs[0] = bLimbs[0] &+ top &* 19
+            let c = bLimbs[0] >> 51
+            bLimbs[0] &= Self.mask51
+            bLimbs[1] = bLimbs[1] &+ c
+        }
+
         var r = [UInt64](repeating: 0, count: 5)
         var borrow: Int64 = 0
         for i in 0..<5 {
-            let d = Int64(a.l[i]) - Int64(b.l[i]) - borrow
+            let d = Int64(a.l[i]) - Int64(bLimbs[i]) - borrow
             if d < 0 {
                 r[i] = UInt64(d &+ (1 << 51))
                 borrow = 1
@@ -79,11 +97,29 @@ struct Fe {
         if borrow > 0 {
             if r[0] >= 19 {
                 r[0] -= 19
-            } else {
-                // Limb 0 underflows: borrow from limb 1 (the integer V > 19, so a
-                // higher limb carries the value).
+            } else if r[1] > 0 {
+                // Limb 0 underflows the -19 fold: borrow from limb 1.
                 r[0] = r[0] &+ (1 << 51) &- 19
                 r[1] -= 1
+            } else {
+                // Degenerate subtrahend within 19 of 2^255: fold by adding p
+                // first so the subtraction stays in range (never traps).
+                var carry: UInt64 = 0
+                for i in 0..<5 {
+                    let sum = r[i] &+ Self.pLimbs[i] &+ carry
+                    r[i] = sum & Self.mask51
+                    carry = sum >> 51
+                }
+                r[0] = r[0] &+ carry &* 19
+                let c = r[0] >> 51
+                r[0] &= Self.mask51
+                r[1] = r[1] &+ c
+                if r[0] >= 19 {
+                    r[0] -= 19
+                } else if r[1] > 0 {
+                    r[0] = r[0] &+ (1 << 51) &- 19
+                    r[1] -= 1
+                }
             }
         }
         return Fe(r)

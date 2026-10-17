@@ -77,16 +77,19 @@ struct ContentView: View {
 
     private func refresh() {
         sizes = I2PSelfTest.sampleByteSizes()
-        Task {
-            self.results = await I2PSelfTest.runAll()
-            self.resultsExpanded = true
+        Task.detached {
+            let fresh = await I2PSelfTest.runAll()
+            await MainActor.run {
+                results = fresh
+                resultsExpanded = true
+            }
         }
     }
 
     /// The live mainnet suite runs explicitly (it performs real network
     /// exchanges with reseed servers and floodfill routers), never on launch.
     private func runMainnetAudit() {
-        Task {
+        Task.detached {
             let fresh = await I2PMainnetVerification.runAll()
             await MainActor.run {
                 results = fresh
@@ -98,7 +101,7 @@ struct ContentView: View {
     /// The production readiness audit runs the existing compliance machinery
     /// plus dedicated readiness probes; it performs no mainnet traffic.
     private func runReadinessAudit() {
-        Task {
+        Task.detached {
             let fresh = await I2PReadinessAudit.runAll()
             await MainActor.run {
                 readinessResults = fresh
@@ -150,7 +153,7 @@ struct ContentView: View {
     /// crash-debugging framework is exercised by an executable probe. No
     /// mainnet traffic involved.
     private func runStabilityAudit() {
-        Task {
+        Task.detached {
             let fresh = await I2PStabilityAudit.runAll()
             await MainActor.run {
                 stabilityResults = fresh
@@ -162,7 +165,7 @@ struct ContentView: View {
     /// The defensive-hardening audit probes every dimension of the hardening
     /// checklist against the live mechanisms. No mainnet traffic involved.
     private func runHardeningAudit() {
-        Task {
+        Task.detached {
             let fresh = await I2PHardeningAudit.runAll()
             await MainActor.run {
                 hardeningResults = fresh
@@ -220,7 +223,7 @@ struct ContentView: View {
     /// RouterInfo verification) plus a blanket gate over the local conformance
     /// suite. Live-network interop probes ride the mainnet suite.
     private func runSpecAudit() {
-        Task {
+        Task.detached {
             let fresh = await I2PSpecConformanceAudit.runAll()
             await MainActor.run {
                 specResults = fresh
@@ -277,7 +280,7 @@ struct ContentView: View {
     /// boundaries, wire primitives, PQ hybrid leg, modern-crypto policy) runs as
     /// an executable probe against the live mechanisms.
     private func runProductionAudit() {
-        Task {
+        Task.detached {
             let fresh = await I2PProductionAudit.runAll()
             await MainActor.run {
                 productionResults = fresh
