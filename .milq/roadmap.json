@@ -306,22 +306,6 @@
     },
     {
       "createdAt" : "2026-10-17T21:06:57Z",
-      "description" : "New screen shown on first launch: a guided connection flow that walks through identity creation (RouterHash revealed), reachability advertisement (external address published to floodfills), reseed progress (RouterInfos ingested from live servers), and establishing sessions to real floodfills with a live count. Ends with a 'Connect to mainnet' action that starts the router and hands off to the Router dashboard. Skippable; the dashboard works regardless.",
-      "glyph" : "power button with signal waves",
-      "id" : "967170bc",
-      "mockups" : [
-        {
-          "brief" : "Router onboarding flow for the pure Swift I2P router app, shown on first launch. Purpose: guide the user from identity creation to a live mainnet connection. Style: dark background, violet accent, consistent with the I2P Core, Router and Alignment tabs; calm, confident, native iOS design language. Layout top to bottom: a compact step indicator (four dots labeled Identity, Reachability, Reseed, Floodfills) with the current step highlighted in violet; a hero area with a step title and one-sentence explanation; the step content region that changes per step — step 1 shows the freshly created RouterHash in a monospaced rounded card with a copy button and a 'Your router identity is permanent' caption; step 2 shows reachability advertisement status ('External address published to floodfills') with a checkmark list; step 3 shows a reseed progress bar with a count of RouterInfos ingested from live reseed servers; step 4 shows a live count of established floodfill sessions with signal-strength rows; a prominent primary button pinned at the bottom that reads 'Connect to mainnet' and a smaller 'Skip for now' text button beneath it. Sample data: RouterHash 'uQ8m…Xk2pJ7w', 47 RouterInfos ingested, 3 of 4 floodfill sessions established.",
-          "id" : "6e0f9d0c",
-          "title" : "Router onboarding"
-        }
-      ],
-      "status" : "pending",
-      "title" : "Add router onboarding",
-      "updatedAt" : "2026-10-17T21:06:57Z"
-    },
-    {
-      "createdAt" : "2026-10-17T21:06:57Z",
       "description" : "Extend the SSU2 transport to use the ML-KEM hybrid establishment module for the version 3\/4 long-header handshake variants: offer and accept hybrid sessions with ML-KEM-512\/768 encapsulation, mix the encapsulation output into the session KDF via the existing dual-leg binding, and negotiate down to the classical handshake only when the peer does not advertise PQ support. Add transport tests covering hybrid session establishment over the UDP loopback.",
       "glyph" : "shield with circuit key",
       "id" : "005b1ce6",
