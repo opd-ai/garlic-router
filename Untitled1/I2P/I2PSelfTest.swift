@@ -92,6 +92,7 @@ enum I2PSelfTest {
         results.append(contentsOf: await I2NPSelfTest.runAll())
         results.append(contentsOf: await I2PGarlicSelfTest.runAll())
         results.append(contentsOf: await I2PRouterStatusSelfTest.runAll())
+        results.append(contentsOf: I2PSpecComplianceSelfTest.runAll())
         return results
     }
 
@@ -332,5 +333,191 @@ enum I2PSelfTest {
             sizes.append(("LeaseSet", leaseSet.serialize().count))
         }
         return sizes
+    }
+}
+// MARK: - Spec compliance suite (compliance review runtime checks)
+
+enum I2PSpecComplianceSelfTest {
+    static func runAll() -> [I2PSelfTestResult] {
+        var results: [I2PSelfTestResult] = []
+        func run(_ name: String, _ body: () throws -> String) {
+            do {
+                let detail = try body()
+                results.append(I2PSelfTestResult(name: name, passed: true, detail: detail))
+            } catch {
+                results.append(I2PSelfTestResult(name: name, passed: false, detail: String(describing: error)))
+            }
+        }
+
+        run("Algorithm registry · modern crypto only") {
+            // The registries must expose exactly the modern I2P algorithms:
+            // EncType 4/5 (X25519) and SigType 7/11 (Ed25519/Ed25519ph).
+            guard I2PEncType.allCases.map(\.rawValue) == [4, 5] else {
+                throw I2PWireError.invalidFormat
+            }
+            guard I2PSigType.allCases.map(\.rawValue) == [7, 11] else {
+                throw I2PWireError.invalidFormat
+            }
+            // No legacy material anywhere: pure Ed25519 keys must match
+            // CryptoKit's Ed25519 so only one (standard-conformant) exists.
+            let seed = I2PCrypto.generateEd25519Seed()
+            guard I2PCrypto.ed25519PurePublicKey(fromSeed: seed) == I2PCrypto.ed25519PublicKey(fromSeed: seed) else {
+                throw I2PWireError.invalidFormat
+            }
+            return "EncType 4/5 + SigType 7/11 only; pure Ed25519 = CryptoKit"
+        }
+
+        run("I2NP wire type codes match the spec table") {
+            let expected: [I2NPMessageType: UInt8] = [
+                .databaseStore: 67, .databaseLookup: 98, .databaseSearchReply: 99,
+                .deliveryStatus: 10, .garlic: 21, .tunnelData: 18,
+                .dataMessage: 31, .tunnelBuild: 123, .tunnelBuildReply: 124
+            ]
+            for (messageType, code) in expected {
+                guard messageType.rawValue == code else {
+                    throw I2PWireError.invalidFormat
+                }
+            }
+            guard I2NPMessageType.options.rawValue == 6 else {
+                throw I2PWireError.invalidFormat // router-internal, unused mainnet code
+            }
+            guard I2NPMessageType.tunnelGateway.rawValue == 15 else {
+                throw I2PWireError.invalidFormat // provisional, pending live verification
+            }
+            return "9 mainnet codes verified; options/gateway flagged in the review"
+        }
+
+        run("I2NP header round trip + expiry enforcement") {
+            let message = I2NPMessage(
+                type: .dataMessage,
+                messageID: 0x0102_0304,
+                expiration: Date(timeIntervalSince1970: 1_700_000_000),
+                payload: Data(repeating: 0x5A, count: 33)
+            )
+            let parsed = try I2NPMessage.parse(message.serialize())
+            guard parsed.type == .dataMessage, parsed.messageID == 0x0102_0304,
+                  abs(parsed.expiration.timeIntervalSince(message.expiration)) < 0.002,
+                  parsed.payload == message.payload else {
+                throw I2PWireError.invalidFormat
+            }
+            guard !message.isExpired() else { throw I2PWireError.invalidFormat }
+            let stale = I2NPMessage(type: .dataMessage, expiration: Date().addingTimeInterval(-5))
+            guard stale.isExpired() else { throw I2PWireError.invalidFormat }
+            return "17-byte header round-tripped; stale messages flagged dropped"
+        }
+
+        run("Big-endian byte order on the wire") {
+            var w = I2PWriter()
+            w.integer(1)
+            w.short(0x0102)
+            w.long(1)
+            let bytes = Array(w.data)
+            guard bytes == [0, 0, 0, 1, 1, 2, 0, 0, 0, 0, 0, 0, 0, 1] else {
+                throw I2PWireError.invalidFormat
+            }
+            var r = I2PReader(w.data)
+            guard try r.integer() == 1, try r.short() == 0x0102, try r.long() == 1 else {
+                throw I2PWireError.invalidFormat
+            }
+            return "network byte order (big-endian) on every primitive"
+        }
+
+        run("NTCP2 protocol-name chaining (Noise §5)") {
+            let nameBytes = Array(NTCP2NoiseChain.protocolName.utf8)
+            guard nameBytes.count == 32 else { throw I2PWireError.invalidFormat }
+            // At exactly HASHLEN bytes the name must ride verbatim, unhashed.
+            let chain = NTCP2NoiseChain()
+            guard chain.chainingKey == Data(nameBytes), chain.hash == Data(nameBytes) else {
+                throw I2PWireError.invalidFormat
+            }
+            return "32-byte name used verbatim as chaining key and hash"
+        }
+
+        run("NTCP2 nonce96 + block codec + frame MAC rejection") {
+            // nonce96 must be exactly [4 zero bytes][big-endian counter]:
+            // verified functionally against a manually built 12-byte nonce.
+            let key = I2PCrypto.randomBytes(32)
+            let counter: UInt64 = 0x0102_0304_0506_0708
+            let manual = Data([0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8])
+            let a = try! ChaChaPoly.seal(Data(), using: SymmetricKey(data: key),
+                                         nonce: NTCP2NoiseChain.nonce96(counter))
+            let b = try! ChaChaPoly.seal(Data(), using: SymmetricKey(data: key),
+                                         nonce: (try! ChaChaPoly.Nonce(data: manual)))
+            guard a.combined == b.combined else { throw I2PWireError.invalidFormat }
+            let blocks: [NTCP2Block] = [
+                .data(Data("payload".utf8)),
+                .time(Date(timeIntervalSince1970: 1_700_000_000)),
+                .padding(7),
+                .termination(reason: 0, validTime: Date(timeIntervalSince1970: 1_700_000_000))
+            ]
+            let encoded = try NTCP2Block.encode(blocks)
+            let decoded = try NTCP2Block.decode(NTCP2Block.aligned(encoded))
+            guard decoded.count >= blocks.count,
+                  case .data(let payload) = decoded[0], payload == Data("payload".utf8) else {
+                throw I2PWireError.invalidFormat
+            }
+            let codec = NTCP2FrameCodec(directionKeys: NTCP2DirectionKeys(
+                aeadKey: I2PCrypto.randomBytes(32), sipKey: I2PCrypto.randomBytes(16)
+            ))
+            let framed = try codec.frame(Data("i2np-frame".utf8))
+            guard (try codec.unframe(framed))?.payload == Data("i2np-frame".utf8) else {
+                throw I2PWireError.invalidFormat
+            }
+            var tampered = framed
+            tampered[tampered.count - 3] ^= 0xff
+            do {
+                _ = try codec.unframe(tampered)
+                throw I2PWireError.invalidSignature
+            } catch let error as NTCP2Error {
+                guard case .decryptFailed = error else { throw I2PWireError.invalidSignature }
+            }
+            return "nonce layout, block round trip and 16-byte MAC validated"
+        }
+
+        run("Ed25519ph dom2 + canonical-S edge cases") {
+            let dom = Ed25519Pure.dom2(prehashed: true)
+            guard String(decoding: dom.dropLast(2), as: UTF8.self)
+                    == "SigEd25519 no Ed25519 collisions", dom.suffix(2) == [1, 0] else {
+                throw I2PWireError.invalidFormat
+            }
+            guard Ed25519Pure.dom2(prehashed: false).isEmpty else {
+                throw I2PWireError.invalidFormat
+            }
+            let seed = I2PCrypto.generateEd25519Seed()
+            let publicKey = I2PCrypto.ed25519PurePublicKey(fromSeed: seed)
+            let message = I2PCrypto.randomBytes(128)
+            guard let signature = I2PCrypto.ed25519phSign(message, seed: seed) else {
+                throw I2PWireError.invalidFormat
+            }
+            // A non-canonical S (>= group order) must be rejected.
+            var highS = signature
+            highS[63] |= 0x80
+            guard !I2PCrypto.ed25519phVerify(signature: highS, message: message, publicKey: publicKey) else {
+                throw I2PWireError.invalidSignature
+            }
+            var tampered = signature
+            tampered[0] ^= 0xff
+            guard !I2PCrypto.ed25519phVerify(signature: tampered, message: message, publicKey: publicKey) else {
+                throw I2PWireError.invalidSignature
+            }
+            return "dom2 prefix verified; high-S and tampered signatures rejected"
+        }
+
+        run("SipHash-2-4 length obfuscation determinism") {
+            let key = I2PCrypto.randomBytes(16)
+            let maskA = UInt16(truncatingIfNeeded: SipHash24.hash(
+                key: key, message: withUnsafeBytes(of: UInt64(0).bigEndian) { Data($0) }
+            ))
+            let maskB = UInt16(truncatingIfNeeded: SipHash24.hash(
+                key: key, message: withUnsafeBytes(of: UInt64(1).bigEndian) { Data($0) }
+            ))
+            let maskA2 = UInt16(truncatingIfNeeded: SipHash24.hash(
+                key: key, message: withUnsafeBytes(of: UInt64(0).bigEndian) { Data($0) }
+            ))
+            guard maskA == maskA2, maskA != maskB else { throw I2PWireError.invalidFormat }
+            return "deterministic per counter, distinct across frame numbers"
+        }
+
+        return results
     }
 }

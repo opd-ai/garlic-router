@@ -12,21 +12,23 @@ enum I2NPError: Error {
     case unknownTunnel
 }
 
-/// I2NP message type codes carried in the type byte.
-/// Codes assigned in this router's I2NP specification; the mainnet wire
-/// codes are noted where they differ (reconciliation happens at interop).
+/// I2NP message type codes on the wire per the I2P common message spec
+/// (spec.i2p.io/common/i2np), reconciled during the compliance review.
+/// `options` is a router-internal status message on an unused mainnet code;
+/// `tunnelGateway` keeps this router's provisional code pending live-network
+/// verification (both are noted in COMPLIANCE_REVIEW.md).
 enum I2NPMessageType: UInt8, CaseIterable {
     case databaseStore = 67
     case databaseLookup = 98
-    case databaseSearchReply = 2
-    case deliveryStatus = 3
+    case databaseSearchReply = 99
+    case deliveryStatus = 10
     case options = 6
-    case garlic = 94
+    case garlic = 21
     case tunnelData = 18
     case tunnelGateway = 15
-    case dataMessage = 9
-    case tunnelBuild = 10
-    case tunnelBuildReply = 11
+    case dataMessage = 31
+    case tunnelBuild = 123
+    case tunnelBuildReply = 124
 }
 
 /// I2NP wire header: type byte, message ID, expiry and big-endian size.

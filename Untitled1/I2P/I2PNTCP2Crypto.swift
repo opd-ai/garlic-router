@@ -32,9 +32,21 @@ struct NTCP2NoiseChain {
     private(set) var nonce: UInt64 = 0
 
     init() {
-        let nameHash = Data(SHA256.hash(data: Data(Self.protocolName.utf8)))
-        chainingKey = nameHash
-        hash = nameHash
+        // Noise §5: protocol names of at most HASHLEN bytes are used verbatim
+        // (zero-padded to HASHLEN) as both chaining key and hash; longer names
+        // are SHA-256 hashed first. The NTCP2 protocol name is exactly 32
+        // bytes, so it rides unhashed — matching every mainnet NTCP2 peer.
+        let nameBytes = Data(Self.protocolName.utf8)
+        if nameBytes.count <= 32 {
+            var padded = nameBytes
+            padded.append(contentsOf: [UInt8](repeating: 0, count: 32 - nameBytes.count))
+            chainingKey = padded
+            hash = padded
+        } else {
+            let nameHash = Data(SHA256.hash(data: nameBytes))
+            chainingKey = nameHash
+            hash = nameHash
+        }
     }
 
     mutating func mixHash(_ data: Data) {
