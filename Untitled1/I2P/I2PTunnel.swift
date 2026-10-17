@@ -142,6 +142,10 @@ struct I2PTunnelHopState {
     let receiveTunnelID: UInt32
     let nextHopHash: Data
     let nextTunnelID: UInt32
+    /// True for the last hop in the build message path: after decrypting its
+    /// layer it delivers the inner TunnelGateway payload to nextHopHash
+    /// (the tunnel's gateway router for outbound, the originator for inbound).
+    let isMessagePathEnd: Bool
     let layerKey: Data
     let ivKey: Data
     let registeredAt: Date
@@ -226,6 +230,7 @@ final class I2PTunnelParticipant {
             receiveTunnelID: record.receiveTunnelID,
             nextHopHash: record.nextHopHash,
             nextTunnelID: record.nextTunnelID,
+            isMessagePathEnd: record.isMessagePathEnd,
             layerKey: record.layerKey,
             ivKey: record.ivKey,
             registeredAt: Date()
@@ -310,6 +315,13 @@ final class I2PTunnelParticipant {
         return pruneHopStatesLocked(now: now)
     }
 
+    /// Test hook: registers a hop state directly (bypasses the build flow).
+    func testInjectHopState(_ state: I2PTunnelHopState) {
+        lock.lock()
+        hopStates[state.receiveTunnelID] = state
+        lock.unlock()
+    }
+
     @discardableResult
     private func pruneHopStatesLocked(now: Date = Date()) -> Int {
         let before = hopStates.count
@@ -320,7 +332,10 @@ final class I2PTunnelParticipant {
 
     private func acceptanceCode(for record: I2PTunnelBuildRequestRecord) -> UInt8 {
         if let forced = forcedRejectCode { return forced }
-        if record.nextHopHash == localRouterHash && !record.nextHopIsOriginator {
+        // A self-addressed next hop is only a loop when this hop must forward
+        // onward; message-path end records may target ourselves (single-hop
+        // tunnels deliver their gateway payload locally).
+        if !record.isMessagePathEnd && record.nextHopHash == localRouterHash && !record.nextHopIsOriginator {
             return I2PTunnelBuildReturnCode.loop.rawValue
         }
         lock.lock()
@@ -338,6 +353,44 @@ final class I2PTunnelParticipant {
                 messageID: messageID) else { return }
         let reply = I2PTunnelBuildReply(messageID: messageID, encryptedRecords: [encrypted])
         transport.sendBuildReply(reply.serialize(), to: target)
+    }
+}
+
+/// What a tunnel hop does with a TunnelData payload after decrypting its layer.
+enum I2PTunnelHopAction {
+    /// Reveal the next hop's (already-encrypted) TunnelData payload and
+    /// forward it over the transport to the next hop's router.
+    case forward(nextHopHash: Data, tunnelData: I2PTunnelDataPayload)
+    /// Message-path end: hand the inner TunnelGateway payload to the tunnel's
+    /// gateway router (outbound) or the originator (inbound).
+    case deliverGateway(toRouterHash: Data, gatewayPayload: Data)
+}
+
+extension I2PTunnelParticipant {
+    /// The I2NP tunnel message pipeline: decrypt one layer of a TunnelData
+    /// payload with this hop's layer key and IV, then either forward the
+    /// revealed next-hop payload or deliver the inner TunnelGateway message.
+    func processTunnelData(_ payload: I2PTunnelDataPayload) throws -> I2PTunnelHopAction {
+        let state: I2PTunnelHopState? = {
+            lock.lock()
+            defer { lock.unlock() }
+            return hopStates[payload.tunnelID]
+        }()
+        guard let state, !state.isExpired() else { throw I2NPError.unknownTunnel }
+        let content = try I2PTunnelLayerCipher.unwrap(
+            ciphertext: payload.ciphertext,
+            layerKey: state.layerKey,
+            iv: payload.iv,
+            tunnelID: payload.tunnelID
+        )
+        if state.isMessagePathEnd {
+            // Innermost content is a TunnelGateway payload: [gatewayID][I2NP].
+            guard content.count >= 4 else { throw I2NPError.invalidPayload }
+            return .deliverGateway(toRouterHash: state.nextHopHash, gatewayPayload: content)
+        }
+        let inner = try I2PTunnelDataPayload.parse(content)
+        guard inner.tunnelID == state.nextTunnelID else { throw I2NPError.invalidPayload }
+        return .forward(nextHopHash: state.nextHopHash, tunnelData: inner)
     }
 }
 /// Builds tunnels from the originator's side: generates per-hop material,
@@ -407,6 +460,10 @@ final class I2PTunnelBuilder {
             var nextIsOriginator = false
             if isLast {
                 if direction == .outbound {
+                    // The endpoint learns the tunnel's gateway so it can
+                    // deliver the inner TunnelGateway payload there.
+                    nextHopHash = hops[0].routerHash
+                    nextTunnelID = receiveIDs[0]
                     isEnd = true
                 } else {
                     nextHopHash = localRouterHash

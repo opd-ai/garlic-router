@@ -89,6 +89,7 @@ enum I2PSelfTest {
         results.append(contentsOf: await I2PNetDBSelfTest.runAll())
         results.append(contentsOf: await I2PNTCP2SelfTest.runAll())
         results.append(contentsOf: await I2PTunnelSelfTest.runAll())
+        results.append(contentsOf: await I2NPSelfTest.runAll())
         return results
     }
 
