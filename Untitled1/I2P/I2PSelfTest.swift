@@ -91,6 +91,7 @@ enum I2PSelfTest {
         results.append(contentsOf: await I2PTunnelSelfTest.runAll())
         results.append(contentsOf: await I2NPSelfTest.runAll())
         results.append(contentsOf: await I2PGarlicSelfTest.runAll())
+        results.append(contentsOf: await I2PSSU2SelfTest.runAll())
         results.append(contentsOf: await I2PRouterStatusSelfTest.runAll())
         results.append(contentsOf: I2PSpecComplianceSelfTest.runAll())
         results.append(contentsOf: await I2PCrossValidation.selfTestEntries())

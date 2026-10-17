@@ -255,6 +255,45 @@ enum I2PCrossValidation {
             try garlicHKDFChecks()
         }
 
+        // MARK: SSU2 — headers, header protection, handshake, tokens, data phase
+
+        run("T4-SS-HEADER-RT", rowID: "SS-HEADER", "SSU2 packet headers: long/short round trips with version/networkID/connection-ID validation") {
+            try ssu2HeaderRoundTrip()
+        }
+        run("T4-SS-HPROTECT-PHASES", rowID: "SS-HPROTECT", "Header protection: 7 phases, tail-IV ChaCha20 masking, receiver-side phase detection") {
+            try ssu2HeaderProtectionPhases()
+        }
+        run("T4-SS-NOISE-LOOPBACK", rowID: "SS-NOISE", "Noise XK handshake: token-request loopback completes with mirrored split keys") {
+            try ssu2HandshakeLoopback()
+        }
+        run("T4-SS-STATE-HANDSHAKE", rowID: "SS-STATE", "Session state machine: both sides established with mirrored conn IDs and the RouterInfo exchanged") {
+            try ssu2StateMachine()
+        }
+        run("T4-SS-TOKEN-MGMT", rowID: "SS-TOKEN", "Tokens: issue, validate, expiry and per-requester rate limiting") {
+            try ssu2TokenManagement()
+        }
+        run("T4-SS-DATA-REPLAY", rowID: "SS-DATA", "Data phase: AEAD round trip, replay window, size bounds, tamper rejection") {
+            try ssu2DataPhase()
+        }
+        run("T4-SS-FRAG-SC", rowID: "SS-FRAG", "SessionConfirmed fragmentation: 3-fragment reassembly; bounds and stale reassembly rejected") {
+            try ssu2ConfirmedFragmentation()
+        }
+        run("T4-SS-PEERTEST-RT", rowID: "SS-PEERTEST", "Peer test: nonce correlation, observed-address extraction, reachability classification, result cache") {
+            try ssu2PeerTest()
+        }
+        run("T4-SS-RELAY-HOLEPUNCH", rowID: "SS-RELAY", "Relay: request/response round trip and the type-11 hole punch datagram") {
+            try ssu2RelayHolePunch()
+        }
+        run("T4-SS-MIGRATE-RT", rowID: "SS-MIGRATE", "Connection migration: new-address challenge, validated response, immutable conn IDs") {
+            try ssu2Migration()
+        }
+        run("T4-SS-TERM-IDLE", rowID: "SS-TERM", "Termination: terminal block delivery, bounded retransmission, idle teardown") {
+            try ssu2Termination()
+        }
+        await runAsync("T4-SS-UDP-LOOPBACK", rowID: "SS-STATE", "UDP transport: real loopback handshake and I2NP delivery over datagram sockets") {
+            try await I2PSSU2SelfTest.udpLoopbackTest()
+        }
+
         commit(results)
         return results
     }
@@ -1986,5 +2025,257 @@ enum I2PCrossValidation {
         _ = try alice.unwrapPayload(resumed)
         guard alice.tagManager.count == 3 else { throw I2PWireError.invalidFormat }
         return "tag chain advances per tag over 4 single-use sends; exhausted sets re-handshake with a fresh seed and the ratchet resumes"
+    }
+
+    // MARK: SSU2
+
+    private static func ssu2HeaderRoundTrip() throws -> String {
+        let dst = SSU2PacketHeader.randomConnectionID()
+        let src = SSU2PacketHeader.randomConnectionID(distinctFrom: dst)
+        let header = SSU2PacketHeader(destinationConnectionID: dst, packetNumber: 42,
+                                      type: .sessionRequest, sourceConnectionID: src,
+                                      token: Data(repeating: 0x5A, count: 8))
+        let bytes = header.serialize()
+        guard bytes.count == 32 else { throw SSU2Error.invalidHeader }
+        let parsed = try SSU2PacketHeader.parse(bytes)
+        guard parsed.serialize() == bytes,
+              parsed.destinationConnectionID == dst, parsed.packetNumber == 42,
+              parsed.sourceConnectionID == src, parsed.token == Data(repeating: 0x5A, count: 8) else {
+            throw SSU2Error.invalidHeader
+        }
+        // Version and network ID validation.
+        var bad = bytes
+        bad[13] = 3
+        guard expectThrow({ _ = try SSU2PacketHeader.parse(Data(bad)) }) else {
+            throw I2PCrossValidationError.unexpectedSuccess
+        }
+        var badNet = bytes
+        badNet[14] = 9
+        guard expectThrow({ _ = try SSU2PacketHeader.parse(Data(badNet)) }) else {
+            throw I2PCrossValidationError.unexpectedSuccess
+        }
+        // Short header fragment info round trip.
+        let short = SSU2PacketHeader(shortDestinationConnectionID: dst, packetNumber: 7,
+                                     type: .sessionConfirmed, fragmentIndex: 2, totalFragments: 5)
+        let parsedShort = try SSU2PacketHeader.parse(short.serialize())
+        guard parsedShort.fragmentIndex == 2, parsedShort.totalFragments == 5 else {
+            throw SSU2Error.invalidHeader
+        }
+        // Connection ID pair rule: identical src/dst rejected.
+        guard expectThrow({ try SSU2PacketHeader.validatePair(dst, dst) }) else {
+            throw I2PCrossValidationError.unexpectedSuccess
+        }
+        return "32-byte long + 16-byte short headers round-tripped; version/netID/connID rules enforced"
+    }
+
+    private static func ssu2HeaderProtectionPhases() throws -> String {
+        let introKey = I2PCrypto.randomBytes(32)
+        let packet = SSU2PacketHeader(destinationConnectionID: SSU2PacketHeader.randomConnectionID(),
+                                      packetNumber: 9, type: .sessionRequest,
+                                      sourceConnectionID: SSU2PacketHeader.randomConnectionID()).serialize()
+            + I2PCrypto.randomBytes(60)
+        for phase in SSU2HeaderPhase.allCases {
+            var masked = Data(packet)
+            try SSU2HeaderProtection.maskHeader(&masked, phase: phase, introKey: introKey)
+            guard masked != packet else { throw SSU2Error.testFailed("\(phase) did not mask") }
+            try SSU2HeaderProtection.unmaskHeader(&masked, phase: phase, introKey: introKey)
+            guard masked == packet else { throw SSU2Error.testFailed("\(phase) unmask not an involution") }
+        }
+        // Receiver-side phase detection.
+        let expectedDst = SSU2InitiatorHandshake.responderConnectionID(for: introKey)
+        var request = SSU2PacketHeader(destinationConnectionID: expectedDst,
+                                       packetNumber: 0, type: .sessionRequest,
+                                       sourceConnectionID: SSU2PacketHeader.randomConnectionID()).serialize()
+            + I2PCrypto.randomBytes(60)
+        try SSU2HeaderProtection.maskHeader(&request, phase: .sessionRequest, introKey: introKey)
+        guard SSU2HeaderProtection.detectPhase(request, introKey: introKey,
+                                               expectedDestinationConnectionID: expectedDst) == .sessionRequest else {
+            throw SSU2Error.testFailed("phase detection missed sessionRequest")
+        }
+        return "all 7 phases mask/unmask with tail-derived IVs; phase detection resolves the intro-key phases"
+    }
+
+    private static func ssu2HandshakeLoopback() throws -> String {
+        let (aliceKeys, bobKeys) = try I2PSSU2SelfTest.handshakeKeySets()
+        guard aliceKeys.send.aeadKey == bobKeys.recv.aeadKey,
+              aliceKeys.recv.aeadKey == bobKeys.send.aeadKey else {
+            throw SSU2Error.testFailed("split keys not mirrored")
+        }
+        return "token-request path completes with mirrored split keys"
+    }
+
+    private static func ssu2StateMachine() throws -> String {
+        let (alice, bob) = try I2PSSU2SelfTest.loopbackPair(
+            aliceKey: Curve25519.KeyAgreement.PrivateKey(),
+            bobKey: Curve25519.KeyAgreement.PrivateKey())
+        guard alice.state == .established, bob.state == .established else {
+            throw SSU2Error.testFailed("state")
+        }
+        guard alice.remoteConnectionID == bob.localConnectionID,
+              bob.remoteConnectionID == alice.localConnectionID else {
+            throw SSU2Error.testFailed("conn IDs")
+        }
+        guard alice.remoteRouterInfo != nil else {
+            throw SSU2Error.testFailed("RouterInfo exchange missing")
+        }
+        return "both sides established with mirrored conn IDs and the RouterInfo exchanged in the SessionConfirmed"
+    }
+
+    private static func ssu2TokenManagement() throws -> String {
+        let manager = SSU2TokenManager(tokenLifetime: 600, maxRequestsPerWindow: 3, requestWindow: 60)
+        let requester = Data(repeating: 7, count: 8)
+        guard let token = manager.issue(for: requester), token.count == 8,
+              manager.validate(token, for: requester) else { throw SSU2Error.invalidToken }
+        guard !manager.validate(token, for: requester, now: Date().addingTimeInterval(700)) else {
+            throw SSU2Error.testFailed("expired token accepted")
+        }
+        _ = manager.issue(for: requester)
+        _ = manager.issue(for: requester)
+        guard manager.issue(for: requester) == nil else { throw SSU2Error.testFailed("rate limit not enforced") }
+        guard manager.issue(for: Data(repeating: 8, count: 8)) != nil else {
+            throw SSU2Error.testFailed("rate limit leaked across requesters")
+        }
+        return "8-byte tokens bound to the requester, expiring and rate-limited per window"
+    }
+
+    private static func ssu2DataPhase() throws -> String {
+        let cipher = SSU2DataCipher(key: I2PCrypto.randomBytes(32))
+        let header = SSU2PacketHeader(shortDestinationConnectionID: SSU2PacketHeader.randomConnectionID(),
+                                      packetNumber: 5, type: .data)
+        let packet = try cipher.seal(Data("i2np payload".utf8), header: header.serialize(), packetNumber: 5)
+        guard try cipher.open(packet) == Data("i2np payload".utf8) else { throw SSU2Error.invalidPacket }
+        let window = SSU2ReplayWindow()
+        guard window.checkAndInsert(10), window.checkAndInsert(9),
+              !window.checkAndInsert(9), !window.checkAndInsert(10),
+              window.checkAndInsert(80) else { throw SSU2Error.replayedPacket }
+        guard expectThrow({ _ = try cipher.seal(Data("tiny"), header: header.serialize(), packetNumber: 6) }) else {
+            throw I2PCrossValidationError.unexpectedSuccess
+        }
+        guard expectThrow({
+            _ = try cipher.seal(Data(repeating: 0, count: 1441), header: header.serialize(), packetNumber: 7)
+        }) else {
+            throw I2PCrossValidationError.unexpectedSuccess
+        }
+        var tampered = packet
+        tampered[tampered.count - 20] ^= 0xff
+        guard expectThrow({ _ = try cipher.open(tampered) }) else {
+            throw I2PCrossValidationError.unexpectedSuccess
+        }
+        return "data phase sealed/opened; replay window, size bounds and MAC tamper rejection verified"
+    }
+
+    private static func ssu2ConfirmedFragmentation() throws -> String {
+        let payload = I2PCrypto.randomBytes(2600)
+        let chunks = try SSU2ConfirmedFragmenter.split(payload, maximumFragmentPayload: 1000)
+        guard chunks.count == 3 else { throw SSU2Error.invalidPacket }
+        let reassembler = SSU2ConfirmedReassembler()
+        var complete: Data?
+        for (index, chunk) in chunks.enumerated() {
+            complete = try reassembler.add(fragmentIndex: index, totalFragments: chunks.count,
+                                           payload: chunk, timeout: 30)
+        }
+        guard complete == payload else { throw SSU2Error.testFailed("reassembly mismatch") }
+        guard expectThrow({
+            _ = try SSU2ConfirmedFragmenter.split(I2PCrypto.randomBytes(15 * 1000 + 1),
+                                                  maximumFragmentPayload: 1000)
+        }) else {
+            throw I2PCrossValidationError.unexpectedSuccess
+        }
+        return "3-fragment SessionConfirmed reassembled byte-exact; 16-fragment splits rejected"
+    }
+
+    private static func ssu2PeerTest() throws -> String {
+        let published = SSU2Endpoint(host: "203.0.113.9", port: 8887)
+        guard SSU2PeerTestCoordinator.classify(observed: published, published: published) == .direct,
+              SSU2PeerTestCoordinator.classify(observed: SSU2Endpoint(host: "203.0.113.9", port: 54321),
+                                               published: published) == .portMapped,
+              SSU2PeerTestCoordinator.classify(observed: SSU2Endpoint(host: "198.51.100.2", port: 54321),
+                                               published: published) == .symmetricNAT,
+              SSU2PeerTestCoordinator.classify(observed: nil, published: published) == .unreachable else {
+            throw SSU2Error.testFailed("classification matrix broken")
+        }
+        let (alice, alicePeer) = try I2PSSU2SelfTest.loopbackPair(
+            aliceKey: Curve25519.KeyAgreement.PrivateKey(),
+            bobKey: Curve25519.KeyAgreement.PrivateKey(),
+            alicePublished: published)
+        let nonce: UInt32 = 0xABCD_EF01
+        try alice.startPeerTest(nonce: nonce)
+        I2PSSU2SelfTest.pumpBoth(alice, alicePeer)
+        guard let result = alice.peerTest.result(for: nonce),
+              result.classification == .portMapped else {
+            throw SSU2Error.testFailed("peer test result missing or misclassified")
+        }
+        guard alice.peerTest.result(for: nonce, now: Date().addingTimeInterval(7200)) == nil else {
+            throw SSU2Error.testFailed("expired result still cached")
+        }
+        return "nonce-correlated request/response, reachability classified, cache expires"
+    }
+
+    private static func ssu2RelayHolePunch() throws -> String {
+        let relayEntry = SSU2RelayEntry(introductionKey: I2PCrypto.randomBytes(32),
+                                        host: "198.51.100.7", port: 9090,
+                                        sessionID: 0x00C0_FFEE,
+                                        supportsPeerTest: true, supportsHolePunch: true)
+        let coordinator = SSU2RelayCoordinator()
+        let targetHash = I2PCrypto.sha256(Data("bob-identity".utf8))
+        let request = coordinator.buildRelayRequest(nonce: 7, targetHash: targetHash, targetPort: 8888)
+        let parsedRequest = try SSU2RelayMessage.parseRequest(request)
+        guard parsedRequest.nonce == 7, parsedRequest.targetHash == targetHash,
+              parsedRequest.targetPort == 8888 else { throw SSU2Error.invalidPacket }
+        guard try coordinator.handleRelayResponse(SSU2RelayMessage.response(nonce: 7, status: 0)) else {
+            throw SSU2Error.testFailed("relay rejected")
+        }
+        let punch = try coordinator.buildHolePunch(nonce: 0x5150, packetNumber: 1,
+                                                   destinationConnectionID: SSU2PacketHeader.randomConnectionID(),
+                                                   sourceConnectionID: SSU2PacketHeader.randomConnectionID(),
+                                                   introKey: relayEntry.introductionKey)
+        guard punch[12] == SSU2MessageType.holePunch.rawValue else { throw SSU2Error.invalidPacket }
+        let receiving = SSU2RelayCoordinator()
+        guard try receiving.handleHolePunch(punch, introKey: relayEntry.introductionKey) == 0x5150,
+              receiving.phase == .completed else {
+            throw SSU2Error.testFailed("hole punch decode failed")
+        }
+        return "relay request/response round-tripped; type-11 hole punch masked, delivered and decoded"
+    }
+
+    private static func ssu2Migration() throws -> String {
+        let (alice, bob) = try I2PSSU2SelfTest.loopbackPair(
+            aliceKey: Curve25519.KeyAgreement.PrivateKey(),
+            bobKey: Curve25519.KeyAgreement.PrivateKey())
+        let localIDs = (alice.localConnectionID, bob.localConnectionID)
+        let remoteIDs = (alice.remoteConnectionID, bob.remoteConnectionID)
+        bob.handleDatagram(Data(), from: SSU2Endpoint(host: "10.6.0.9", port: 41234))
+        I2PSSU2SelfTest.pumpBoth(alice, bob)
+        guard bob.remoteEndpoint == SSU2Endpoint(host: "10.6.0.9", port: 41234) else {
+            throw SSU2Error.testFailed("path not migrated")
+        }
+        guard alice.localConnectionID == localIDs.0, bob.localConnectionID == localIDs.1,
+              alice.remoteConnectionID == remoteIDs.0, bob.remoteConnectionID == remoteIDs.1 else {
+            throw SSU2Error.testFailed("conn IDs changed during migration")
+        }
+        return "new address challenged, validated by the echoed response, conn IDs untouched"
+    }
+
+    private static func ssu2Termination() throws -> String {
+        let (alice, bob) = try I2PSSU2SelfTest.loopbackPair(
+            aliceKey: Curve25519.KeyAgreement.PrivateKey(),
+            bobKey: Curve25519.KeyAgreement.PrivateKey())
+        try alice.close(reason: 0, detail: "bye")
+        I2PSSU2SelfTest.pumpBoth(alice, bob)
+        guard bob.state == .closed else { throw SSU2Error.testFailed("peer did not close") }
+        guard alice.state == .terminating else { throw SSU2Error.testFailed("terminator state") }
+        try alice.retransmitTermination()
+        try alice.retransmitTermination()
+        guard expectThrow({ try alice.retransmitTermination() }) else {
+            throw I2PCrossValidationError.unexpectedSuccess
+        }
+        let quiet = try I2PSSU2SelfTest.loopbackPair(
+            aliceKey: Curve25519.KeyAgreement.PrivateKey(),
+            bobKey: Curve25519.KeyAgreement.PrivateKey()).0
+        guard !quiet.checkIdle(timeout: 60) else { throw SSU2Error.testFailed("idle fired too early") }
+        guard quiet.checkIdle(timeout: 60, now: Date().addingTimeInterval(3600)) else {
+            throw SSU2Error.testFailed("idle teardown did not fire")
+        }
+        return "termination block delivered, 3 retransmissions bounded, idle timeout tears down"
     }
 }

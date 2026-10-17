@@ -83,6 +83,7 @@ enum I2PSpecComponent: String, Codable, CaseIterable {
     case netdb
     case i2np
     case ntcp2
+    case ssu2
     case tunnels
     case garlic
 
@@ -93,6 +94,7 @@ enum I2PSpecComponent: String, Codable, CaseIterable {
         case .netdb: return "NetDB"
         case .i2np: return "I2NP"
         case .ntcp2: return "NTCP2"
+        case .ssu2: return "SSU2"
         case .tunnels: return "Tunnels"
         case .garlic: return "Garlic"
         }
@@ -155,6 +157,7 @@ enum I2PSpecTruthTable {
         all += netdbRows
         all += i2npRows
         all += ntcp2Rows
+        all += ssu2Rows
         all += tunnelRows
         all += garlicRows
         return all
@@ -609,6 +612,132 @@ enum I2PSpecTruthTable {
             edges: "Signature failure aborts the session; exchanged RouterInfos feed floodfill selection.",
             status: .pendingWireVerification,
             tests: ["T4-NT-RIEX-RT", "T4-NT-RIEX-SIG"]),
+    ]
+
+    // MARK: SSU2
+
+    private static let ssu2Rows: [I2PSpecRow] = [
+        row("SS-HEADER", .ssu2,
+            "SSU2 packet headers: 32-byte long and 16-byte short headers with immutable connection IDs and per-direction packet numbers.",
+            spec: "spec.i2p.io/proposals/159-ssu2 §headers",
+            java: "net.i2p.router.transport.udp2 packet header handling (establish package)",
+            swift: "I2PSSU2Crypto.swift (SSU2PacketHeader)",
+            wire: "Long: dstConnID (8) + packetNumber (4 BE) + type (1) + version (1) + networkID (1) + flags (1) + srcConnID (8) + token (8) = 32 bytes. Short: dstConnID (8) + packetNumber (4 BE) + type (1) + fragment info (1: index<<4 | total-1) + additional flags (2) = 16 bytes.",
+            encoding: "Types: sessionRequest 0, sessionCreated 1, sessionConfirmed 2, data 6, peerTest 7, retry 9, tokenRequest 10, holePunch 11. Version 2 and network ID 2 validated on every long-header parse.",
+            crypto: "n/a (headers are protection-masked, not encrypted).",
+            edges: "Connection IDs are random, immutable for the session's life, and src/dst are never identical (validated at handshake); unsupported version/networkID and unknown type codes rejected; packet numbers wrap at 2^32.",
+            status: .aligned,
+            tests: ["T4-SS-HEADER-RT"]),
+        row("SS-HPROTECT", .ssu2,
+            "DPI-resistant header protection: seven masking phases with tail-derived ChaCha20 IVs and the SessionRequest/Created ephemeral-region obfuscation.",
+            spec: "spec.i2p.io/proposals/159-ssu2 §header encryption",
+            java: "net.i2p.router.transport.udp2 header obfuscation",
+            swift: "I2PSSU2Crypto.swift (SSU2HeaderProtection, ChaCha20Stream)",
+            wire: "First 8 bytes XOR with ChaCha20 keystream IV = packet tail [len-24, len-12); bytes 8-16 XOR with IV = packet tail [len-12, len); SessionRequest/Created additionally obfuscate bytes 16-64 (srcConnID + token + the 32-byte ephemeral key) with an intro-key/responder-static-derived key over a zero IV.",
+            encoding: "Phases: sessionRequest, sessionCreated, retry, peerTest, holePunch keyed off the RouterInfo intro key (tokenRequest shares the sessionRequest key); sessionConfirmed and data keyed off the split direction keys. Receiver-side phase detection unmasks candidates and accepts the phase whose destination connection ID matches.",
+            crypto: "Raw ChaCha20 keystream (RFC 8439 block function) XOR masking keyed by HKDF-SHA256.",
+            edges: "Masking is an involution; a wrong phase key yields a random-looking connection ID so detection never false-positives; the tail IV makes every packet mask differently.",
+            status: .pendingWireVerification,
+            tests: ["T4-SS-HPROTECT-PHASES"]),
+        row("SS-NOISE", .ssu2,
+            "Noise_XK_25519_ChaChaPoly_SHA256 handshake: SessionRequest → SessionCreated → SessionConfirmed with header binding and the ephemeral region.",
+            spec: "spec.i2p.io/proposals/159-ssu2 §handshake; Noise pattern XK",
+            java: "net.i2p.router.transport.udp2 establish package (InboundEstablishState/OutboundEstablishState)",
+            swift: "I2PSSU2.swift (SSU2InitiatorHandshake/SSU2ResponderHandshake) + I2PSSU2Crypto.swift",
+            wire: "SessionRequest: long header + ephemeral (32, region-obfuscated) + ChaChaPoly static section (initiator static key 32 + 16-byte tag inside = 48) + ChaChaPoly options payload. SessionCreated: long header + responder ephemeral (32, region-obfuscated) + ChaChaPoly static section (responder static) + ChaChaPoly options payload. SessionConfirmed: short-header fragments carrying the RouterInfo block.",
+            encoding: "Header MixHash binding before Noise processing; the chain resets per SessionRequest attempt; the static sections authenticate both parties; the split happens only after the last handshake material mixed on both sides.",
+            crypto: "X25519 es + ee + se agreement over the shared Noise chain (protocol name rides verbatim as the 32-byte chaining key); ChaCha20-Poly1305 with nonce96; HKDF-SHA256 MixKey.",
+            edges: "Static-key mismatch or MAC failure aborts the handshake; tampered handshake packets reject; the responder's RouterInfo travels in the SessionConfirmed fragments.",
+            status: .pendingWireVerification,
+            tests: ["T4-SS-NOISE-LOOPBACK"]),
+        row("SS-TOKEN", .ssu2,
+            "Token management: TokenRequest → Retry solicitation, token validation in SessionRequest, expiry and rate limiting.",
+            spec: "spec.i2p.io/proposals/159-ssu2 §token management",
+            java: "net.i2p.router.transport.udp2 token handling",
+            swift: "I2PSSU2.swift (SSU2TokenManager, SSU2TokenCache, the handshake engines' Retry paths)",
+            wire: "TokenRequest (type 10): long header with a zero token field. Retry (type 9): long header carrying the fresh 8-byte opaque token in the header token field. SessionRequest: the token rides in its header token field.",
+            encoding: "Three establishment sequences: fast path (a cached token rides straight into the SessionRequest), token-request path (TokenRequest → Retry → SessionRequest), retry path (a SessionRequest with an invalid token earns a Retry with a fresh token).",
+            crypto: "Tokens are opaque random 8-byte values bound to the requester's source connection ID.",
+            edges: "Tokens expire (10 min default) and are rate-limited per requester (5/min default, silently dropped when exceeded); invalid tokens earn a Retry, never a silent accept; the Retry path is exercised end-to-end in the loopback handshake.",
+            status: .aligned,
+            tests: ["T4-SS-TOKEN-MGMT"]),
+        row("SS-STATE", .ssu2,
+            "Session state machine: UNKNOWN → INITIAL → REQUESTED → CREATED → CONFIRMED → ESTABLISHED → TERMINATING → CLOSED with handshake retransmission and backoff.",
+            spec: "spec.i2p.io/proposals/159-ssu2 §session establishment states",
+            java: "net.i2p.router.transport.udp2.OutboundEstablishState / InboundEstablishState",
+            swift: "I2PSSU2.swift (SSU2Session)",
+            wire: "n/a (state transitions driven by the packet flow).",
+            encoding: "The initiator splits after processing SessionCreated; the responder after building SessionCreated; both split at the identical chaining-key state so the data-phase keys mirror exactly.",
+            crypto: "See SS-NOISE.",
+            edges: "Unauthenticated datagrams drop silently with the error recorded; the connection-ID pair is validated (never identical) at establishment; the loopback handshake exercises every transition including both the token-request and retry paths.",
+            status: .aligned,
+            tests: ["T4-SS-STATE-HANDSHAKE", "T4-SS-UDP-LOOPBACK"]),
+        row("SS-DATA", .ssu2,
+            "Data phase: per-direction ChaCha20-Poly1305 with the short header as AAD, nonce96 packet counters, replay protection and out-of-order delivery.",
+            spec: "spec.i2p.io/proposals/159-ssu2 §data phase",
+            java: "net.i2p.router.transport.udp2 packet cipher state",
+            swift: "I2PSSU2Crypto.swift (SSU2DataCipher, SSU2ReplayWindow, SSU2Nonce) + I2PSSU2.swift (SSU2Session data path)",
+            wire: "Short header (16) + ChaChaPoly ciphertext + 16-byte MAC; the AAD is the unmasked short header; the AEAD nonce is 4 zero bytes ‖ the 8-byte big-endian packet number.",
+            encoding: "One packet-number sequence per direction (nonce96 per packet, wrapping at 2^32); minimum message 40 bytes (16 header + 8 payload + 16 MAC), maximum 1472 (IPv4).",
+            crypto: "ChaCha20-Poly1305 AEAD; MAC failure drops the packet.",
+            edges: "Replay window: duplicates and packets below the 64-packet window rejected (counted); in-window out-of-order delivery accepted; payload bounds enforced at seal time.",
+            status: .aligned,
+            tests: ["T4-SS-DATA-REPLAY"]),
+        row("SS-FRAG", .ssu2,
+            "Fragmentation: SessionConfirmed fragments (up to 15) and I2NP message fragmentation inside data packets, both with timeout-bounded reassembly.",
+            spec: "spec.i2p.io/proposals/159-ssu2 §SessionConfirmed fragmentation; i2np fragmentation",
+            java: "net.i2p.router.transport.udp2 establish fragmentation; OutboundMessageFragments",
+            swift: "I2PSSU2.swift (SSU2ConfirmedFragmenter, SSU2ConfirmedReassembler, SSU2MessageFragmenter, SSU2MessageReassembler)",
+            wire: "Short-header fragment byte: index << 4 | total-1 (up to 15 fragments). Data-block fragments carry [messageID (4 BE)][fragment byte][chunk] so out-of-order delivery reassembles by message ID.",
+            encoding: "SessionConfirmed fragments reassemble into the payload whose data block carries the RouterInfo; I2NP messages over the data budget split into up to 15 fragments and reassemble byte-exact.",
+            crypto: "Fragment payloads are covered by the data-phase AEAD.",
+            edges: "Reassembly times out (stale fragments rejected); 16-fragment splits rejected; out-of-order fragment arrival handled.",
+            status: .aligned,
+            tests: ["T4-SS-FRAG-SC", "T4-SS-FRAG-I2NP"]),
+        row("SS-PEERTEST", .ssu2,
+            "Peer test protocol: type-7 reachability testing with nonce correlation, observed-address extraction and reachability classification.",
+            spec: "spec.i2p.io/proposals/159-ssu2 §peer test (test types 5/6/7)",
+            java: "net.i2p.router.transport.udp2.PeerTestManagement",
+            swift: "I2PSSU2.swift (SSU2PeerTestMessage, SSU2PeerTestCoordinator, SSU2Session peer-test path)",
+            wire: "Type-7 long-header packets; request body [nonce (4 BE)][timestamp (4 BE)]; response body [nonce (4 BE)][observed endpoint (host length + host + port)] as the tester observed the requester.",
+            encoding: "Reachability classification: observed == published → direct; same IP, different port → port-mapped; different IP → symmetric NAT; nothing arrived → unreachable.",
+            crypto: "Peer-test packets ride the established session's header protection (session-derived peerTest phase).",
+            edges: "Nonce correlation distinguishes responses from inbound requests (a request echoes back the nonce with the requester's observed endpoint); results cache with configurable expiration (1h default) and lapse.",
+            status: .aligned,
+            tests: ["T4-SS-PEERTEST-RT"]),
+        row("SS-RELAY", .ssu2,
+            "Relay protocol: RelayRequest/RelayResponse with the introducer and HolePunch (type-11) coordination for NAT traversal.",
+            spec: "spec.i2p.io/proposals/159-ssu2 §relay; hole punching",
+            java: "net.i2p.router.transport.udp2 relay package",
+            swift: "I2PSSU2.swift (SSU2RelayEntry, SSU2RelayMessage, SSU2RelayCoordinator)",
+            wire: "RelayRequest to the introducer: [nonce (4 BE)][target hash (32)][target port (2 BE)]. RelayResponse: [nonce (4 BE)][status (1), 0 = accepted]. HolePunch: a type-11 long-header datagram carrying the punch nonce, header-masked with the relay's introduction key.",
+            encoding: "The coordinator advances requested → relay-accepted → hole-punch-sent → completed; the punch target decodes the nonce to open a return path to the puncher's endpoint.",
+            crypto: "HolePunch packets mask with the relay entry's introduction key.",
+            edges: "Relay rejection (nonzero status) fails the coordination phase; the introduction key is the phase key binding.",
+            status: .aligned,
+            tests: ["T4-SS-RELAY-HOLEPUNCH"]),
+        row("SS-MIGRATE", .ssu2,
+            "Connection migration: PathChallenge/PathResponse validation before switching to a new address, with immutable connection IDs.",
+            spec: "spec.i2p.io/proposals/159-ssu2 §connection migration / path validation",
+            java: "net.i2p.router.transport.udp2 path validation",
+            swift: "I2PSSU2.swift (SSU2Session migration trigger + PathChallenge/PathResponse blocks)",
+            wire: "Traffic arriving from a new address on an established session is answered with a data-phase PathChallenge block (8-byte random value) targeted at the new address; the peer echoes a PathResponse with the same value.",
+            encoding: "The remote endpoint switches only after the echoed response validates; traffic on the unvalidated path is held until then; connection IDs stay immutable across the migration.",
+            crypto: "Path-validation packets ride the established data-phase AEAD.",
+            edges: "Only one pending challenge at a time; a mismatched echoed value does not migrate the session.",
+            status: .aligned,
+            tests: ["T4-SS-MIGRATE-RT"]),
+        row("SS-TERM", .ssu2,
+            "Termination and cleanup: encrypted termination blocks, bounded terminal-packet retransmission and idle teardown.",
+            spec: "spec.i2p.io/proposals/159-ssu2 §termination",
+            java: "net.i2p.router.transport.udp2 session termination",
+            swift: "I2PSSU2.swift (SSU2Session close/retransmitTermination/checkIdle, SSU2Block.termination)",
+            wire: "A data-phase packet carrying a termination block: [reason (1)][optional detail]. The terminal packet is retained whole and may be retransmitted up to 3 times.",
+            encoding: "The receiving peer transitions to closed on the termination block; the sender stays terminating (awaiting nothing) and retransmits the same datagram bounded.",
+            crypto: "Termination blocks ride the data-phase AEAD.",
+            edges: "Idle teardown tears down an established session that exceeded its idle timeout; abrupt abort closes without the termination exchange.",
+            status: .aligned,
+            tests: ["T4-SS-TERM-IDLE"]),
     ]
 
     // MARK: Tunnels
