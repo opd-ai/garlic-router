@@ -240,7 +240,10 @@ final class NTCP2ResponderHandshake {
             staticKeyProcessed = true
             let peerStatic = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: staticKey)
             // "es": MixKey(DH(e', s))
-            let es = try ephemeral!.sharedSecretFromKeyAgreement(with: peerStatic)
+            guard let ephemeral else {
+                throw NTCP2Error.handshakeFailed("missing responder ephemeral key")
+            }
+            let es = try ephemeral.sharedSecretFromKeyAgreement(with: peerStatic)
             chain.mixKey(es.withUnsafeBytes { Data($0) })
         }
 

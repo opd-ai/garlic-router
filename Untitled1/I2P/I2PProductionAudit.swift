@@ -74,7 +74,11 @@ enum I2PProductionAudit {
             remoteStaticKey: responderStatic.publicKey.rawRepresentation
         )
         let responder = NTCP2ResponderHandshake(localStaticKey: responderStatic)
-        let routerInfo = I2PRouterAppContext.shared.mainnetSignedRouterInfo.serialize()
+        // This is a protocol-unit probe. Do not access I2PRouterAppContext.shared:
+        // constructing the live router also creates Keychain-backed identity,
+        // NetDB storage, transport and tunnel services, which makes an isolated
+        // handshake audit capable of crashing for unrelated app-lifecycle work.
+        let routerInfo = try I2PSamples.sampleRouterInfo().serialize()
 
         let request = try initiator.makeSessionRequest(routerInfo: routerInfo, padding: 16)
         // The announced m3p2len is a wire contract: exactly RouterInfo + tag.
@@ -111,9 +115,24 @@ enum I2PProductionAudit {
         guard initiator.stage == .established, responder.stage == .established else {
             throw I2PMainnetFailure(message: "handshake state machines did not reach established")
         }
-        _ = try initiator.complete()
-        _ = try responder.complete()
-        return "full Noise_XK exchange: \(request.count)-byte request, \(confirm.count)-byte confirm; RouterInfo + static key round-tripped; both state machines established with derived session keys"
+        let initiatorKeys = try initiator.complete()
+        let responderKeys = try responder.complete()
+        guard initiatorKeys.sendKeys == responderKeys.recvKeys,
+              initiatorKeys.recvKeys == responderKeys.sendKeys else {
+            throw I2PMainnetFailure(message: "NTCP2 Noise split keys do not mirror between peers")
+        }
+
+        // Exercise authenticated transport framing after the handshake. This
+        // catches a key/nonce-direction mismatch in the same end-to-end probe.
+        let sender = NTCP2FrameCodec(directionKeys: initiatorKeys.sendKeys)
+        let receiver = NTCP2FrameCodec(directionKeys: responderKeys.recvKeys)
+        let framePayload = Data("NTCP2 readiness frame".utf8)
+        let frame = try sender.frame(framePayload)
+        guard let opened = try receiver.unframe(frame), opened.payload == framePayload,
+              opened.consumed == frame.count else {
+            throw I2PMainnetFailure(message: "NTCP2 post-handshake authenticated frame did not round-trip")
+        }
+        return "full Noise_XK exchange: \(request.count)-byte request, \(confirm.count)-byte confirm; RouterInfo + static key round-tripped; mirrored split keys authenticated a data frame"
     }
 
     // MARK: - SSU2
