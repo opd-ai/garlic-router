@@ -50,6 +50,24 @@ struct I2PRouterStatusSnapshot {
     let outRate: Double
     let inRateHistory: [Double]
     let outRateHistory: [Double]
+    // Per-peer session readings (peer inspector)
+    let peers: [I2PPeerSummary]
+}
+
+/// One live per-peer session reading for the peer inspector.
+struct I2PPeerSummary: Identifiable {
+    let id: String                      // peer identity hash, hex
+    let transport: String               // "NTCP2" or "SSU2"
+    let establishedAt: Date
+    let bytesIn: Int
+    let bytesOut: Int
+    /// XOR distance between our router hash and the peer's, hex.
+    let xorDistanceHex: String
+    /// Kademlia bucket = leading zero bits of the XOR distance.
+    let kademliaBucket: Int
+    let isFloodfill: Bool
+    /// nil when the peer takes no part in one of our tunnels.
+    let tunnelRole: String?
 }
 
 /// Aggregated netdb reading served by the network database actor.
@@ -127,6 +145,10 @@ final class I2PRouterStatusEngine {
     private weak var ntcp2: NTCP2Transport?
     private weak var tunnelPool: I2PTunnelPool?
     let localRouterHash: Data
+    /// Optional SSU2 session source: once the SSU2 transport is wired into the
+    /// running router, it supplies established-session readings in the same
+    /// shape the NTCP2 transport reports, so the peer inspector lists both.
+    var ssu2PeerSummaries: (() -> [(hash: Data, establishedAt: Date, bytesIn: Int, bytesOut: Int)])?
 
     private let startedAt = Date()
     private let lock = NSLock()
@@ -222,15 +244,77 @@ final class I2PRouterStatusEngine {
             }
         }
 
+        let peers = await peerSummaries(tunnelPool: tunnelPool)
+
         return sample(netDBStatus: netDBStatus,
                       ntcp2SessionCount: ntcp2?.sessionCount() ?? 0,
-                      pools: pools)
+                      pools: pools,
+                      peers: peers)
+    }
+
+    /// Builds per-peer session readings: transport sessions enriched with the
+    /// Kademlia XOR distance, floodfill status and tunnel participation.
+    private func peerSummaries(tunnelPool: I2PTunnelPool?) async -> [I2PPeerSummary] {
+        var roles: [Data: String] = [:]
+        if let tunnelPool {
+            for tunnel in tunnelPool.outboundTunnels {
+                for hop in tunnel.hops { roles[hop.routerHash] = "Outbound tunnel hop" }
+            }
+            for tunnel in tunnelPool.inboundTunnels {
+                for hop in tunnel.hops { roles[hop.routerHash] = "Inbound tunnel hop" }
+            }
+        }
+
+        var sessions: [(hash: Data, transport: String, establishedAt: Date, bytesIn: Int, bytesOut: Int)] = []
+        if let ntcp2 {
+            for summary in ntcp2.sessionSummaries() {
+                sessions.append((summary.hash, "NTCP2", summary.establishedAt, summary.bytesIn, summary.bytesOut))
+            }
+        }
+        if let ssu2PeerSummaries {
+            for summary in ssu2PeerSummaries() {
+                sessions.append((summary.hash, "SSU2", summary.establishedAt, summary.bytesIn, summary.bytesOut))
+            }
+        }
+
+        var result: [I2PPeerSummary] = []
+        var seen: Set<Data> = []
+        for session in sessions.sorted(by: { $0.bytesIn + $0.bytesOut > $1.bytesIn + $1.bytesOut }) {
+            guard !seen.contains(session.hash) else { continue }
+            seen.insert(session.hash)
+            let distance = I2PNetworkDatabase.xorDistance(localRouterHash, session.hash)
+            let floodfill = await netDB?.isFloodfill(session.hash) ?? false
+            result.append(I2PPeerSummary(
+                id: Self.hex(session.hash),
+                transport: session.transport,
+                establishedAt: session.establishedAt,
+                bytesIn: session.bytesIn,
+                bytesOut: session.bytesOut,
+                xorDistanceHex: Self.hex(distance),
+                kademliaBucket: Self.leadingZeroBits(distance),
+                isFloodfill: floodfill,
+                tunnelRole: roles[session.hash]
+            ))
+        }
+        return result
+    }
+
+    private static func leadingZeroBits(_ data: Data) -> Int {
+        var bits = 0
+        for byte in data {
+            if byte == 0 { bits += 8; continue }
+            var value = byte
+            while value & 0x80 == 0 { bits += 1; value <<= 1 }
+            break
+        }
+        return bits
     }
 
     /// Synchronous sampling of the counters (kept sync for lock safety).
     private func sample(netDBStatus: I2PNetDBStatus?,
                         ntcp2SessionCount: Int,
-                        pools: [I2PRouterStatusSnapshot.PoolSummary]) -> I2PRouterStatusSnapshot {
+                        pools: [I2PRouterStatusSnapshot.PoolSummary],
+                        peers: [I2PPeerSummary]) -> I2PRouterStatusSnapshot {
         lock.lock()
         defer { lock.unlock() }
         let now = Date()
@@ -259,7 +343,8 @@ final class I2PRouterStatusEngine {
             inRate: inRate,
             outRate: outRate,
             inRateHistory: inRateHistory,
-            outRateHistory: outRateHistory
+            outRateHistory: outRateHistory,
+            peers: peers
         )
         lastSampleAt = now
         lastSampleIn = messagesIn

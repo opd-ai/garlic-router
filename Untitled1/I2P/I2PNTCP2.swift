@@ -42,6 +42,10 @@ final class NTCP2Session: NSObject {
     private var recvCodec: NTCP2FrameCodec?
     private var rxBuffer = Data()
     private var didNotifyEstablished = false
+    // Per-peer session readings for the peer inspector.
+    private(set) var establishedAt: Date?
+    private(set) var bytesIn = 0
+    private(set) var bytesOut = 0
 
     var isEstablished: Bool { state == .established }
 
@@ -140,6 +144,7 @@ final class NTCP2Session: NSObject {
         sendCodec = NTCP2FrameCodec(directionKeys: keys.sendKeys)
         recvCodec = NTCP2FrameCodec(directionKeys: keys.recvKeys)
         state = .established
+        if establishedAt == nil { establishedAt = Date() }
 
         if !asInitiator {
             // Responder announces its RouterInfo in the first data-phase frame.
@@ -235,6 +240,7 @@ final class NTCP2Session: NSObject {
             case .data(let data):
                 // Mainnet framing: one short-header I2NP message per data block.
                 // Non-I2NP raw payloads (loopback/test traffic) pass through.
+                bytesIn += data.count
                 if I2NPMessage.looksLikeShortHeaderMessage(data),
                    let message = try? I2NPMessage.parseShort(data) {
                     delegate?.session(self, didReceiveData: message.serialize())
@@ -268,6 +274,7 @@ final class NTCP2Session: NSObject {
         guard shortMessage.count <= 65519 else {
             throw NTCP2Error.notEstablished
         }
+        bytesOut += shortMessage.count
         var payload = try NTCP2Block.encode([.data(shortMessage), .time(Date())])
         payload = NTCP2Block.aligned(payload)
         sendRaw(try codec.frame(payload))
@@ -413,6 +420,23 @@ final class NTCP2Transport {
         lock.lock()
         defer { lock.unlock() }
         return sessions.count
+    }
+
+    /// Per-peer session readings for the peer inspector (established sessions only,
+    /// deduplicated by router hash).
+    func sessionSummaries() -> [(hash: Data, establishedAt: Date, bytesIn: Int, bytesOut: Int)] {
+        lock.lock()
+        defer { lock.unlock() }
+        var seen: Set<Data> = []
+        var out: [(hash: Data, establishedAt: Date, bytesIn: Int, bytesOut: Int)] = []
+        for session in sessions {
+            guard session.isEstablished,
+                  let hash = session.remoteRouterHash,
+                  !seen.contains(hash) else { continue }
+            seen.insert(hash)
+            out.append((hash, session.establishedAt ?? Date(), session.bytesIn, session.bytesOut))
+        }
+        return out
     }
 
     func hasSession(for routerHash: Data) -> Bool {

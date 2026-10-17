@@ -88,7 +88,7 @@ struct NTCP2NoiseChain {
     mutating func decrypt(_ ciphertext: Data) throws -> Data {
         guard let key else { throw NTCP2Error.handshakeFailed("DecryptWithAd without a key") }
         guard ciphertext.count > 16 else { throw NTCP2Error.decryptFailed }
-        let box = ChaChaPoly.SealedBox(
+        let box = try ChaChaPoly.SealedBox(
             nonce: Self.nonce96(nonce),
             ciphertext: ciphertext.subdata(in: 0..<(ciphertext.count - 16)),
             tag: ciphertext.subdata(in: (ciphertext.count - 16)..<ciphertext.count))
@@ -423,7 +423,7 @@ final class NTCP2FrameCodec {
         guard bytes.count >= total else { return nil }
         let body = Data(bytes[2..<total])
         guard body.count > 16 else { throw NTCP2Error.invalidFrame }
-        let box = ChaChaPoly.SealedBox(
+        let box = try ChaChaPoly.SealedBox(
             nonce: NTCP2NoiseChain.nonce96(counter),
             ciphertext: body.subdata(in: 0..<(body.count - 16)),
             tag: body.subdata(in: (body.count - 16)..<body.count))

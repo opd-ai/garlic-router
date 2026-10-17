@@ -22,6 +22,7 @@ struct RouterDashboardView: View {
                     if let snapshot {
                         headerCard(snapshot)
                         statGrid(snapshot)
+                        peersCard(snapshot)
                         tunnelsCard(snapshot)
                         throughputCard(snapshot)
                         footerText(snapshot)
@@ -117,6 +118,76 @@ struct RouterDashboardView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(14)
         .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 16))
+    }
+
+    // MARK: - Peers & sessions
+
+    private func peersCard(_ snapshot: I2PRouterStatusSnapshot) -> some View {
+        card(title: "Peers & Sessions") {
+            if snapshot.peers.isEmpty {
+                Label("No peer sessions yet — sessions appear once transports establish",
+                      systemImage: "antenna.radiowaves.left.and.right")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(snapshot.peers) { peer in
+                    NavigationLink {
+                        PeerDetailView(summary: peer)
+                    } label: {
+                        peerRow(peer)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    private func peerRow(_ peer: I2PPeerSummary) -> some View {
+        HStack(spacing: 10) {
+            Text(peer.transport)
+                .font(.caption2.weight(.bold))
+                .foregroundStyle(accent)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 3)
+                .background(accent.opacity(0.14), in: RoundedRectangle(cornerRadius: 7))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(formatHash(peer.id))
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(.primary)
+                Text("\(formatBytes(peer.bytesIn)) in · \(formatBytes(peer.bytesOut)) out")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            VStack(alignment: .trailing, spacing: 2) {
+                HStack(spacing: 4) {
+                    if peer.isFloodfill {
+                        Image(systemName: "point.3.connected.trianglepath.dotted")
+                            .font(.caption2)
+                            .foregroundStyle(accent)
+                    }
+                    Text("bucket \(peer.kademliaBucket)")
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                if let role = peer.tunnelRole {
+                    Text(role)
+                        .font(.caption2)
+                        .foregroundStyle(accent)
+                }
+            }
+            Image(systemName: "chevron.right")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func formatBytes(_ bytes: Int) -> String {
+        let value = Double(bytes)
+        if value >= 1_048_576 { return String(format: "%.1f MB", value / 1_048_576) }
+        if value >= 1024 { return String(format: "%.1f KB", value / 1024) }
+        return "\(bytes) B"
     }
 
     // MARK: - Tunnels

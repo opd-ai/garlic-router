@@ -94,8 +94,8 @@ enum I2PCrypto {
 
     static func chacha20Poly1305Open(key: Data, nonce: Data, ciphertextAndTag: Data, aad: Data = Data()) throws -> Data {
         guard ciphertextAndTag.count > 16 else { throw I2PWireError.invalidFormat }
-        let box = ChaChaPoly.SealedBox(
-            nonce: ChaChaPoly.Nonce(data: nonce),
+        let box = try ChaChaPoly.SealedBox(
+            nonce: try ChaChaPoly.Nonce(data: nonce),
             ciphertext: ciphertextAndTag.subdata(in: 0..<(ciphertextAndTag.count - 16)),
             tag: ciphertextAndTag.subdata(in: (ciphertextAndTag.count - 16)..<ciphertextAndTag.count))
         return try ChaChaPoly.open(box, using: SymmetricKey(data: key), authenticating: aad)
