@@ -62,6 +62,10 @@ enum I2PProductionAudit {
         let routerInfo = I2PRouterAppContext.shared.mainnetSignedRouterInfo.serialize()
 
         let request = try initiator.makeSessionRequest(routerInfo: routerInfo, padding: 16)
+        // The announced m3p2len is a wire contract: exactly RouterInfo + tag.
+        guard initiator.announcedPart2Length == routerInfo.count + 16 else {
+            throw I2PMainnetFailure(message: "SessionRequest announced m3p2len \(initiator.announcedPart2Length), expected RouterInfo + 16-byte tag (\(routerInfo.count + 16)) — m3p2len wrong")
+        }
         let (reply, requestConsumed) = try responder.processSessionRequest(request, padding: 16)
         guard requestConsumed == request.count else {
             throw I2PMainnetFailure(message: "responder consumed \(requestConsumed) of \(request.count) SessionRequest bytes — m3p2len/frame mismatch")
@@ -75,6 +79,12 @@ enum I2PProductionAudit {
         let confirmConsumed = try responder.processSessionConfirm(confirm)
         guard confirmConsumed == confirm.count else {
             throw I2PMainnetFailure(message: "responder consumed \(confirmConsumed) of \(confirm.count) SessionConfirm bytes — part 2 length mismatch")
+        }
+        // The responder consumed exactly the announced part-2 envelope: the
+        // m3p2len the initiator wrote into the SessionRequest options governs
+        // the wire on both sides.
+        guard confirmConsumed == 48 + initiator.announcedPart2Length else {
+            throw I2PMainnetFailure(message: "responder consumed \(confirmConsumed) bytes, expected 48 + announced m3p2len (\(48 + initiator.announcedPart2Length)) — options and frames disagree")
         }
 
         guard responder.remoteRouterInfo == routerInfo else {
@@ -149,7 +159,14 @@ enum I2PProductionAudit {
         let key = hex("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
         let nonce = hex("070000004041424344454647")
         let aad = hex("50515253c0c1c2c3c4c5c6c7")
-        let plaintext = Data("Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.".utf8)
+        // RFC 8439 §2.8.2 (the sunscreen vector), plaintext taken from the RFC
+        // hex dump so the transcription is byte-explicit (114 bytes):
+        // "Ladies and Gentlemen of the class of '99: If I could offer you only
+        // one tip for the future, sunscreen would be it."
+        let plaintext = hex("4c616469657320616e642047656e746c656d656e206f662074686520636c617373206f66202739393a204966204920636f756c64206f6666657220796f75206f6e6c79206f6e652074697020666f7220746865206675747572652c2073756e73637265656e20776f756c642062652069742e")
+        guard plaintext.count == 114 else {
+            throw I2PMainnetFailure(message: "RFC 8439 §2.8.2 plaintext transcription drift")
+        }
         let combined = try I2PCrypto.chacha20Poly1305Seal(key: key, nonce: nonce, plaintext: plaintext, aad: aad)
         guard combined.prefix(16) == hex("d31a8d34648e60db7b86afbc53ef7ec2") else {
             throw I2PMainnetFailure(message: "ChaCha20-Poly1305 ciphertext does not match RFC 8439 §2.8.2")
@@ -307,8 +324,10 @@ enum I2PProductionAudit {
               bytes[4] == 0xBE, bytes[5] == 0xEF else {
             throw I2PMainnetFailure(message: "big-endian encoding of integer/short primitives wrong")
         }
-        // 1_000_000 ms = 0x00000000000F4240 at offsets 38..<46.
-        guard bytes[43] == 0x0F, bytes[44] == 0x42, bytes[45] == 0x40 else {
+        // 1_000_000 seconds since the epoch encodes as 1_000_000_000 milliseconds
+        // = 0x000000003B9ACA00 at offsets 38..<46.
+        guard bytes[38] == 0x00, bytes[39] == 0x00, bytes[40] == 0x00, bytes[41] == 0x00,
+              bytes[42] == 0x3B, bytes[43] == 0x9A, bytes[44] == 0xCA, bytes[45] == 0x00 else {
             throw I2PMainnetFailure(message: "8-byte timestamp not encoded as big-endian milliseconds since epoch")
         }
         var reader = I2PReader(bytes)

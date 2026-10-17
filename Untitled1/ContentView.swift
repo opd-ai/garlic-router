@@ -12,6 +12,12 @@ struct ContentView: View {
     @State private var hardeningResults: [I2PSelfTestResult] = []
     @State private var specResults: [I2PSelfTestResult] = []
     @State private var productionResults: [I2PSelfTestResult] = []
+    @State private var resultsExpanded = false
+    @State private var readinessExpanded = false
+    @State private var stabilityExpanded = false
+    @State private var hardeningExpanded = false
+    @State private var specExpanded = false
+    @State private var productionExpanded = false
     @State private var sizes: [(name: String, bytes: Int)] = []
 
     private let accent = Color(red: 0.47, green: 0.44, blue: 0.97)
@@ -73,6 +79,7 @@ struct ContentView: View {
         sizes = I2PSelfTest.sampleByteSizes()
         Task {
             self.results = await I2PSelfTest.runAll()
+            self.resultsExpanded = true
         }
     }
 
@@ -81,7 +88,10 @@ struct ContentView: View {
     private func runMainnetAudit() {
         Task {
             let fresh = await I2PMainnetVerification.runAll()
-            await MainActor.run { results = fresh }
+            await MainActor.run {
+                results = fresh
+                resultsExpanded = true
+            }
         }
     }
 
@@ -90,7 +100,10 @@ struct ContentView: View {
     private func runReadinessAudit() {
         Task {
             let fresh = await I2PReadinessAudit.runAll()
-            await MainActor.run { readinessResults = fresh }
+            await MainActor.run {
+                readinessResults = fresh
+                readinessExpanded = true
+            }
         }
     }
 
@@ -110,24 +123,22 @@ struct ContentView: View {
 
             if !readinessResults.isEmpty {
                 let passed = readinessResults.filter(\.passed).count
-                Text(passed == readinessResults.count
-                     ? "\(passed) of \(readinessResults.count) checks passed"
-                     : "\(passed) of \(readinessResults.count) checks passed — findings below")
-                    .font(.footnote.weight(.medium))
-                    .foregroundStyle(passed == readinessResults.count ? Color.green : Color.orange)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                ForEach(readinessResults.indices, id: \.self) { index in
-                    HStack(alignment: .top, spacing: 8) {
-                        Image(systemName: readinessResults[index].passed ? "checkmark.circle.fill" : "xmark.circle.fill")
-                            .foregroundStyle(readinessResults[index].passed ? Color.green : Color.red)
-                            .font(.caption)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(readinessResults[index].name)
-                                .font(.footnote.weight(.medium))
-                            Text(readinessResults[index].detail)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
+                auditResultsSection(passed, of: readinessResults.count,
+                                    allPassedSummary: "\(passed) of \(readinessResults.count) checks passed",
+                                    findingsSummary: "\(passed) of \(readinessResults.count) checks passed — findings below",
+                                    isExpanded: $readinessExpanded) {
+                    ForEach(readinessResults.indices, id: \.self) { index in
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: readinessResults[index].passed ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                .foregroundStyle(readinessResults[index].passed ? Color.green : Color.red)
+                                .font(.caption)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(readinessResults[index].name)
+                                    .font(.footnote.weight(.medium))
+                                Text(readinessResults[index].detail)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
                 }
@@ -141,7 +152,10 @@ struct ContentView: View {
     private func runStabilityAudit() {
         Task {
             let fresh = await I2PStabilityAudit.runAll()
-            await MainActor.run { stabilityResults = fresh }
+            await MainActor.run {
+                stabilityResults = fresh
+                stabilityExpanded = true
+            }
         }
     }
 
@@ -150,7 +164,10 @@ struct ContentView: View {
     private func runHardeningAudit() {
         Task {
             let fresh = await I2PHardeningAudit.runAll()
-            await MainActor.run { hardeningResults = fresh }
+            await MainActor.run {
+                hardeningResults = fresh
+                hardeningExpanded = true
+            }
         }
     }
 
@@ -170,24 +187,22 @@ struct ContentView: View {
 
             if !hardeningResults.isEmpty {
                 let passed = hardeningResults.filter(\.passed).count
-                Text(passed == hardeningResults.count
-                     ? "\(passed) of \(hardeningResults.count) probes passed — defensive posture verified"
-                     : "\(passed) of \(hardeningResults.count) probes passed — findings below")
-                    .font(.footnote.weight(.medium))
-                    .foregroundStyle(passed == hardeningResults.count ? Color.green : Color.orange)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                ForEach(hardeningResults.indices, id: \.self) { index in
-                    HStack(alignment: .top, spacing: 8) {
-                        Image(systemName: hardeningResults[index].passed ? "checkmark.circle.fill" : "xmark.circle.fill")
-                            .foregroundStyle(hardeningResults[index].passed ? Color.green : Color.red)
-                            .font(.caption)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(hardeningResults[index].name)
-                                .font(.footnote.weight(.medium))
-                            Text(hardeningResults[index].detail)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
+                auditResultsSection(passed, of: hardeningResults.count,
+                                    allPassedSummary: "\(passed) of \(hardeningResults.count) probes passed — defensive posture verified",
+                                    findingsSummary: "\(passed) of \(hardeningResults.count) probes passed — findings below",
+                                    isExpanded: $hardeningExpanded) {
+                    ForEach(hardeningResults.indices, id: \.self) { index in
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: hardeningResults[index].passed ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                .foregroundStyle(hardeningResults[index].passed ? Color.green : Color.red)
+                                .font(.caption)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(hardeningResults[index].name)
+                                    .font(.footnote.weight(.medium))
+                                Text(hardeningResults[index].detail)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
                 }
@@ -207,7 +222,10 @@ struct ContentView: View {
     private func runSpecAudit() {
         Task {
             let fresh = await I2PSpecConformanceAudit.runAll()
-            await MainActor.run { specResults = fresh }
+            await MainActor.run {
+                specResults = fresh
+                specExpanded = true
+            }
         }
     }
 
@@ -227,24 +245,22 @@ struct ContentView: View {
 
             if !specResults.isEmpty {
                 let passed = specResults.filter(\.passed).count
-                Text(passed == specResults.count
-                     ? "\(passed) of \(specResults.count) probes passed — official-spec checklist verified"
-                     : "\(passed) of \(specResults.count) probes passed — findings below")
-                    .font(.footnote.weight(.medium))
-                    .foregroundStyle(passed == specResults.count ? Color.green : Color.orange)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                ForEach(specResults.indices, id: \.self) { index in
-                    HStack(alignment: .top, spacing: 8) {
-                        Image(systemName: specResults[index].passed ? "checkmark.circle.fill" : "xmark.circle.fill")
-                            .foregroundStyle(specResults[index].passed ? Color.green : Color.red)
-                            .font(.caption)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(specResults[index].name)
-                                .font(.footnote.weight(.medium))
-                            Text(specResults[index].detail)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
+                auditResultsSection(passed, of: specResults.count,
+                                    allPassedSummary: "\(passed) of \(specResults.count) probes passed — official-spec checklist verified",
+                                    findingsSummary: "\(passed) of \(specResults.count) probes passed — findings below",
+                                    isExpanded: $specExpanded) {
+                    ForEach(specResults.indices, id: \.self) { index in
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: specResults[index].passed ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                .foregroundStyle(specResults[index].passed ? Color.green : Color.red)
+                                .font(.caption)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(specResults[index].name)
+                                    .font(.footnote.weight(.medium))
+                                Text(specResults[index].detail)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
                 }
@@ -263,7 +279,10 @@ struct ContentView: View {
     private func runProductionAudit() {
         Task {
             let fresh = await I2PProductionAudit.runAll()
-            await MainActor.run { productionResults = fresh }
+            await MainActor.run {
+                productionResults = fresh
+                productionExpanded = true
+            }
         }
     }
 
@@ -283,24 +302,22 @@ struct ContentView: View {
 
             if !productionResults.isEmpty {
                 let passed = productionResults.filter(\.passed).count
-                Text(passed == productionResults.count
-                     ? "\(passed) of \(productionResults.count) checklist sections verified — production readiness closed"
-                     : "\(passed) of \(productionResults.count) sections verified — findings below")
-                    .font(.footnote.weight(.medium))
-                    .foregroundStyle(passed == productionResults.count ? Color.green : Color.orange)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                ForEach(productionResults.indices, id: \.self) { index in
-                    HStack(alignment: .top, spacing: 8) {
-                        Image(systemName: productionResults[index].passed ? "checkmark.circle.fill" : "xmark.circle.fill")
-                            .foregroundStyle(productionResults[index].passed ? Color.green : Color.red)
-                            .font(.caption)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(productionResults[index].name)
-                                .font(.footnote.weight(.medium))
-                            Text(productionResults[index].detail)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
+                auditResultsSection(passed, of: productionResults.count,
+                                    allPassedSummary: "\(passed) of \(productionResults.count) checklist sections verified — production readiness closed",
+                                    findingsSummary: "\(passed) of \(productionResults.count) sections verified — findings below",
+                                    isExpanded: $productionExpanded) {
+                    ForEach(productionResults.indices, id: \.self) { index in
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: productionResults[index].passed ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                .foregroundStyle(productionResults[index].passed ? Color.green : Color.red)
+                                .font(.caption)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(productionResults[index].name)
+                                    .font(.footnote.weight(.medium))
+                                Text(productionResults[index].detail)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
                 }
@@ -328,24 +345,22 @@ struct ContentView: View {
 
             if !stabilityResults.isEmpty {
                 let passed = stabilityResults.filter(\.passed).count
-                Text(passed == stabilityResults.count
-                     ? "\(passed) of \(stabilityResults.count) probes passed — every crash checklist category ran clean"
-                     : "\(passed) of \(stabilityResults.count) probes passed — findings below")
-                    .font(.footnote.weight(.medium))
-                    .foregroundStyle(passed == stabilityResults.count ? Color.green : Color.orange)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                ForEach(stabilityResults.indices, id: \.self) { index in
-                    HStack(alignment: .top, spacing: 8) {
-                        Image(systemName: stabilityResults[index].passed ? "checkmark.circle.fill" : "xmark.circle.fill")
-                            .foregroundStyle(stabilityResults[index].passed ? Color.green : Color.red)
-                            .font(.caption)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(stabilityResults[index].name)
-                                .font(.footnote.weight(.medium))
-                            Text(stabilityResults[index].detail)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
+                auditResultsSection(passed, of: stabilityResults.count,
+                                    allPassedSummary: "\(passed) of \(stabilityResults.count) probes passed — every crash checklist category ran clean",
+                                    findingsSummary: "\(passed) of \(stabilityResults.count) probes passed — findings below",
+                                    isExpanded: $stabilityExpanded) {
+                    ForEach(stabilityResults.indices, id: \.self) { index in
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: stabilityResults[index].passed ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                .foregroundStyle(stabilityResults[index].passed ? Color.green : Color.red)
+                                .font(.caption)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(stabilityResults[index].name)
+                                    .font(.footnote.weight(.medium))
+                                Text(stabilityResults[index].detail)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
                 }
@@ -420,24 +435,22 @@ struct ContentView: View {
 
             if !results.isEmpty {
                 let passed = results.filter(\.passed).count
-                Text(passed == results.count
-                     ? "\(passed) of \(results.count) tests passed"
-                     : "\(passed) of \(results.count) passed — failures below")
-                    .font(.footnote.weight(.medium))
-                    .foregroundStyle(passed == results.count ? Color.green : Color.orange)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                ForEach(results.indices, id: \.self) { index in
-                    HStack(alignment: .top, spacing: 8) {
-                        Image(systemName: results[index].passed ? "checkmark.circle.fill" : "xmark.circle.fill")
-                            .foregroundStyle(results[index].passed ? Color.green : Color.red)
-                            .font(.caption)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(results[index].name)
-                                .font(.footnote.weight(.medium))
-                            Text(results[index].detail)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
+                auditResultsSection(passed, of: results.count,
+                                    allPassedSummary: "\(passed) of \(results.count) tests passed",
+                                    findingsSummary: "\(passed) of \(results.count) passed — failures below",
+                                    isExpanded: $resultsExpanded) {
+                    ForEach(results.indices, id: \.self) { index in
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: results[index].passed ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                .foregroundStyle(results[index].passed ? Color.green : Color.red)
+                                .font(.caption)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(results[index].name)
+                                    .font(.footnote.weight(.medium))
+                                Text(results[index].detail)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
                 }
@@ -456,6 +469,37 @@ struct ContentView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(16)
         .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 18))
+    }
+
+    /// Expandable audit-results section: the summary row toggles the detail
+    /// list, so long reports collapse out of the way and re-expand on demand.
+    /// Runs auto-expand the section when fresh results arrive.
+    private func auditResultsSection(_ passed: Int, of total: Int,
+                                     allPassedSummary: String,
+                                     findingsSummary: String,
+                                     isExpanded: Binding<Bool>,
+                                     @ViewBuilder rows: () -> some View) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isExpanded.wrappedValue.toggle()
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Text(passed == total ? allPassedSummary : findingsSummary)
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(passed == total ? Color.green : Color.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Image(systemName: isExpanded.wrappedValue ? "chevron.up" : "chevron.down")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .buttonStyle(.plain)
+            if isExpanded.wrappedValue {
+                rows()
+            }
+        }
     }
 
     private func suiteRow(_ name: String, subtitle: String) -> some View {

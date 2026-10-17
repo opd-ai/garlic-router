@@ -22,6 +22,9 @@ final class NTCP2InitiatorHandshake {
     private var ephemeral: Curve25519.KeyAgreement.PrivateKey?
     private var ourRouterInfo = Data()
     private var sessionKeys: NTCP2SessionKeys?
+    /// The m3p2len value written into the SessionRequest options block — the
+    /// wire contract for message 3 part 2 (RouterInfo + 16-byte AEAD tag).
+    private(set) var announcedPart2Length: Int = 0
 
     init(localStaticKey: Curve25519.KeyAgreement.PrivateKey, remoteStaticKey: Data) throws {
         guard remoteStaticKey.count == 32 else {
@@ -44,6 +47,7 @@ final class NTCP2InitiatorHandshake {
             throw NTCP2Error.handshakeFailed("RouterInfo too large for SessionRequest")
         }
         ourRouterInfo = routerInfo
+        announcedPart2Length = routerInfo.count + 16
 
         let e = Curve25519.KeyAgreement.PrivateKey()
         ephemeral = e

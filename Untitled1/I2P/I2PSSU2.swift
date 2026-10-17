@@ -1386,6 +1386,14 @@ final class SSU2Transport {
         guard listener == nil else { return listenerPort ?? port }
         let nwListener = try NWListener(using: NWParameters.udp,
                                         on: NWEndpoint.Port(rawValue: port) ?? .any)
+        // The ephemeral binding completes asynchronously (notably slower on
+        // device): publish the assigned port once the listener reaches ready.
+        nwListener.stateUpdateHandler = { [weak self, weak nwListener] state in
+            guard state == .ready, let self, let nwListener else { return }
+            self.lock.lock()
+            self.listenerPort = nwListener.port?.rawValue ?? self.listenerPort
+            self.lock.unlock()
+        }
         nwListener.newConnectionHandler = { [weak self] connection in
             guard let self else { return }
             self.registerFlow(connection)
@@ -2088,7 +2096,17 @@ enum I2PSSU2SelfTest {
         let transport = SSU2Transport(localStaticKey: bobKey, introKey: bobIntroKey,
                                       localRouterInfo: bobRI,
                                       publishedEndpoint: SSU2Endpoint(host: "127.0.0.1", port: 8888))
-        let port = try transport.startListener(port: 0)
+        _ = try transport.startListener(port: 0)
+        // The listener binds asynchronously; wait for the state handler to
+        // publish the assigned ephemeral port (near-instant on the simulator,
+        // slower on device).
+        var port = transport.listenerPort ?? 0
+        var waited = 0.0
+        while port == 0 && waited < 5 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            waited += 0.1
+            port = transport.listenerPort ?? 0
+        }
         guard port > 0 else { throw SSU2Error.testFailed("no listener port") }
 
         let responderEstablished = Expectation()
