@@ -211,6 +211,11 @@ final class SSU2InitiatorHandshake {
             token: Data(repeating: 0, count: 8))
         var packet = header.serialize()
         packet.append(ssu2Timestamp(Date()))
+        if packet.count < 40 {
+            // Header masking derives its IVs from the packet tail; the minimum
+            // datagram is 40 bytes (16 header + 24 tail). Pad up to it.
+            packet.append(I2PCrypto.randomBytes(40 - packet.count))
+        }
         try SSU2HeaderProtection.maskHeader(&packet, phase: .sessionRequest, introKey: introKey)
         stage = .awaitingRetryOrCreated
         return packet
@@ -232,7 +237,10 @@ final class SSU2InitiatorHandshake {
         let responderStatic = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: remoteStaticKey)
         let es = try ephemeral.sharedSecretFromKeyAgreement(with: responderStatic)
         chain.mixKey(es.withUnsafeBytes { Data($0) })
-        let staticPlain = localStaticKey.publicKey.rawRepresentation + Data(repeating: 0, count: 16)
+        // The encrypted static-key section is exactly 48 bytes on the wire
+        // (32-byte ciphertext + 16-byte tag of the key alone, per the spec
+        // SessionRequest layout the receiver slices at 64..<112).
+        let staticPlain = localStaticKey.publicKey.rawRepresentation
         packet.append(try chain.encrypt(staticPlain))
         let ss = try localStaticKey.sharedSecretFromKeyAgreement(with: responderStatic)
         chain.mixKey(ss.withUnsafeBytes { Data($0) })
@@ -345,6 +353,11 @@ final class SSU2ResponderHandshake {
             type: .retry, sourceConnectionID: localConnectionID, token: token)
         var packet = header.serialize()
         packet.append(ssu2Timestamp(Date()))
+        if packet.count < 40 {
+            // Masking needs the 40-byte minimum; pad to it (padding is ignored
+            // by the receiver, which reads the header and timestamp only).
+            packet.append(I2PCrypto.randomBytes(40 - packet.count))
+        }
         try SSU2HeaderProtection.maskHeader(&packet, phase: .retry, introKey: introKey)
         return packet
     }
@@ -421,7 +434,8 @@ final class SSU2ResponderHandshake {
         let aliceEphemeral = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: aliceEphemeralPub!)
         let ee = try ephemeral.sharedSecretFromKeyAgreement(with: aliceEphemeral)
         chain.mixKey(ee.withUnsafeBytes { Data($0) })
-        let staticPlain = localStaticKey.publicKey.rawRepresentation + Data(repeating: 0, count: 16)
+        // 48-byte encrypted static-key section: 32-byte ciphertext + tag.
+        let staticPlain = localStaticKey.publicKey.rawRepresentation
         packet.append(try chain.encrypt(staticPlain))
 
         let aliceStatic = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: aliceStaticPub!)
@@ -763,6 +777,9 @@ final class SSU2RelayCoordinator {
         var packet = header.serialize()
         var value = nonce.bigEndian
         packet.append(contentsOf: withUnsafeBytes(of: &value) { Data($0) })
+        if packet.count < 40 {
+            packet.append(I2PCrypto.randomBytes(40 - packet.count))
+        }
         try SSU2HeaderProtection.maskHeader(&packet, phase: .holePunch, introKey: introKey)
         phase = .holePunchSent
         return packet
@@ -1398,6 +1415,8 @@ final class SSU2Transport {
             guard let self else { return }
             self.registerFlow(connection)
             connection.start(queue: self.queue)
+            // Accepted flows must be read or inbound datagrams never arrive.
+            self.receiveOn(connection)
         }
         nwListener.start(queue: queue)
         listener = nwListener

@@ -331,7 +331,11 @@ enum I2PProductionAudit {
             throw I2PMainnetFailure(message: "8-byte timestamp not encoded as big-endian milliseconds since epoch")
         }
         var reader = I2PReader(bytes)
-        guard try reader.integer() == 0x11223344, try reader.short() == 0xBEEF, reader.remaining == 40 else {
+        guard try reader.integer() == 0x11223344, try reader.short() == 0xBEEF else {
+            throw I2PMainnetFailure(message: "decoder did not mirror the encoder layout")
+        }
+        _ = try reader.hash()
+        guard reader.remaining == 8 else {
             throw I2PMainnetFailure(message: "decoder did not mirror the encoder layout")
         }
         guard let date = try reader.date(), abs(date.timeIntervalSince1970 - 1_000_000) < 0.5 else {

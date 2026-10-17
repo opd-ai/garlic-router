@@ -87,11 +87,17 @@ enum I2PCrypto {
             nonce: ChaChaPoly.Nonce(data: nonce),
             authenticating: aad
         )
-        return box.combined
+        // Wire format: ciphertext || tag. The nonce rides implicitly (it is an
+        // input to this call), never prefixed onto the output blob.
+        return box.ciphertext + box.tag
     }
 
     static func chacha20Poly1305Open(key: Data, nonce: Data, ciphertextAndTag: Data, aad: Data = Data()) throws -> Data {
-        let box = try ChaChaPoly.SealedBox(combined: ciphertextAndTag)
+        guard ciphertextAndTag.count > 16 else { throw I2PWireError.invalidFormat }
+        let box = ChaChaPoly.SealedBox(
+            nonce: ChaChaPoly.Nonce(data: nonce),
+            ciphertext: ciphertextAndTag.subdata(in: 0..<(ciphertextAndTag.count - 16)),
+            tag: ciphertextAndTag.subdata(in: (ciphertextAndTag.count - 16)..<ciphertextAndTag.count))
         return try ChaChaPoly.open(box, using: SymmetricKey(data: key), authenticating: aad)
     }
 

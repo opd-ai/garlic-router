@@ -70,6 +70,8 @@ struct NTCP2NoiseChain {
 
     /// Noise EncryptWithAd: AEAD under the current key with `h` as associated
     /// data, then MixHash of the ciphertext. Nonce resets on every MixKey.
+    /// The wire format is ciphertext || tag (the nonce rides implicitly in the
+    /// counter, never on the wire).
     mutating func encrypt(_ plaintext: Data) throws -> Data {
         guard let key else { throw NTCP2Error.handshakeFailed("EncryptWithAd without a key") }
         let box = try ChaChaPoly.seal(plaintext,
@@ -77,17 +79,19 @@ struct NTCP2NoiseChain {
                                       nonce: Self.nonce96(nonce),
                                       authenticating: hash)
         nonce += 1
-        let ciphertext = box.combined
+        let ciphertext = box.ciphertext + box.tag
         mixHash(ciphertext)
         return ciphertext
     }
 
-    /// Noise DecryptWithAd.
+    /// Noise DecryptWithAd over a ciphertext || tag wire blob.
     mutating func decrypt(_ ciphertext: Data) throws -> Data {
         guard let key else { throw NTCP2Error.handshakeFailed("DecryptWithAd without a key") }
-        let box: ChaChaPoly.SealedBox
-        do { box = try ChaChaPoly.SealedBox(combined: ciphertext) }
-        catch { throw NTCP2Error.decryptFailed }
+        guard ciphertext.count > 16 else { throw NTCP2Error.decryptFailed }
+        let box = ChaChaPoly.SealedBox(
+            nonce: Self.nonce96(nonce),
+            ciphertext: ciphertext.subdata(in: 0..<(ciphertext.count - 16)),
+            tag: ciphertext.subdata(in: (ciphertext.count - 16)..<ciphertext.count))
         guard let plaintext = try? ChaChaPoly.open(box, using: SymmetricKey(data: key), authenticating: hash) else {
             throw NTCP2Error.decryptFailed
         }
@@ -397,7 +401,7 @@ final class NTCP2FrameCodec {
         let box = try ChaChaPoly.seal(payload,
                                       using: SymmetricKey(data: aeadKey),
                                       nonce: NTCP2NoiseChain.nonce96(counter))
-        let ciphertext = box.combined
+        let ciphertext = box.ciphertext + box.tag
         let mask = lengthMask(counter)
         let obfuscated = UInt16(ciphertext.count) ^ mask
         counter += 1
@@ -417,7 +421,12 @@ final class NTCP2FrameCodec {
         guard length >= 16 else { throw NTCP2Error.invalidFrame }
         let total = 2 + Int(length)
         guard bytes.count >= total else { return nil }
-        let box = try ChaChaPoly.SealedBox(combined: Data(bytes[2..<total]))
+        let body = Data(bytes[2..<total])
+        guard body.count > 16 else { throw NTCP2Error.invalidFrame }
+        let box = ChaChaPoly.SealedBox(
+            nonce: NTCP2NoiseChain.nonce96(counter),
+            ciphertext: body.subdata(in: 0..<(body.count - 16)),
+            tag: body.subdata(in: (body.count - 16)..<body.count))
         guard let payload = try? ChaChaPoly.open(box, using: SymmetricKey(data: aeadKey), authenticating: Data()) else {
             throw NTCP2Error.decryptFailed
         }
