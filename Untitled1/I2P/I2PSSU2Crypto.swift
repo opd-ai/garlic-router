@@ -129,6 +129,9 @@ struct SSU2PacketHeader {
     static let networkID: UInt8 = 2
 
     let isLong: Bool
+    /// Long-header handshake version: 2 = classical Noise_XK, 3 = ML-KEM-512
+    /// hybrid, 4 = ML-KEM-768 hybrid (short headers do not carry a version).
+    let version: UInt8
     let destinationConnectionID: Data // 8 bytes
     let packetNumber: UInt32
     let type: SSU2MessageType
@@ -142,13 +145,16 @@ struct SSU2PacketHeader {
     let totalFragments: Int
 
     /// A long header with all fields explicit. `sourceConnectionID` and
-    /// `token` must both be 8 bytes.
+    /// `token` must both be 8 bytes. `version` defaults to the classical
+    /// handshake; hybrid offers pass the ML-KEM long-header variant here.
     init(destinationConnectionID: Data, packetNumber: UInt32, type: SSU2MessageType,
-         flags: UInt8 = 0, sourceConnectionID: Data? = nil, token: Data? = nil) {
+         flags: UInt8 = 0, sourceConnectionID: Data? = nil, token: Data? = nil,
+         version: UInt8 = SSU2PacketHeader.version) {
         precondition(destinationConnectionID.count == 8, "connection IDs are 8 bytes")
         if let sourceConnectionID { precondition(sourceConnectionID.count == 8, "connection IDs are 8 bytes") }
         if let token { precondition(token.count == 8, "tokens are 8 bytes") }
         isLong = true
+        self.version = version
         self.destinationConnectionID = destinationConnectionID
         self.packetNumber = packetNumber
         self.type = type
@@ -167,6 +173,7 @@ struct SSU2PacketHeader {
         precondition(totalFragments >= 1 && totalFragments <= 15, "up to 15 fragments")
         precondition(fragmentIndex >= 0 && fragmentIndex < totalFragments, "fragment index out of range")
         isLong = false
+        version = SSU2PacketHeader.version
         destinationConnectionID = shortDestinationConnectionID
         self.packetNumber = packetNumber
         self.type = type
@@ -198,7 +205,7 @@ struct SSU2PacketHeader {
         w.raw(withUnsafeBytes(of: &pn) { Data($0) })
         w.byte(type.rawValue)
         if isLong {
-            w.byte(SSU2PacketHeader.version)
+            w.byte(version)
             w.byte(SSU2PacketHeader.networkID)
             w.byte(flags)
             w.raw(sourceConnectionID ?? Data(repeating: 0, count: 8))
@@ -233,16 +240,26 @@ struct SSU2PacketHeader {
                 fragmentIndex: Int(fragmentByte >> 4), totalFragments: Int(fragmentByte & 0x0f) + 1)
             return header
         }
-        // Long header.
+        // Long header. Versions 2 (classical Noise_XK) and 3/4 (the ML-KEM
+        // hybrid variants) are accepted; anything else fails closed.
         guard bytes.count >= longLength else { throw SSU2Error.invalidHeader }
-        guard bytes[13] == SSU2PacketHeader.version else { throw SSU2Error.unsupportedVersion }
+        guard bytes[13] == 2 || bytes[13] == 3 || bytes[13] == 4 else {
+            throw SSU2Error.unsupportedVersion
+        }
         guard bytes[14] == SSU2PacketHeader.networkID else { throw SSU2Error.unsupportedNetworkID }
         let header = SSU2PacketHeader(
             destinationConnectionID: dst, packetNumber: pn, type: type,
             flags: bytes[15],
             sourceConnectionID: Data(bytes[16..<24]),
-            token: Data(bytes[24..<32]))
+            token: Data(bytes[24..<32]),
+            version: bytes[13])
         return header
+    }
+
+    /// The ML-KEM hybrid leg bound to this long header
+    /// (nil for the classical version-2 handshake).
+    var pqVersion: I2PSSU2PQVersion? {
+        I2PSSU2PQVersion(rawValue: version)
     }
 }
 

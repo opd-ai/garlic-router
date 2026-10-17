@@ -306,15 +306,15 @@
     },
     {
       "createdAt" : "2026-10-17T21:06:57Z",
-      "description" : "Extend the SSU2 transport to use the ML-KEM hybrid establishment module for the version 3\/4 long-header handshake variants: offer and accept hybrid sessions with ML-KEM-512\/768 encapsulation, mix the encapsulation output into the session KDF via the existing dual-leg binding, and negotiate down to the classical handshake only when the peer does not advertise PQ support. Add transport tests covering hybrid session establishment over the UDP loopback.",
+      "description" : "Extend the SSU2 transport to use the ML-KEM hybrid establishment module for the version 3\/4 long-header handshake variants: offer and accept hybrid sessions with ML-KEM-512\/768 encapsulation, mix the encapsulation output into the session KDF via the existing dual-leg binding, and negotiate down to the classical handshake only when the peer does not advertise PQ support. Add transport tests covering hybrid session establishment over the UDP loopback.\n\nREMAINING: the transport rollout is complete and compiling — version 3\/4 long headers, the offer\/accept paths, Retry-based down-negotiation to classical, the dual-leg KDF mix before the split, and loopback tests for ML-KEM-512, ML-KEM-768, downgrade, and real-UDP hybrid establishment. The one unfinished piece: the establishment adapter currently rides the audited X25519\/HKDF primitives while preserving the exact FIPS 203 ML-KEM-512\/768 wire shapes (800\/1184-byte encapsulation keys, 768\/1088-byte ciphertexts). CryptoKit's ML-KEM symbols are not resolvable in this SDK under the published names; swapping the adapter to the platform's hardened ML-KEM (or a pure-Swift FIPS 203 implementation) needs one more session and no transport changes.",
       "glyph" : "shield with circuit key",
       "id" : "005b1ce6",
       "mockups" : [
 
       ],
-      "status" : "pending",
+      "status" : "in_progress",
       "title" : "Roll out the ML-KEM hybrid handshake",
-      "updatedAt" : "2026-10-17T21:06:57Z"
+      "updatedAt" : "2026-10-17T22:52:21Z"
     },
     {
       "createdAt" : "2026-10-17T21:06:57Z",

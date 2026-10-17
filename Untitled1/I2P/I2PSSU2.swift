@@ -178,6 +178,10 @@ final class SSU2InitiatorHandshake {
 
     private(set) var stage: Stage = .idle
     private(set) var remoteConnectionID: Data?
+    /// The offered ML-KEM hybrid leg (nil = classical handshake in progress).
+    private(set) var pqLeg: I2PSSU2PQVersion?
+    private let remoteMLKEMKey: I2PMLKEMPublicKey?
+    private var pendingEncapsulation: I2PMLKEMEncapsulation?
 
     private var chain = NTCP2NoiseChain()
     private let localStaticKey: Curve25519.KeyAgreement.PrivateKey
@@ -193,11 +197,16 @@ final class SSU2InitiatorHandshake {
     }
 
     init(localStaticKey: Curve25519.KeyAgreement.PrivateKey,
-         remoteStaticKey: Data, introKey: Data) {
+         remoteStaticKey: Data, introKey: Data,
+         remoteMLKEMKey: I2PMLKEMPublicKey? = nil) {
         precondition(remoteStaticKey.count == 32 && introKey.count == 32)
         self.localStaticKey = localStaticKey
         self.remoteStaticKey = remoteStaticKey
         self.introKey = introKey
+        // The PQ leg is offered only when the peer advertises an ML-KEM
+        // encapsulation key; the long-header version byte binds the offer.
+        self.remoteMLKEMKey = remoteMLKEMKey
+        self.pqLeg = remoteMLKEMKey?.version
     }
 
     /// TokenRequest (type 10): a long-header packet addressed to the responder's
@@ -229,7 +238,8 @@ final class SSU2InitiatorHandshake {
         let header = SSU2PacketHeader(
             destinationConnectionID: SSU2InitiatorHandshake.responderConnectionID(for: remoteStaticKey),
             packetNumber: 0, type: .sessionRequest,
-            sourceConnectionID: localConnectionID, token: token)
+            sourceConnectionID: localConnectionID, token: token,
+            version: pqLeg?.rawValue ?? SSU2PacketHeader.version)
         aliceHeader = header.serialize()
         chain.mixHash(aliceHeader!)
         var packet = aliceHeader! + ephemeral.publicKey.rawRepresentation
@@ -247,6 +257,16 @@ final class SSU2InitiatorHandshake {
         var payload = ssu2Timestamp(Date())
         payload.append(contentsOf: Data("SSU2".utf8))
         packet.append(try chain.encrypt(payload))
+        if let pqLeg, let remoteMLKEMKey {
+            // Hybrid offer: the FIPS 203 ENCAPS ciphertext rides after the
+            // options section, and the version byte binds the peer to this
+            // ciphertext shape (768 bytes for ML-KEM-512, 1088 for ML-KEM-768).
+            let encapsulation = try remoteMLKEMKey.encapsulate()
+            try I2PPQHybrid.validateVersionBinding(versionRawValue: pqLeg.rawValue,
+                                                   encapsulation: encapsulation)
+            packet.append(encapsulation.ciphertext)
+            pendingEncapsulation = encapsulation
+        }
 
         try SSU2HeaderProtection.obfuscateEphemeralRegion(&packet, introKey: introKey,
                                                           responderStaticKey: remoteStaticKey)
@@ -256,10 +276,11 @@ final class SSU2InitiatorHandshake {
     }
 
     /// Retry (type 9): unmasked with the retry phase key; the fresh token rides
-    /// in the header token field. Returns the token for the token cache.
+    /// in the header token field. Returns the token for the token cache. A Retry
+    /// doubles as the responder's no-PQ signal when a hybrid offer is outstanding.
     func processRetry(_ packet: Data) throws -> Data {
-        guard stage == .awaitingRetryOrCreated else {
-            throw SSU2Error.handshakeFailed("Retry outside the token-request stage")
+        guard stage == .awaitingRetryOrCreated || stage == .awaitingCreated else {
+            throw SSU2Error.handshakeFailed("Retry outside the request stages")
         }
         var masked = Data(packet)
         try SSU2HeaderProtection.unmaskHeader(&masked, phase: .retry, introKey: introKey)
@@ -290,6 +311,15 @@ final class SSU2InitiatorHandshake {
               let bobSource = header.sourceConnectionID else {
             throw SSU2Error.invalidPacket
         }
+        // The PQ negotiation is bound to the version byte: a hybrid offer is
+        // only satisfied by a hybrid SessionCreated of the same shape.
+        if let pqLeg {
+            guard header.pqVersion == pqLeg, let pendingEncapsulation else {
+                throw SSU2Error.handshakeFailed("hybrid SessionCreated missing the offered PQ leg")
+            }
+        } else if header.pqVersion != nil {
+            throw SSU2Error.handshakeFailed("unoffered PQ version in SessionCreated")
+        }
         guard header.destinationConnectionID == aliceHeader?.subdata(in: 16..<24) else {
             throw SSU2Error.handshakeFailed("SessionCreated not addressed to this initiator")
         }
@@ -307,7 +337,19 @@ final class SSU2InitiatorHandshake {
         let se = try localStaticKey.sharedSecretFromKeyAgreement(with: bobEphemeral)
         chain.mixKey(se.withUnsafeBytes { Data($0) })
         _ = try chain.decrypt(masked.subdata(in: 112..<masked.count))
+        if let encapsulation = pendingEncapsulation {
+            // Dual-leg binding: mix the ML-KEM encapsulation output into the
+            // session KDF before the split, so the split rides both legs.
+            I2PSSU2PQKDF.mix(&chain, encapsulation: encapsulation)
+        }
         stage = .confirmed
+    }
+
+    /// Down-negotiation: the peer signaled no PQ support (a Retry while a
+    /// hybrid offer was outstanding), so the handshake continues classically.
+    func downgradeToClassical() {
+        pqLeg = nil
+        pendingEncapsulation = nil
     }
 
     /// Noise Split() after the last handshake message was processed.
@@ -329,6 +371,10 @@ final class SSU2ResponderHandshake {
     private(set) var remoteStaticKey: Data?
     private(set) var requesterConnectionID: Data?
     private(set) var validatedToken: Data?
+    /// The accepted ML-KEM hybrid leg (nil = classical handshake in progress).
+    private(set) var negotiatedPQ: I2PSSU2PQVersion?
+    private let localMLKEMSecretKey: I2PMLKEMSecretKey?
+    private var acceptedEncapsulation: I2PMLKEMEncapsulation?
     private var aliceEphemeralPub: Data?
     private var aliceStaticPub: Data?
 
@@ -339,11 +385,13 @@ final class SSU2ResponderHandshake {
     private let tokenManager: SSU2TokenManager
 
     init(localStaticKey: Curve25519.KeyAgreement.PrivateKey, localConnectionID: Data,
-         introKey: Data, tokenManager: SSU2TokenManager) {
+         introKey: Data, tokenManager: SSU2TokenManager,
+         localMLKEMSecretKey: I2PMLKEMSecretKey? = nil) {
         self.localStaticKey = localStaticKey
         self.localConnectionID = localConnectionID
         self.introKey = introKey
         self.tokenManager = tokenManager
+        self.localMLKEMSecretKey = localMLKEMSecretKey
     }
 
     /// Retry (type 9) carrying a fresh token in the header token field.
@@ -396,6 +444,14 @@ final class SSU2ResponderHandshake {
         guard header.destinationConnectionID == localConnectionID else {
             throw SSU2Error.invalidPacket
         }
+        // Hybrid offer gate: when the peer offered the ML-KEM leg (version 3/4)
+        // but this responder holds no matching ML-KEM key, a Retry signals the
+        // classical handshake — the initiator down-negotiates and retries.
+        let offeredPQ = header.pqVersion
+        if let offeredPQ, localMLKEMSecretKey?.version != offeredPQ {
+            guard let fresh = tokenManager.issue(for: source) else { return Data() }
+            return try makeRetry(for: source, token: fresh)
+        }
         guard tokenManager.validate(token, for: source) else {
             guard let fresh = tokenManager.issue(for: source) else { return Data() }
             return try makeRetry(for: source, token: fresh)
@@ -408,13 +464,31 @@ final class SSU2ResponderHandshake {
         self.aliceEphemeralPub = aliceEphemeralPub.rawRepresentation
         let es = try localStaticKey.sharedSecretFromKeyAgreement(with: aliceEphemeralPub)
         chain.mixKey(es.withUnsafeBytes { Data($0) })
+        // Hybrid offers append the FIPS 203 ciphertext after the options
+        // section; its length is bound to the version byte, so the options
+        // section ends where the ML-KEM ciphertext begins.
+        let optionsEnd = masked.count - (offeredPQ?.mlKemCiphertextLength ?? 0)
+        guard optionsEnd >= 112 else { throw SSU2Error.invalidPacket }
         let staticPlain = try chain.decrypt(masked.subdata(in: 64..<112))
         remoteStaticKey = staticPlain.prefix(32)
         self.aliceStaticPub = remoteStaticKey
         let aliceStatic = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: remoteStaticKey!)
         let ss = try localStaticKey.sharedSecretFromKeyAgreement(with: aliceStatic)
         chain.mixKey(ss.withUnsafeBytes { Data($0) })
-        _ = try chain.decrypt(masked.subdata(in: 112..<masked.count))
+        _ = try chain.decrypt(masked.subdata(in: 112..<optionsEnd))
+        if let offeredPQ, let localMLKEMSecretKey {
+            // Hybrid accept: decapsulate the FIPS 203 ciphertext and bind the
+            // ciphertext shape to the long-header version byte. The shared
+            // secret mixes into the session KDF before the split (dual-leg
+            // binding), so a classical-only peer derives different material.
+            let ciphertext = masked.subdata(in: optionsEnd..<masked.count)
+            let secret = try localMLKEMSecretKey.decapsulate(ciphertext)
+            let encapsulation = try I2PMLKEMEncapsulation(ciphertext: ciphertext, sharedSecret: secret)
+            try I2PPQHybrid.validateVersionBinding(versionRawValue: offeredPQ.rawValue,
+                                                   encapsulation: encapsulation)
+            acceptedEncapsulation = encapsulation
+        }
+        negotiatedPQ = offeredPQ
         return try makeSessionCreated()
     }
 
@@ -427,7 +501,8 @@ final class SSU2ResponderHandshake {
         let ephemeral = Curve25519.KeyAgreement.PrivateKey()
         let header = SSU2PacketHeader(
             destinationConnectionID: requesterConnectionID!, packetNumber: 0,
-            type: .sessionCreated, sourceConnectionID: localConnectionID)
+            type: .sessionCreated, sourceConnectionID: localConnectionID,
+            version: negotiatedPQ?.rawValue ?? SSU2PacketHeader.version)
         chain.mixHash(header.serialize())
         var packet = header.serialize() + ephemeral.publicKey.rawRepresentation
 
@@ -444,6 +519,11 @@ final class SSU2ResponderHandshake {
         var payload = ssu2Timestamp(Date())
         payload.append(contentsOf: Data("SSU2".utf8))
         packet.append(try chain.encrypt(payload))
+        if let encapsulation = acceptedEncapsulation {
+            // The initiator mixes at the same chain point after decrypting this
+            // payload; mixing here keeps both sides' split states aligned.
+            I2PSSU2PQKDF.mix(&chain, encapsulation: encapsulation)
+        }
 
         try SSU2HeaderProtection.obfuscateEphemeralRegion(&packet, introKey: introKey,
                                                           responderStaticKey: localStaticKey.publicKey.rawRepresentation)
@@ -838,6 +918,11 @@ final class SSU2Session {
     private let localStaticKey: Curve25519.KeyAgreement.PrivateKey
     private let remoteStaticKey: Data?
     private let introKey: Data
+    /// Our ML-KEM capability for accepting hybrid sessions (responder side).
+    private let localMLKEMSecretKey: I2PMLKEMSecretKey?
+    /// The peer's advertised ML-KEM encapsulation key (initiator side; nil =
+    /// the peer does not advertise PQ support, so the handshake stays classical).
+    private let remoteMLKEMKey: I2PMLKEMPublicKey?
     private let localRouterInfoData: Data
     var tokenCache = SSU2TokenCache()
     private var tokenManager: SSU2TokenManager
@@ -860,17 +945,27 @@ final class SSU2Session {
 
     var isEstablished: Bool { state == .established }
 
+    /// The negotiated hybrid leg for this session
+    /// (nil = the handshake completed classically).
+    var negotiatedPQVersion: I2PSSU2PQVersion? {
+        role == .initiator ? initiator?.pqLeg : responder?.negotiatedPQ
+    }
+
     init(role: Role,
          localStaticKey: Curve25519.KeyAgreement.PrivateKey,
          remoteStaticKey: Data?,
          remoteIntroKey: Data,
          localRouterInfo: I2PRouterInfo,
          tokenManager: SSU2TokenManager = SSU2TokenManager(),
-         publishedEndpoint: SSU2Endpoint? = nil) {
+         publishedEndpoint: SSU2Endpoint? = nil,
+         mlKemSecretKey: I2PMLKEMSecretKey? = nil,
+         remoteMLKEMKeyData: Data? = nil) {
         self.role = role
         self.localStaticKey = localStaticKey
         self.remoteStaticKey = remoteStaticKey
         self.introKey = remoteIntroKey
+        self.localMLKEMSecretKey = mlKemSecretKey
+        self.remoteMLKEMKey = try? I2PMLKEMPublicKey(keyData: remoteMLKEMKeyData ?? Data())
         self.localRouterInfoData = localRouterInfo.serialize()
         self.tokenManager = tokenManager
         self.publishedEndpoint = publishedEndpoint
@@ -911,7 +1006,8 @@ final class SSU2Session {
             throw SSU2Error.handshakeFailed("initiator without remote static key")
         }
         let engine = SSU2InitiatorHandshake(localStaticKey: localStaticKey,
-                                            remoteStaticKey: remoteStaticKey, introKey: introKey)
+                                            remoteStaticKey: remoteStaticKey, introKey: introKey,
+                                            remoteMLKEMKey: remoteMLKEMKey)
         initiator = engine
         let token: Data?
         if forceInvalidToken {
@@ -1002,6 +1098,12 @@ final class SSU2Session {
                 if let remoteStaticKey {
                     tokenCache.store(token: token, for: remoteStaticKey)
                 }
+                if engine.pqLeg != nil {
+                    // A Retry while a hybrid offer is outstanding is the
+                    // responder's no-PQ signal: the handshake falls back to
+                    // the classical long-header variant.
+                    engine.downgradeToClassical()
+                }
                 try enqueue(try engine.makeSessionRequest(localConnectionID: localConnectionID, token: token))
                 state = .requested
                 return
@@ -1026,7 +1128,8 @@ final class SSU2Session {
             if responder == nil {
                 responder = SSU2ResponderHandshake(localStaticKey: localStaticKey,
                                                    localConnectionID: localConnectionID,
-                                                   introKey: introKey, tokenManager: tokenManager)
+                                                   introKey: introKey, tokenManager: tokenManager,
+                                                   localMLKEMSecretKey: localMLKEMSecretKey)
             }
             switch header.type {
             case .tokenRequest:
@@ -1035,7 +1138,13 @@ final class SSU2Session {
             case .sessionRequest:
                 let created = try responder!.processSessionRequest(unmasked)
                 guard !created.isEmpty else { return } // rate-limited, silent drop
-                remoteConnectionID = responder!.requesterConnectionID
+                guard let requesterID = responder!.requesterConnectionID else {
+                    // A no-PQ downgrade Retry: no handshake state advanced, so
+                    // deliver the Retry and wait for the classical request.
+                    try enqueue(created)
+                    return
+                }
+                remoteConnectionID = requesterID
                 try SSU2PacketHeader.validatePair(localConnectionID, remoteConnectionID!)
                 // Split after the SessionCreated construction so the chaining
                 // key state matches the initiator's split point exactly.
@@ -1379,6 +1488,9 @@ final class SSU2Transport {
     private let introKey: Data
     private let localRouterInfo: I2PRouterInfo
     private let publishedEndpoint: SSU2Endpoint?
+    /// Our ML-KEM capability for hybrid sessions; spawned responder sessions
+    /// accept hybrid offers, and initiator sessions carry it for symmetry.
+    private let mlKemSecretKey: I2PMLKEMSecretKey?
     private let queue = DispatchQueue(label: "i2p.ssu2.transport")
     private let lock = NSLock()
     private var listener: NWListener?
@@ -1388,11 +1500,13 @@ final class SSU2Transport {
     private var tokenManager = SSU2TokenManager()
 
     init(localStaticKey: Curve25519.KeyAgreement.PrivateKey, introKey: Data,
-         localRouterInfo: I2PRouterInfo, publishedEndpoint: SSU2Endpoint? = nil) {
+         localRouterInfo: I2PRouterInfo, publishedEndpoint: SSU2Endpoint? = nil,
+         mlKemSecretKey: I2PMLKEMSecretKey? = nil) {
         self.localStaticKey = localStaticKey
         self.introKey = introKey
         self.localRouterInfo = localRouterInfo
         self.publishedEndpoint = publishedEndpoint
+        self.mlKemSecretKey = mlKemSecretKey
     }
 
     /// Starts the UDP listener; port 0 binds an ephemeral port.
@@ -1427,11 +1541,13 @@ final class SSU2Transport {
     /// Opens an outbound session toward a peer; the token-request path runs
     /// automatically and the session reports establishment via the delegate.
     @discardableResult
-    func connect(host: String, port: UInt16, remoteStaticKey: Data, remoteIntroKey: Data) throws -> SSU2Session {
+    func connect(host: String, port: UInt16, remoteStaticKey: Data, remoteIntroKey: Data,
+                 remoteMLKEMKey: Data? = nil) throws -> SSU2Session {
         let endpoint = SSU2Endpoint(host: host, port: port)
         let session = SSU2Session(role: .initiator, localStaticKey: localStaticKey,
                                   remoteStaticKey: remoteStaticKey, remoteIntroKey: remoteIntroKey,
-                                  localRouterInfo: localRouterInfo, publishedEndpoint: publishedEndpoint)
+                                  localRouterInfo: localRouterInfo, publishedEndpoint: publishedEndpoint,
+                                  mlKemSecretKey: mlKemSecretKey, remoteMLKEMKeyData: remoteMLKEMKey)
         session.delegate = self
         let connection = NWConnection(host: NWEndpoint.Host(host),
                                       port: NWEndpoint.Port(rawValue: port) ?? .any,
@@ -1524,7 +1640,8 @@ final class SSU2Transport {
                                   remoteStaticKey: nil, remoteIntroKey: introKey,
                                   localRouterInfo: localRouterInfo,
                                   tokenManager: tokenManager,
-                                  publishedEndpoint: publishedEndpoint)
+                                  publishedEndpoint: publishedEndpoint,
+                                  mlKemSecretKey: mlKemSecretKey)
         session.delegate = self
         lock.lock()
         sessionsByEndpoint[key] = session
@@ -1617,10 +1734,21 @@ enum I2PSSU2SelfTest {
                   parsed.token == Data(repeating: 0x5A, count: 8), parsed.isLong else {
                 throw SSU2Error.invalidHeader
             }
-            // Version and network ID validation.
+            // Version and network ID validation: versions 2/3/4 accepted (3/4 bind
+            // the ML-KEM hybrid legs), anything else fails closed.
             var bad = bytes
-            bad[13] = 3
+            bad[13] = 5
             guard (try? SSU2PacketHeader.parse(Data(bad))) == nil else { throw SSU2Error.unsupportedVersion }
+            var v3 = bytes
+            v3[13] = 3
+            guard try SSU2PacketHeader.parse(Data(v3)).pqVersion == .mlKem512 else {
+                throw SSU2Error.testFailed("version 3 lost its ML-KEM-512 binding")
+            }
+            var v4 = bytes
+            v4[13] = 4
+            guard try SSU2PacketHeader.parse(Data(v4)).pqVersion == .mlKem768 else {
+                throw SSU2Error.testFailed("version 4 lost its ML-KEM-768 binding")
+            }
             var badNet = bytes
             badNet[14] = 9
             guard (try? SSU2PacketHeader.parse(Data(badNet))) == nil else { throw SSU2Error.unsupportedNetworkID }
@@ -1641,7 +1769,7 @@ enum I2PSSU2SelfTest {
             guard SSU2PacketHeader.randomConnectionID(distinctFrom: dst) != dst else {
                 throw SSU2Error.invalidHeader
             }
-            return "32-byte long + 16-byte short headers round-tripped; version/netID/connID rules enforced"
+            return "32-byte long + 16-byte short headers round-tripped; versions 2/3/4 accepted (3/4 = ML-KEM hybrid legs), netID/connID rules enforced"
         }
 
         run("SSU2 header protection · 7 phases, tail-IV masking, phase detection") {
@@ -2022,6 +2150,93 @@ enum I2PSSU2SelfTest {
             return "encrypted I2NP data delivered end-to-end; RouterInfo exchanged in the SessionConfirmed"
         }
 
+        run("SSU2 PQ hybrid · ML-KEM-512 (version 3) offer and accept on the loopback") {
+            let bobPQ = I2PMLKEMSecretKey(version: .mlKem512)
+            let (alice, bob) = try loopbackPair(aliceKey: Curve25519.KeyAgreement.PrivateKey(),
+                                                bobKey: Curve25519.KeyAgreement.PrivateKey(),
+                                                bobMLKEMSecret: bobPQ,
+                                                bobAdvertisedPQKey: bobPQ.encapsulationKeyData)
+            guard alice.negotiatedPQVersion == .mlKem512, bob.negotiatedPQVersion == .mlKem512 else {
+                throw SSU2Error.testFailed("hybrid leg not negotiated to ML-KEM-512")
+            }
+            // Dual-leg binding: only peers that completed BOTH legs derive the
+            // same split keys — the end-to-end data phase under those keys proves it.
+            var received: [Data] = []
+            bob.delegate = LoopbackDelegate(onData: { received.append($0) })
+            let message = I2NPMessage(type: .dataMessage, payload: Data("pq hybrid 512 e2e".utf8)).serialize()
+            try alice.sendData(message)
+            pumpBoth(alice, bob)
+            guard received == [message] else { throw SSU2Error.testFailed("hybrid data phase lost") }
+            return "v3 offer with a 768-byte FIPS 203 ML-KEM-512 ENCAPS; accepted, decapsulated, dual-leg keys mirrored, data delivered end-to-end"
+        }
+
+        run("SSU2 PQ hybrid · ML-KEM-768 (version 4) offer and accept on the loopback") {
+            let bobPQ = I2PMLKEMSecretKey(version: .mlKem768)
+            let (alice, bob) = try loopbackPair(aliceKey: Curve25519.KeyAgreement.PrivateKey(),
+                                                bobKey: Curve25519.KeyAgreement.PrivateKey(),
+                                                bobMLKEMSecret: bobPQ,
+                                                bobAdvertisedPQKey: bobPQ.encapsulationKeyData)
+            guard alice.negotiatedPQVersion == .mlKem768, bob.negotiatedPQVersion == .mlKem768 else {
+                throw SSU2Error.testFailed("hybrid leg not negotiated to ML-KEM-768")
+            }
+            var received: [Data] = []
+            bob.delegate = LoopbackDelegate(onData: { received.append($0) })
+            let message = I2NPMessage(type: .dataMessage, payload: Data("pq hybrid 768 e2e".utf8)).serialize()
+            try alice.sendData(message)
+            pumpBoth(alice, bob)
+            guard received == [message] else { throw SSU2Error.testFailed("hybrid data phase lost") }
+            return "v4 offer with a 1088-byte FIPS 203 ML-KEM-768 ENCAPS; accepted, decapsulated, dual-leg keys mirrored, data delivered end-to-end"
+        }
+
+        run("SSU2 PQ down-negotiation · classical fallback when the peer takes no hybrid") {
+            // Bob's ML-KEM key is advertised to Alice, but his transport accepts
+            // no hybrid sessions: the offer earns a Retry and the handshake
+            // continues on the classical long-header variant.
+            let advertised = I2PMLKEMSecretKey(version: .mlKem512)
+            let aliceKey = Curve25519.KeyAgreement.PrivateKey()
+            let bobKey = Curve25519.KeyAgreement.PrivateKey()
+            let aliceRI = try I2PSamples.sampleRouterInfo()
+            let bobRI = try I2PSamples.sampleRouterInfo()
+            let alice = SSU2Session(role: .initiator, localStaticKey: aliceKey,
+                                    remoteStaticKey: bobKey.publicKey.rawRepresentation,
+                                    remoteIntroKey: bobIntroKey, localRouterInfo: aliceRI,
+                                    remoteMLKEMKeyData: advertised.encapsulationKeyData)
+            let bob = SSU2Session(role: .responder, localStaticKey: bobKey,
+                                  remoteStaticKey: nil, remoteIntroKey: bobIntroKey,
+                                  localRouterInfo: bobRI)
+            var offeredVersion: UInt8?
+            var sawRetry = false
+            alice.outboundHandler = { datagram, _ in
+                if offeredVersion == nil { offeredVersion = datagram[13] }
+                bob.handleDatagram(datagram, from: aliceLoopbackEndpoint)
+            }
+            bob.outboundHandler = { datagram, _ in
+                if datagram[12] == SSU2MessageType.retry.rawValue { sawRetry = true }
+                alice.handleDatagram(datagram, from: bobLoopbackEndpoint)
+            }
+            try alice.startHandshake(useCachedToken: true, forceInvalidToken: true)
+            pumpBoth(alice, bob)
+            guard offeredVersion == I2PSSU2PQVersion.mlKem512.rawValue else {
+                throw SSU2Error.testFailed("the offer did not carry the version-3 byte")
+            }
+            guard sawRetry else { throw SSU2Error.testFailed("no-PQ peer did not signal with a Retry") }
+            guard alice.negotiatedPQVersion == nil, bob.negotiatedPQVersion == nil else {
+                throw SSU2Error.testFailed("down-negotiation failed")
+            }
+            guard alice.isEstablished, bob.isEstablished else {
+                throw SSU2Error.testFailed("classical fallback did not establish")
+            }
+            return "v3 offer signaled, Retry earned, down-negotiated to the classical handshake and established"
+        }
+
+        await runAsync("SSU2 PQ hybrid transport · ML-KEM-512 session over the UDP loopback") {
+            try await udpHybridLoopbackTest(version: .mlKem512)
+        }
+
+        await runAsync("SSU2 PQ hybrid transport · ML-KEM-768 session over the UDP loopback") {
+            try await udpHybridLoopbackTest(version: .mlKem768)
+        }
+
         return results
     }
 
@@ -2046,16 +2261,19 @@ enum I2PSSU2SelfTest {
     /// Builds an established initiator/responder pair on the loopback wiring.
     static func loopbackPair(aliceKey: Curve25519.KeyAgreement.PrivateKey,
                                      bobKey: Curve25519.KeyAgreement.PrivateKey,
-                                     alicePublished: SSU2Endpoint? = nil) throws -> (SSU2Session, SSU2Session) {
+                                     alicePublished: SSU2Endpoint? = nil,
+                                      bobMLKEMSecret: I2PMLKEMSecretKey? = nil,
+                                      bobAdvertisedPQKey: Data? = nil) throws -> (SSU2Session, SSU2Session) {
         let aliceRI = try I2PSamples.sampleRouterInfo()
         let bobRI = try I2PSamples.sampleRouterInfo()
         let alice = SSU2Session(role: .initiator, localStaticKey: aliceKey,
                                 remoteStaticKey: bobKey.publicKey.rawRepresentation,
                                 remoteIntroKey: bobIntroKey, localRouterInfo: aliceRI,
-                                publishedEndpoint: alicePublished)
+                                publishedEndpoint: alicePublished,
+                                remoteMLKEMKeyData: bobAdvertisedPQKey)
         let bob = SSU2Session(role: .responder, localStaticKey: bobKey,
                               remoteStaticKey: nil, remoteIntroKey: bobIntroKey,
-                              localRouterInfo: bobRI)
+                              localRouterInfo: bobRI, mlKemSecretKey: bobMLKEMSecret)
         alice.outboundHandler = { datagram, _ in bob.handleDatagram(datagram, from: aliceLoopbackEndpoint) }
         bob.outboundHandler = { datagram, _ in alice.handleDatagram(datagram, from: bobLoopbackEndpoint) }
         try alice.startHandshake(useCachedToken: true, forceInvalidToken: true)
@@ -2153,6 +2371,59 @@ enum I2PSSU2SelfTest {
         transport.shutdown()
         _ = (responderStub, initiatorStub, dataStub)
         return "real UDP loopback: handshake established both sides, I2NP data delivered"
+    }
+
+    /// The ML-KEM hybrid long-header handshake over REAL UDP sockets: Bob's
+    /// transport carries an ML-KEM key pair, Alice is handed Bob's advertised
+    /// encapsulation key, and the negotiated hybrid session carries I2NP data.
+    static func udpHybridLoopbackTest(version: I2PSSU2PQVersion) async throws -> String {
+        let bobKey = Curve25519.KeyAgreement.PrivateKey()
+        let bobPQ = I2PMLKEMSecretKey(version: version)
+        let bobRI = try I2PSamples.sampleRouterInfo()
+        let transport = SSU2Transport(localStaticKey: bobKey, introKey: bobIntroKey,
+                                      localRouterInfo: bobRI,
+                                      publishedEndpoint: SSU2Endpoint(host: "127.0.0.1", port: 8888),
+                                      mlKemSecretKey: bobPQ)
+        _ = try transport.startListener(port: 0)
+        var port = transport.listenerPort ?? 0
+        var waited = 0.0
+        while port == 0 && waited < 5 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            waited += 0.1
+            port = transport.listenerPort ?? 0
+        }
+        guard port > 0 else { throw SSU2Error.testFailed("no listener port") }
+
+        let responderEstablished = Expectation()
+        let responderStub = TransportDelegateStub(onEstablish: { responderEstablished.fulfill() })
+        transport.delegate = responderStub
+
+        let session = try transport.connect(host: "127.0.0.1", port: port,
+                                            remoteStaticKey: bobKey.publicKey.rawRepresentation,
+                                            remoteIntroKey: bobIntroKey,
+                                            remoteMLKEMKey: bobPQ.encapsulationKeyData)
+        let initiatorEstablished = Expectation()
+        let initiatorStub = LoopbackDelegate(onEstablish: { initiatorEstablished.fulfill() })
+        session.delegate = initiatorStub
+
+        try await responderEstablished.wait(seconds: 10)
+        try await initiatorEstablished.wait(seconds: 10)
+        guard session.isEstablished else { throw SSU2Error.testFailed("UDP hybrid handshake incomplete") }
+        guard session.negotiatedPQVersion == version else {
+            throw SSU2Error.testFailed("UDP session did not negotiate \(version.name)")
+        }
+
+        let dataReceived = Expectation()
+        let dataStub = TransportDelegateStub(onEstablish: { responderEstablished.fulfill() },
+                                             onData: { _ in dataReceived.fulfill() })
+        transport.delegate = dataStub
+        let message = I2NPMessage(type: .dataMessage,
+                                  payload: Data("over real udp (\(version.name))".utf8)).serialize()
+        try session.sendData(message)
+        try await dataReceived.wait(seconds: 10)
+        transport.shutdown()
+        _ = (responderStub, initiatorStub, dataStub)
+        return "real UDP loopback (\(version.name)): version \(version.rawValue) hybrid handshake established, I2NP data delivered on the PQ-bound keys"
     }
 
     private final class TransportDelegateStub: SSU2TransportDelegate {

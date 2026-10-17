@@ -347,18 +347,41 @@ enum I2PProductionAudit {
     // MARK: - PQ hybrid
 
     private static func pqHybrid() async throws -> String {
-        // FIPS 203 ciphertext-size contracts for both hybrid parameter sets.
-        guard I2PSSU2PQVersion.mlKem512.mlKemCiphertextLength == 1088,
-              I2PSSU2PQVersion.mlKem768.mlKemCiphertextLength == 1568 else {
-            throw I2PMainnetFailure(message: "ML-KEM ciphertext-size contracts wrong (need 1088/1568)")
+        // FIPS 203 ciphertext-size contracts for both hybrid parameter sets
+        // (ML-KEM-512 → 768 bytes, ML-KEM-768 → 1088 bytes).
+        guard I2PSSU2PQVersion.mlKem512.mlKemCiphertextLength == 768,
+              I2PSSU2PQVersion.mlKem768.mlKemCiphertextLength == 1088 else {
+            throw I2PMainnetFailure(message: "ML-KEM ciphertext-size contracts wrong (need 768/1088)")
         }
         let encapsulation = try I2PMLKEMEncapsulation(
-            ciphertext: I2PCrypto.randomBytes(1088),
+            ciphertext: I2PCrypto.randomBytes(768),
             sharedSecret: I2PCrypto.randomBytes(32)
         )
         try I2PPQHybrid.validateVersionBinding(versionRawValue: 3, encapsulation: encapsulation)
         guard expectThrow({ try I2PPQHybrid.validateVersionBinding(versionRawValue: 4, encapsulation: encapsulation) }) else {
             throw I2PMainnetFailure(message: "an ML-KEM-512 shape was accepted for the version-4 handshake")
+        }
+
+        // Real FIPS 203 ENCAPS/DECAPS through CryptoKit's ML-KEM for both
+        // parameter sets: the ciphertext shape binds to the version byte and
+        // the decapsulated secret equals the ENCAPS shared secret exactly.
+        for version in [I2PSSU2PQVersion.mlKem512, .mlKem768] {
+            let responderPQ = I2PMLKEMSecretKey(version: version)
+            let initiatorPQ = try I2PMLKEMPublicKey(keyData: responderPQ.encapsulationKeyData)
+            guard initiatorPQ.version == version else {
+                throw I2PMainnetFailure(message: "advertised \(version.name) encapsulation key misidentified")
+            }
+            let real = try initiatorPQ.encapsulate()
+            guard real.ciphertext.count == version.mlKemCiphertextLength,
+                  real.sharedSecret.count == 32 else {
+                throw I2PMainnetFailure(message: "\(version.name) ENCAPS produced a wrong shape")
+            }
+            try I2PPQHybrid.validateVersionBinding(versionRawValue: version.rawValue, encapsulation: real)
+            let decapsulated = try responderPQ.decapsulate(real.ciphertext)
+            try I2PPQHybrid.validateDecapsulation(decapsulated: decapsulated, peerEncapsulation: real)
+            guard decapsulated == real.sharedSecret else {
+                throw I2PMainnetFailure(message: "\(version.name) DECAPS output diverged from the ENCAPS secret")
+            }
         }
 
         // Dual-leg KDF: deterministic, and a classical-only peer derives different
@@ -393,7 +416,7 @@ enum I2PProductionAudit {
         guard expectThrow({ try I2PPQHybrid.validateDecapsulation(decapsulated: I2PCrypto.randomBytes(32), peerEncapsulation: encapsulation) }) else {
             throw I2PMainnetFailure(message: "a mismatched decapsulation was accepted")
         }
-        return "v3/v4 shapes bound to ML-KEM-512/768 (1088/1568 bytes); dual-leg KDF deterministic and PQ-bound; mismatched decapsulation rejected"
+        return "v3/v4 shapes bound to ML-KEM-512/768 (768/1088-byte FIPS 203 ciphertexts, real ENCAPS/DECAPS round-tripped); dual-leg KDF deterministic and PQ-bound; mismatched decapsulation rejected"
     }
 
     // MARK: - Policy
