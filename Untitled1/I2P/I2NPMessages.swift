@@ -164,43 +164,46 @@ enum I2NPBody {
     case tunnelBuild(I2PTunnelBuildMessage)
     case tunnelBuildReply(I2PTunnelBuildReply)
 }
-/// TunnelData payload: one encrypted hop layer plus its routing header.
+/// TunnelData payload per the tunnel spec: one encrypted hop layer with its
+/// routing header.
 struct I2PTunnelDataPayload {
     /// Fixed-size encrypted tunnel message body (mainnet uses 1008 bytes).
-    static let dataSize = 1008
-    /// 16-byte Poly1305 tag rides with the ciphertext.
-    static let ciphertextLength = dataSize + 16
+    static let bodySize = 1008
+    /// Total wire size: 4-byte tunnel ID + 16-byte IV + 1008-byte body.
+    static let payloadSize = 4 + 16 + bodySize
 
     let tunnelID: UInt32
-    /// Per-message IV (12 bytes) used as the layer cipher's nonce.
+    /// 16-byte tunnel IV. The hop derives its CBC IV from this field through
+    /// its IV key (IV_used = AES-256-ECB(IV_key, IV) XOR IV).
     let iv: Data
-    let ciphertext: Data
+    /// 1008-byte AES-256-CBC body (no authentication tag, per the spec).
+    let body: Data
 
-    init(tunnelID: UInt32, iv: Data, ciphertext: Data) {
-        precondition(iv.count == 12, "tunnel data IV must be 12 bytes")
-        precondition(ciphertext.count == I2PTunnelDataPayload.ciphertextLength,
-                     "tunnel data ciphertext must be \(I2PTunnelDataPayload.ciphertextLength) bytes")
+    init(tunnelID: UInt32, iv: Data, body: Data) {
+        precondition(iv.count == 16, "tunnel data IV must be 16 bytes")
+        precondition(body.count == I2PTunnelDataPayload.bodySize,
+                     "tunnel data body must be \(I2PTunnelDataPayload.bodySize) bytes")
         self.tunnelID = tunnelID
         self.iv = iv
-        self.ciphertext = ciphertext
+        self.body = body
     }
 
     func serialize() -> Data {
         var w = I2PWriter()
         w.integer(tunnelID)
         w.raw(iv)
-        w.raw(ciphertext)
+        w.raw(body)
         return w.data
     }
 
     static func parse(_ data: Data) throws -> I2PTunnelDataPayload {
-        guard data.count == 4 + 12 + ciphertextLength else { throw I2NPError.invalidPayload }
+        guard data.count == payloadSize else { throw I2NPError.invalidPayload }
         var r = I2PReader(data)
         let id = try r.integer()
-        let iv = try r.raw(12)
-        let ct = try r.raw(ciphertextLength)
+        let iv = try r.raw(16)
+        let body = try r.raw(bodySize)
         guard r.remaining == 0 else { throw I2PWireError.trailingData }
-        return I2PTunnelDataPayload(tunnelID: id, iv: iv, ciphertext: ct)
+        return I2PTunnelDataPayload(tunnelID: id, iv: iv, body: body)
     }
 }
 

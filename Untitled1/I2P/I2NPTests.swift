@@ -138,17 +138,27 @@ private static func typedPayloadTest() async throws -> String {
               try I2NPMessage.parse(message).messageID == inner.messageID else {
             throw I2NPError.invalidPayload
         }
-        // TunnelData payload round-trip through one layer cipher
+        // TunnelData payload round-trip through one layer cipher, byte-for-byte
+        // per the spec layout: [tunnelID (4)][IV (16)][body (1008)] = 1028.
         let layerKey = I2PCrypto.randomBytes(32)
+        let ivKey = I2PCrypto.randomBytes(16)
+        let iv = I2PCrypto.randomBytes(16)
         let content = Data("tunnel message content".utf8)
-        let wire = try I2PTunnelLayerCipher.wrap(content: content, layerKey: layerKey,
-                                                 iv: I2PCrypto.randomBytes(12), tunnelID: 42)
+        let body = try I2PTunnelLayerCipher.wrap(content: content, layerKey: layerKey,
+                                                 ivField: iv, ivKey: ivKey)
+        let tunnelPayload = I2PTunnelDataPayload(tunnelID: 42, iv: iv, body: body)
+        let wire = tunnelPayload.serialize()
+        guard wire.count == I2PTunnelDataPayload.payloadSize,
+              I2PTunnelDataPayload.payloadSize == 1028 else {
+            throw I2NPError.invalidPayload
+        }
         let dataPayload = I2NPMessage(type: .tunnelData, payload: wire)
         guard case .tunnelData(let parsedPayload) = try I2NPMessage.parse(dataPayload.serialize()).parseBody(),
               parsedPayload.tunnelID == 42,
-              try I2PTunnelLayerCipher.unwrap(ciphertext: parsedPayload.ciphertext,
-                                              layerKey: layerKey, iv: parsedPayload.iv,
-                                              tunnelID: 42) == content else {
+              parsedPayload.serialize() == wire,
+              parsedPayload.iv == iv, parsedPayload.body == body,
+              try I2PTunnelLayerCipher.unwrap(body: parsedPayload.body, layerKey: layerKey,
+                                              ivField: parsedPayload.iv, ivKey: ivKey) == content else {
             throw I2NPError.invalidPayload
         }
         // TunnelBuild / TunnelBuildReply carriers
@@ -329,14 +339,15 @@ private static func expiryTest() async throws -> String {
     guard box.bodyKinds == [.deliveryStatus, .options] else { throw I2NPError.invalidPayload }
 
     // A tunnel hop whose participation state expired no longer decrypts data.
-    let tunnelKeys = (layerKey: I2PCrypto.randomBytes(32), iv: I2PCrypto.randomBytes(12))
+    let tunnelKeys = (layerKey: I2PCrypto.randomBytes(32), ivKey: I2PCrypto.randomBytes(16))
     let tunnelID: UInt32 = 0x76543210
-    let payload = try I2PTunnelDataPayload(tunnelID: tunnelID, iv: tunnelKeys.iv,
-        ciphertext: I2PTunnelLayerCipher.wrap(content: Data("x".utf8), layerKey: tunnelKeys.layerKey,
-                                              iv: tunnelKeys.iv, tunnelID: tunnelID))
+    let iv = I2PCrypto.randomBytes(16)
+    let payload = I2PTunnelDataPayload(tunnelID: tunnelID, iv: iv,
+        body: try I2PTunnelLayerCipher.wrap(content: Data("x".utf8), layerKey: tunnelKeys.layerKey,
+                                            ivField: iv, ivKey: tunnelKeys.ivKey))
     let state = I2PTunnelHopState(
         receiveTunnelID: tunnelID, nextHopHash: I2PCrypto.randomBytes(32), nextTunnelID: 0,
-        isMessagePathEnd: true, layerKey: tunnelKeys.layerKey, ivKey: tunnelKeys.iv, registeredAt: Date()
+        isMessagePathEnd: true, layerKey: tunnelKeys.layerKey, ivKey: tunnelKeys.ivKey, registeredAt: Date()
     )
     node.participant.testInjectHopState(state)
     _ = node.participant.pruneHopStates(now: Date().addingTimeInterval(1801))

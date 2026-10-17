@@ -367,9 +367,13 @@ enum I2PTunnelHopAction {
 }
 
 extension I2PTunnelParticipant {
-    /// The I2NP tunnel message pipeline: decrypt one layer of a TunnelData
-    /// payload with this hop's layer key and IV, then either forward the
-    /// revealed next-hop payload or deliver the inner TunnelGateway message.
+    /// The I2NP tunnel message pipeline per the tunnel spec: decrypt the hop's
+    /// AES-256-CBC layer (the full 1008-byte body, CBC IV chained through the
+    /// hop's IV key), then either forward the revealed next-hop TunnelData
+    /// message — carrying its ciphertext region byte-for-byte and re-randomizing
+    /// the region this hop's key never covered — or, at the message path's end,
+    /// deliver the inner TunnelGateway payload to the tunnel's gateway router
+    /// (outbound) or the originator (inbound).
     func processTunnelData(_ payload: I2PTunnelDataPayload) throws -> I2PTunnelHopAction {
         let state: I2PTunnelHopState? = {
             lock.lock()
@@ -378,17 +382,28 @@ extension I2PTunnelParticipant {
         }()
         guard let state, !state.isExpired() else { throw I2NPError.unknownTunnel }
         let content = try I2PTunnelLayerCipher.unwrap(
-            ciphertext: payload.ciphertext,
+            body: payload.body,
             layerKey: state.layerKey,
-            iv: payload.iv,
-            tunnelID: payload.tunnelID
+            ivField: payload.iv,
+            ivKey: state.ivKey
         )
         if state.isMessagePathEnd {
-            // Innermost content is a TunnelGateway payload: [gatewayID][I2NP].
+            // Innermost content is the TunnelGateway payload: [gatewayID][I2NP].
             guard content.count >= 4 else { throw I2NPError.invalidPayload }
             return .deliverGateway(toRouterHash: state.nextHopHash, gatewayPayload: content)
         }
-        let inner = try I2PTunnelDataPayload.parse(content)
+        // Transit hop: [nextTunnelID (4)][nextIV (16)][next ciphertext region].
+        guard content.count >= 20 else { throw I2NPError.invalidPayload }
+        let bytes = Array(content)
+        let nextTunnelID = (UInt32(bytes[0]) << 24) | (UInt32(bytes[1]) << 16)
+                         | (UInt32(bytes[2]) << 8) | UInt32(bytes[3])
+        let nextIV = Data(bytes[4..<20])
+        let nextBody = Data(bytes[20..<bytes.count])
+        let filler = I2PTunnelDataPayload.bodySize - nextBody.count
+        guard filler >= 0 else { throw I2NPError.invalidPayload }
+        var body = nextBody
+        body.append(contentsOf: I2PCrypto.randomBytes(filler))
+        let inner = I2PTunnelDataPayload(tunnelID: nextTunnelID, iv: nextIV, body: body)
         guard inner.tunnelID == state.nextTunnelID else { throw I2NPError.invalidPayload }
         return .forward(nextHopHash: state.nextHopHash, tunnelData: inner)
     }

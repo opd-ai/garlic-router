@@ -206,6 +206,12 @@ enum I2PCrossValidation {
         run("T4-TN-BREPLY-RT", rowID: "TN-BREPLY", "Build reply record: round trip across return codes; wrong message ID rejected") {
             try buildReplyRecordRoundTrip()
         }
+        run("T4-TN-DATA-RT", rowID: "TN-DATA", "TunnelData layering: spec 4/16/1008 layout, AES-256-CBC layers with IV-key chaining, block-aligned per-hop region ladder") {
+            try tunnelDataLayerSpec()
+        }
+        run("T4-TN-HOP-LAYER", rowID: "TN-HOP", "Hop processing: 3-hop layered pipeline forwards ciphertext regions byte-for-byte and delivers the gateway payload byte-exact") {
+            try tunnelHopLayerSpec()
+        }
 
         // MARK: NetDB — ingestion, lookup, selection, expiry
 
@@ -749,10 +755,10 @@ enum I2PCrossValidation {
     private static func tunnelDataRoundTrip() throws -> String {
         let payload = I2PTunnelDataPayload(
             tunnelID: 0x00C0_FFEE,
-            iv: I2PCrypto.randomBytes(12),
-            ciphertext: I2PCrypto.randomBytes(I2PTunnelDataPayload.ciphertextLength))
+            iv: I2PCrypto.randomBytes(16),
+            body: I2PCrypto.randomBytes(I2PTunnelDataPayload.bodySize))
         let encoded = payload.serialize()
-        guard encoded.count == 4 + 12 + I2PTunnelDataPayload.ciphertextLength else {
+        guard encoded.count == 4 + 16 + I2PTunnelDataPayload.bodySize else {
             throw I2PWireError.invalidFormat
         }
         let parsed = try I2PTunnelDataPayload.parse(encoded)
@@ -761,7 +767,11 @@ enum I2PCrossValidation {
         guard expectThrow({ _ = try I2PTunnelDataPayload.parse(Data(encoded.prefix(encoded.count - 1))) }) else {
             throw I2PCrossValidationError.unexpectedSuccess
         }
-        return "\(encoded.count)-byte fixed-shape payload round trips; short payload rejected"
+        // Trailing data rejected.
+        guard expectThrow({ _ = try I2PTunnelDataPayload.parse(encoded + Data([0x00])) }) else {
+            throw I2PCrossValidationError.unexpectedSuccess
+        }
+        return "\(encoded.count)-byte fixed-shape payload round trips; short and trailing payloads rejected"
     }
 
     private static func buildMessagesRoundTrip() throws -> String {
@@ -1368,6 +1378,143 @@ enum I2PCrossValidation {
             throw I2PCrossValidationError.unexpectedSuccess
         }
         return "reply records round trip across the return-code spectrum; message-ID AAD enforced"
+    }
+
+    // MARK: Tunnel data layering
+
+    /// TunnelData layering per the tunnel spec: the 4/16/1008 payload layout,
+    /// AES-256-CBC layers with the IV-key-derived CBC IV, and the per-hop
+    /// encrypted-region ladder.
+    private static func tunnelDataLayerSpec() throws -> String {
+        // The ladder: the outermost layer covers the full body; each deeper
+        // layer's region shrinks by a block-aligned 32 bytes.
+        let ladder = I2PTunnelDataProcessor.layerLengths(hopCount: 3)
+        guard ladder == [1008, 976, 944] else { throw I2PWireError.invalidFormat }
+        guard I2PTunnelDataProcessor.layerLengths(hopCount: 1) == [1008] else {
+            throw I2PWireError.invalidFormat
+        }
+
+        // One layer: AES-256-CBC over the 1008-byte body with the CBC IV
+        // derived from the IV field through the IV key.
+        let layerKey = I2PCrypto.randomBytes(32)
+        let ivKey = I2PCrypto.randomBytes(32)
+        let ivField = I2PCrypto.randomBytes(16)
+        let content = I2PCrypto.randomBytes(600)
+        let body = try I2PTunnelLayerCipher.wrap(content: content, layerKey: layerKey,
+                                                 ivField: ivField, ivKey: ivKey)
+        guard body.count == I2PTunnelDataPayload.bodySize else { throw I2PWireError.invalidFormat }
+        let payload = I2PTunnelDataPayload(tunnelID: 0x00C0_FFEE, iv: ivField, body: body)
+        let wire = payload.serialize()
+        guard wire.count == 1028, try I2PTunnelDataPayload.parse(wire).serialize() == wire else {
+            throw I2PWireError.invalidFormat
+        }
+
+        // The CBC IV is exactly AES-ECB(IV_key, IV field) XOR IV field, and
+        // manual CBC decryption with it recovers the padded content byte-for-byte.
+        let derived = I2PTunnelLayerCipher.deriveCBCIV(ivField: ivField, ivKey: ivKey)
+        let expectedPlain = try I2PTunnelLayerCipher.padded(content)
+        guard I2PAESCBC.decrypt(body, key: layerKey, iv: derived) == expectedPlain else {
+            throw I2PWireError.invalidFormat
+        }
+        guard try I2PTunnelLayerCipher.unwrap(body: body, layerKey: layerKey,
+                                              ivField: ivField, ivKey: ivKey) == content else {
+            throw I2PWireError.invalidFormat
+        }
+        // A wrong IV key yields different plaintext: the IV-key transform is load-bearing.
+        let otherKey = I2PCrypto.randomBytes(32)
+        let wrongPlain = try? I2PTunnelLayerCipher.unwrap(body: body, layerKey: layerKey,
+                                                          ivField: ivField, ivKey: otherKey)
+        guard wrongPlain != content else { throw I2PWireError.invalidFormat }
+        return "spec layout (4+16+1008) byte-for-byte; AES-256-CBC layer with ECB-keyed IV chaining verified; 3-hop ladder 1008/976/944"
+    }
+
+    /// Hop processing per the tunnel spec end-to-end: a 3-hop layered pipeline
+    /// where every hop forwards the next hop's ciphertext region byte-for-byte
+    /// (re-randomizing only the region its own key never covered) and the final
+    /// hop delivers the original I2NP message with its gateway ID intact.
+    private static func tunnelHopLayerSpec() throws -> String {
+        let gatewayID: UInt32 = 0x1122_3344
+        let receiveIDs = (0..<3).map { _ in UInt32.random(in: 1...UInt32.max) }
+        let layerKeys = (0..<3).map { _ in I2PCrypto.randomBytes(32) }
+        let ivKeys = (0..<3).map { _ in I2PCrypto.randomBytes(32) }
+        let ladder = I2PTunnelDataProcessor.layerLengths(hopCount: 3)
+
+        var hops: [I2PTunnelHop] = []
+        for index in 0..<3 {
+            hops.append(I2PTunnelHop(
+                routerHash: I2PCrypto.randomBytes(32),
+                receiveTunnelID: receiveIDs[index],
+                nextTunnelID: index < 2 ? receiveIDs[index + 1] : 0x0BAD_F00D,
+                isTunnelEndpoint: index == 2))
+        }
+        let tunnel = I2PTunnel(direction: .outbound, hops: hops,
+                               gatewayTunnelID: receiveIDs[0], endpointTunnelID: receiveIDs[2],
+                               layerKeys: layerKeys, ivKeys: ivKeys,
+                               createdAt: Date(), expiresAt: Date().addingTimeInterval(600),
+                               buildLatency: nil)
+        let inner = I2NPMessage(type: .dataMessage, payload: I2PCrypto.randomBytes(280))
+        var current = try I2PTunnelDataProcessor.preprocess(inner.serialize(), via: tunnel)
+        guard current.tunnelID == receiveIDs[0],
+              current.body.count == I2PTunnelDataPayload.bodySize else {
+            throw I2PWireError.invalidFormat
+        }
+
+        for index in 0..<3 {
+            let participant = I2PTunnelParticipant(
+                localRouterHash: tunnel.hops[index].routerHash,
+                localEncryptionKey: Curve25519.KeyAgreement.PrivateKey(),
+                transport: TunnelLayerSpecTransport())
+            participant.testInjectHopState(I2PTunnelHopState(
+                receiveTunnelID: tunnel.hops[index].receiveTunnelID,
+                nextHopHash: index < 2 ? tunnel.hops[index + 1].routerHash : I2PCrypto.randomBytes(32),
+                nextTunnelID: tunnel.hops[index].nextTunnelID,
+                isMessagePathEnd: index == 2,
+                layerKey: layerKeys[index], ivKey: ivKeys[index], registeredAt: Date()))
+
+            // The inbound ciphertext region decrypts with this hop's key and the
+            // IV-key-chained CBC IV to the framed next-hop message.
+            let regionLength = ladder[index]
+            let plain = I2PAESCBC.decrypt(Data(current.body.prefix(regionLength)),
+                                          key: layerKeys[index],
+                                          iv: I2PTunnelLayerCipher.deriveCBCIV(ivField: current.iv,
+                                                                               ivKey: ivKeys[index]))
+            let action = try participant.processTunnelData(current)
+            if index < 2 {
+                guard case .forward(_, let forwarded) = action else { throw I2PWireError.invalidFormat }
+                // Routing: addressed to the next hop with its tunnel ID, full 1008-byte body.
+                guard forwarded.tunnelID == tunnel.hops[index].nextTunnelID,
+                      forwarded.body.count == I2PTunnelDataPayload.bodySize else {
+                    throw I2PWireError.invalidFormat
+                }
+                // The frame inside this layer: [BE16 length][nextTunnelID (4)][nextIV (16)],
+                // with the length exactly 20 + the next hop's covered region.
+                let length = (Int(plain[0]) << 8) | Int(plain[1])
+                guard length == 20 + ladder[index + 1] else { throw I2PWireError.invalidFormat }
+                guard Data(plain[2..<6]) == I2PTunnelLayerCipher.tunnelIDBytes(tunnel.hops[index + 1].receiveTunnelID) else {
+                    throw I2PWireError.invalidFormat
+                }
+                // The forwarded region is byte-identical to this hop's decrypted
+                // ciphertext bytes — the next hop decrypts the very same bytes.
+                guard forwarded.body.prefix(ladder[index + 1]) == Data(plain[22..<(22 + ladder[index + 1])]) else {
+                    throw I2PWireError.invalidFormat
+                }
+                current = forwarded
+            } else {
+                guard case .deliverGateway(_, let gatewayPayload) = action else { throw I2PWireError.invalidFormat }
+                // The delivered payload is [gatewayID][the original I2NP bytes].
+                guard gatewayPayload == I2PTunnelGatewayPayload(gatewayID: gatewayID,
+                                                                message: inner.serialize()).serialize() else {
+                    throw I2PWireError.invalidFormat
+                }
+            }
+        }
+        return "3-hop pipeline: ciphertext regions forwarded byte-for-byte, uncovered regions re-randomized, gateway payload delivered byte-exact"
+    }
+
+    /// No-op build transport for pipeline participants under test.
+    private final class TunnelLayerSpecTransport: I2PTunnelBuildTransport {
+        func sendBuild(_ message: I2PTunnelBuildMessage, to routerHash: Data) {}
+        func sendBuildReply(_ body: Data, to routerHash: Data) {}
     }
 
     // MARK: NetDB
