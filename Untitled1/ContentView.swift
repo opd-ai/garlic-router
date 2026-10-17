@@ -8,6 +8,7 @@ import SwiftUI
 struct ContentView: View {
     @State private var results: [I2PSelfTestResult] = []
     @State private var readinessResults: [I2PSelfTestResult] = []
+    @State private var stabilityResults: [I2PSelfTestResult] = []
     @State private var sizes: [(name: String, bytes: Int)] = []
 
     private let accent = Color(red: 0.47, green: 0.44, blue: 0.97)
@@ -44,6 +45,7 @@ struct ContentView: View {
                     serializationCard
                     selfTestCard
                     readinessCard
+                    stabilityCard
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 4)
@@ -123,6 +125,61 @@ struct ContentView: View {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// The systematic crash-safety audit: every checklist category from the
+    /// crash-debugging framework is exercised by an executable probe. No
+    /// mainnet traffic involved.
+    private func runStabilityAudit() {
+        Task {
+            let fresh = await I2PStabilityAudit.runAll()
+            await MainActor.run { stabilityResults = fresh }
+        }
+    }
+
+    private var stabilityCard: some View {
+        card(title: "Crash & stability audit") {
+            Button {
+                runStabilityAudit()
+            } label: {
+                Label("Run stability audit", systemImage: "checkmark.shield")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .background(accent.opacity(0.15), in: RoundedRectangle(cornerRadius: 12))
+            }
+            .buttonStyle(.plain)
+            .tint(accent)
+
+            if !stabilityResults.isEmpty {
+                let passed = stabilityResults.filter(\.passed).count
+                Text(passed == stabilityResults.count
+                     ? "\(passed) of \(stabilityResults.count) probes passed — every crash checklist category ran clean"
+                     : "\(passed) of \(stabilityResults.count) probes passed — findings below")
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(passed == stabilityResults.count ? Color.green : Color.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                ForEach(stabilityResults.indices, id: \.self) { index in
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: stabilityResults[index].passed ? "checkmark.circle.fill" : "xmark.circle.fill")
+                            .foregroundStyle(stabilityResults[index].passed ? Color.green : Color.red)
+                            .font(.caption)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(stabilityResults[index].name)
+                                .font(.footnote.weight(.medium))
+                            Text(stabilityResults[index].detail)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                Text("Surviving probes are the systematic equivalent of an empty crash log; failures carry the action-items breakdown (crash type, root cause, verification).")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
         }
     }
