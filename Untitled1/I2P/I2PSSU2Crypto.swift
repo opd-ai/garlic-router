@@ -446,7 +446,6 @@ final class SSU2ReplayWindow {
 /// associated data. Every authenticated payload carries a 16-byte MAC.
 final class SSU2DataCipher {
     let key: Data
-    private(set) var sendCounter: UInt32 = 0
 
     init(key: Data) {
         precondition(key.count == 32)
@@ -458,9 +457,11 @@ final class SSU2DataCipher {
     static let minimumMessageLength = 40
     static let maximumMessageLength = 1472
 
-    /// Seals `payload` under `header` (16-byte short header as AAD) and returns
-    /// header || ciphertext || MAC. Advances the packet number.
-    func seal(_ payload: Data, header: Data) throws -> Data {
+    /// Seals `payload` under `header` (the 16-byte short header as associated
+    /// data) with the nonce96 of `packetNumber`, returning header || ciphertext
+    /// || MAC. The session owns the per-direction packet-number sequence, so
+    /// the nonce comes from the header number itself.
+    func seal(_ payload: Data, header: Data, packetNumber: UInt32) throws -> Data {
         guard payload.count >= 8 else { throw SSU2Error.invalidPacket }
         let messageLength = header.count + payload.count + 16
         guard messageLength <= SSU2DataCipher.maximumMessageLength else {
@@ -468,12 +469,11 @@ final class SSU2DataCipher {
         }
         let box = try ChaChaPoly.seal(payload,
                                       using: SymmetricKey(data: key),
-                                      nonce: SSU2Nonce.nonce96(sendCounter),
+                                      nonce: SSU2Nonce.nonce96(packetNumber),
                                       authenticating: header)
         var out = header
         out.append(box.ciphertext)
         out.append(box.tag)
-        sendCounter &+= 1
         return out
     }
 
@@ -481,10 +481,11 @@ final class SSU2DataCipher {
     /// the payload and the header. Returns the plaintext payload.
     func open(_ packet: Data, headerLength: Int = SSU2PacketHeader.shortLength) throws -> Data {
         guard packet.count >= SSU2DataCipher.minimumMessageLength else { throw SSU2Error.invalidPacket }
+        let parsedHeader = try SSU2PacketHeader.parse(packet)
         let header = packet.subdata(in: 0..<headerLength)
         let body = packet.subdata(in: headerLength..<packet.count)
         guard body.count >= 16 else { throw SSU2Error.invalidPacket }
-        let box = try ChaChaPoly.SealedBox(nonce: SSU2Nonce.nonce96(header.packetNumber),
+        let box = try ChaChaPoly.SealedBox(nonce: SSU2Nonce.nonce96(parsedHeader.packetNumber),
                                            ciphertext: body.subdata(in: 0..<(body.count - 16)),
                                            tag: body.subdata(in: (body.count - 16)..<body.count))
         guard let payload = try? ChaChaPoly.open(box, using: SymmetricKey(data: key), authenticating: header) else {
