@@ -12,6 +12,34 @@ import Foundation
 import CryptoKit
 
 enum I2PProductionAudit {
+    /// Durable progress keys. Checkpointing lives HERE (not in a wrapper) so
+    /// both the readiness audit and the standalone production-audit button
+    /// persist the active probe — a crash during either one then names the
+    /// current probe with a timestamp, instead of leaving a stale checkpoint
+    /// from an older build pointing at the wrong probe (e.g. an old NTCP2
+    /// banner surviving a crash that actually happened in rfcVectors).
+    static let checkpointKey = "i2p.readinessAudit.activeProbe"
+    static let checkpointTimeKey = "i2p.readinessAudit.activeProbeAt"
+
+    private static let probeLock = NSLock()
+    private static var activeProbeStorage: String?
+
+    /// The probe currently executing, read by the fatal-signal handler so the
+    /// persisted crash report names the probe that trapped. Best-effort: the
+    /// lock is held only for the instant of the pointer swap, so a trap will
+    /// essentially never arrive while it is held.
+    static var activeProbeName: String? {
+        probeLock.lock()
+        defer { probeLock.unlock() }
+        return activeProbeStorage
+    }
+
+    private static func setActiveProbe(_ name: String?) {
+        probeLock.lock()
+        defer { probeLock.unlock() }
+        activeProbeStorage = name
+    }
+
     /// Runs each production probe serially and reports both its start and its
     /// completed result. Serial execution keeps the pure-Swift crypto workload
     /// from overlapping other probes and gives the UI a durable checkpoint if
@@ -34,6 +62,14 @@ enum I2PProductionAudit {
 
         var results: [I2PSelfTestResult] = []
         for (name, probe) in probes {
+            // Persist the active probe (with a timestamp so a checkpoint from
+            // an older build is distinguishable) and expose the name to the
+            // crash reporter BEFORE the probe runs: a mid-probe trap then
+            // names the exact probe in its own report.
+            setActiveProbe(name)
+            UserDefaults.standard.set(name, forKey: checkpointKey)
+            UserDefaults.standard.set(Date(), forKey: checkpointTimeKey)
+            UserDefaults.standard.synchronize()
             await onProgress(name, nil)
             let result: I2PSelfTestResult
             do {
@@ -47,6 +83,13 @@ enum I2PProductionAudit {
             // probes; no two audit probes run concurrently.
             await Task.yield()
         }
+
+        // The run completed (probe errors were folded into failed results) —
+        // retire the checkpoint so no stale banner survives the session.
+        setActiveProbe(nil)
+        UserDefaults.standard.removeObject(forKey: checkpointKey)
+        UserDefaults.standard.removeObject(forKey: checkpointTimeKey)
+        UserDefaults.standard.synchronize()
 
         let passing = results.filter(\.passed).count
         let summary = I2PSelfTestResult(

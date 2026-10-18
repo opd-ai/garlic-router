@@ -24,9 +24,19 @@ enum I2PCrashReporter {
                 // land after the faulting state is stable, so the report
                 // virtually always gets out for the trap-class crashes.
                 let stack = Thread.callStackSymbols.joined(separator: "\n")
+                // Name the probe that was executing, when the crash happened
+                // inside an audit run — the backtrace alone can be ambiguous
+                // between audits, and a stale checkpoint from an older build
+                // can point at the wrong probe entirely.
+                let probeContext: String
+                if let probe = I2PProductionAudit.activeProbeName {
+                    probeContext = "\nactive probe: \(probe)"
+                } else {
+                    probeContext = ""
+                }
                 let report = """
                 Signal \(number) at \(Date())
-                thread: \(Thread.current.name ?? "unnamed")
+                thread: \(Thread.current.name ?? "unnamed")\(probeContext)
                 \(stack)
                 """
                 let url = FileManager.default.temporaryDirectory

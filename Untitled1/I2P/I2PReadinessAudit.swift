@@ -13,9 +13,6 @@ import Foundation
 /// probes once, serially, and persists the active probe (plus the moment it
 /// became active) so an OS termination is diagnosable on the next launch.
 enum I2PReadinessAudit {
-    private static let checkpointKey = "i2p.readinessAudit.activeProbe"
-    private static let checkpointTimeKey = "i2p.readinessAudit.activeProbeAt"
-
     /// The phase the audit was interrupted in, plus when the checkpoint was
     /// written. The timestamp distinguishes a fresh interruption from a stale
     /// checkpoint left behind by an older app version, which only wrote the
@@ -25,17 +22,21 @@ enum I2PReadinessAudit {
         let savedAt: Date?
     }
 
+    /// Checkpoint keys live on I2PProductionAudit — the checkpointing (per-probe,
+    /// timestamped) belongs to the probe engine itself, so BOTH the readiness
+    /// audit and the standalone production-audit button persist durable progress
+    /// under the same keys.
     static var interruptedCheckpoint: Checkpoint? {
-        guard let phase = UserDefaults.standard.string(forKey: checkpointKey) else {
+        guard let phase = UserDefaults.standard.string(forKey: I2PProductionAudit.checkpointKey) else {
             return nil
         }
-        let savedAt = UserDefaults.standard.object(forKey: checkpointTimeKey) as? Date
+        let savedAt = UserDefaults.standard.object(forKey: I2PProductionAudit.checkpointTimeKey) as? Date
         return Checkpoint(phase: phase, savedAt: savedAt)
     }
 
     /// Backwards-compatible accessor for the raw interrupted phase.
     static var interruptedPhase: String? {
-        UserDefaults.standard.string(forKey: checkpointKey)
+        UserDefaults.standard.string(forKey: I2PProductionAudit.checkpointKey)
     }
 
     /// A user-facing notice describing the interrupted run. When the checkpoint
@@ -56,18 +57,11 @@ enum I2PReadinessAudit {
     static func runAll(
         onProgress: (String, I2PSelfTestResult?) async -> Void = { _, _ in }
     ) async -> [I2PSelfTestResult] {
+        // Checkpointing (per-probe, timestamped, plus the crash reporter's
+        // active-probe name) happens inside I2PProductionAudit.runAll itself.
         let productionResults = await I2PProductionAudit.runAll { phase, result in
-            if result == nil {
-                UserDefaults.standard.set(phase, forKey: checkpointKey)
-                UserDefaults.standard.set(Date(), forKey: checkpointTimeKey)
-                UserDefaults.standard.synchronize()
-            }
             await onProgress(phase, result)
         }
-
-        UserDefaults.standard.removeObject(forKey: checkpointKey)
-        UserDefaults.standard.removeObject(forKey: checkpointTimeKey)
-        UserDefaults.standard.synchronize()
 
         return productionResults.map { result in
             I2PSelfTestResult(
