@@ -94,10 +94,14 @@ enum I2PCrypto {
 
     static func chacha20Poly1305Open(key: Data, nonce: Data, ciphertextAndTag: Data, aad: Data = Data()) throws -> Data {
         guard ciphertextAndTag.count > 16 else { throw I2PWireError.invalidFormat }
+        // Split via dropLast/suffix, never subdata(in:) with absolute ranges:
+        // Data carries its own index base (a slice of another Data can start
+        // at any offset), and subdata(in: 0..<n) traps with SIGTRAP when the
+        // receiver's indices are not zero-based. dropLast/suffix are immune.
         let box = try ChaChaPoly.SealedBox(
             nonce: try ChaChaPoly.Nonce(data: nonce),
-            ciphertext: ciphertextAndTag.subdata(in: 0..<(ciphertextAndTag.count - 16)),
-            tag: ciphertextAndTag.subdata(in: (ciphertextAndTag.count - 16)..<ciphertextAndTag.count))
+            ciphertext: Data(ciphertextAndTag.dropLast(16)),
+            tag: Data(ciphertextAndTag.suffix(16)))
         return try ChaChaPoly.open(box, using: SymmetricKey(data: key), authenticating: aad)
     }
 

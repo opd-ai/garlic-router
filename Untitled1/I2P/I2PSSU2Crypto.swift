@@ -314,13 +314,18 @@ enum SSU2HeaderProtection {
                            introKey: Data, sessionKey: Data? = nil) throws {
         guard packet.count >= 40 else { throw SSU2Error.invalidPacket }
         let key = Self.key(phase: phase, introKey: introKey, sessionKey: sessionKey)
-        let tail = packet.subdata(in: (packet.count - 24)..<packet.count)
-        let iv1 = tail.subdata(in: 0..<12)
-        let iv2 = tail.subdata(in: 12..<24)
-        let first = ChaCha20Stream.xor(packet.subdata(in: 0..<8), key: key, nonce: iv1)
-        packet.replaceSubrange(0..<8, with: first)
-        let second = ChaCha20Stream.xor(packet.subdata(in: 8..<16), key: key, nonce: iv2)
-        packet.replaceSubrange(8..<16, with: second)
+        // Operate on a zero-based copy: Data slices carry a non-zero index
+        // base, and absolute-range subdata(in:)/replaceSubrange on them traps
+        // (SIGTRAP). prefix/dropFirst/suffix are index-base immune.
+        var normalized = Data(packet)
+        let tail = Data(normalized.suffix(24))
+        let iv1 = Data(tail.prefix(12))
+        let iv2 = Data(tail.dropFirst(12))
+        let first = ChaCha20Stream.xor(Data(normalized.prefix(8)), key: key, nonce: iv1)
+        normalized.replaceSubrange(0..<8, with: first)
+        let second = ChaCha20Stream.xor(Data(normalized.dropFirst(8).prefix(8)), key: key, nonce: iv2)
+        normalized.replaceSubrange(8..<16, with: second)
+        packet = normalized
     }
 
     /// Masking is an involution over XOR; unmask re-applies it.
@@ -338,7 +343,7 @@ enum SSU2HeaderProtection {
         for phase in SSU2HeaderPhase.introKeyPhases {
             var candidate = Data(packet)
             do { try unmaskHeader(&candidate, phase: phase, introKey: introKey) } catch { continue }
-            if candidate.subdata(in: 0..<8) == expectedDestinationConnectionID {
+            if Data(candidate.prefix(8)) == expectedDestinationConnectionID {
                 return phase
             }
         }
@@ -363,9 +368,11 @@ enum SSU2HeaderProtection {
                                          responderStaticKey: Data) throws {
         guard packet.count >= 64 else { throw SSU2Error.invalidPacket }
         let key = ephemeralRegionKey(introKey: introKey, responderStaticKey: responderStaticKey)
-        let region = packet.subdata(in: 16..<64)
+        var normalized = Data(packet)
+        let region = Data(normalized.dropFirst(16).prefix(48))
         let masked = ChaCha20Stream.xor(region, key: key, nonce: Data(repeating: 0, count: 12))
-        packet.replaceSubrange(16..<64, with: masked)
+        normalized.replaceSubrange(16..<64, with: masked)
+        packet = normalized
     }
 }
 
@@ -499,12 +506,13 @@ final class SSU2DataCipher {
     func open(_ packet: Data, headerLength: Int = SSU2PacketHeader.shortLength) throws -> Data {
         guard packet.count >= SSU2DataCipher.minimumMessageLength else { throw SSU2Error.invalidPacket }
         let parsedHeader = try SSU2PacketHeader.parse(packet)
-        let header = packet.subdata(in: 0..<headerLength)
-        let body = packet.subdata(in: headerLength..<packet.count)
+        // Slice-safe split (index-base immune, see SSU2HeaderProtection.maskHeader).
+        let header = Data(packet.prefix(headerLength))
+        let body = Data(packet.dropFirst(headerLength))
         guard body.count >= 16 else { throw SSU2Error.invalidPacket }
         let box = try ChaChaPoly.SealedBox(nonce: SSU2Nonce.nonce96(parsedHeader.packetNumber),
-                                           ciphertext: body.subdata(in: 0..<(body.count - 16)),
-                                           tag: body.subdata(in: (body.count - 16)..<body.count))
+                                           ciphertext: Data(body.dropLast(16)),
+                                           tag: Data(body.suffix(16)))
         guard let payload = try? ChaChaPoly.open(box, using: SymmetricKey(data: key), authenticating: header) else {
             throw SSU2Error.decryptFailed
         }

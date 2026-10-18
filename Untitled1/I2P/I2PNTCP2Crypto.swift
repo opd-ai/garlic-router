@@ -88,10 +88,14 @@ struct NTCP2NoiseChain {
     mutating func decrypt(_ ciphertext: Data) throws -> Data {
         guard let key else { throw NTCP2Error.handshakeFailed("DecryptWithAd without a key") }
         guard ciphertext.count > 16 else { throw NTCP2Error.decryptFailed }
+        // dropLast/suffix split — never subdata(in:) with absolute ranges:
+        // Data carries its own index base (a slice of another Data can start
+        // at any offset), and subdata(in: 0..<n) traps with SIGTRAP when the
+        // receiver's indices are not zero-based. dropLast/suffix are immune.
         let box = try ChaChaPoly.SealedBox(
             nonce: Self.nonce96(nonce),
-            ciphertext: ciphertext.subdata(in: 0..<(ciphertext.count - 16)),
-            tag: ciphertext.subdata(in: (ciphertext.count - 16)..<ciphertext.count))
+            ciphertext: Data(ciphertext.dropLast(16)),
+            tag: Data(ciphertext.suffix(16)))
         guard let plaintext = try? ChaChaPoly.open(box, using: SymmetricKey(data: key), authenticating: hash) else {
             throw NTCP2Error.decryptFailed
         }
@@ -423,10 +427,11 @@ final class NTCP2FrameCodec {
         guard bytes.count >= total else { return nil }
         let body = Data(bytes[2..<total])
         guard body.count > 16 else { throw NTCP2Error.invalidFrame }
+        // Same slice-safe split as NoiseChain.decrypt (see note there).
         let box = try ChaChaPoly.SealedBox(
             nonce: NTCP2NoiseChain.nonce96(counter),
-            ciphertext: body.subdata(in: 0..<(body.count - 16)),
-            tag: body.subdata(in: (body.count - 16)..<body.count))
+            ciphertext: Data(body.dropLast(16)),
+            tag: Data(body.suffix(16)))
         guard let payload = try? ChaChaPoly.open(box, using: SymmetricKey(data: aeadKey), authenticating: Data()) else {
             throw NTCP2Error.decryptFailed
         }
