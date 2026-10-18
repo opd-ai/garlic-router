@@ -503,6 +503,12 @@ actor I2PNetworkDatabase {
             let deadline = Date().addingTimeInterval(timeoutPerRound)
             var discovered: Set<Data> = []
             while Date() < deadline {
+                if Task.isCancelled {
+                    outgoingLookupTokens.remove(token)
+                    pendingLookupResults.removeValue(forKey: key)
+                    pendingSearchReplies.removeValue(forKey: key)
+                    return nil
+                }
                 if let found = pendingLookupResults.removeValue(forKey: key) {
                     outgoingLookupTokens.remove(token)
                     return found
@@ -516,7 +522,14 @@ actor I2PNetworkDatabase {
                     }
                 }
                 if !discovered.isEmpty { break }
-                try? await Task.sleep(for: .milliseconds(50))
+                do {
+                    try await Task.sleep(for: .milliseconds(50))
+                } catch {
+                    outgoingLookupTokens.remove(token)
+                    pendingLookupResults.removeValue(forKey: key)
+                    pendingSearchReplies.removeValue(forKey: key)
+                    return nil
+                }
             }
             outgoingLookupTokens.remove(token)
             // Iterative discovery: fetch RouterInfos for newly discovered peers to

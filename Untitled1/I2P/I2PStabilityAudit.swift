@@ -74,7 +74,10 @@ enum I2PStabilityAudit {
         )
         let i2npBytes = i2np.serialize()
         let shortBytes = i2np.serializeShort()
-        let routerInfoBytes = I2PRouterAppContext.shared.mainnetSignedRouterInfo.serialize()
+        // Use a fresh signed sample: this parser probe must not construct the
+        // live router singleton (Keychain, persistent NetDB, transports and
+        // tunnel services) merely to obtain valid wire bytes.
+        let routerInfoBytes = try I2PSamples.sampleRouterInfo().serialize()
 
         struct Input {
             let name: String
@@ -162,8 +165,10 @@ enum I2PStabilityAudit {
     /// replay window. Completing inside the deadline proves no deadlock; the
     /// entry-count equality proves no data race corrupted shared state.
     private static func concurrentHammer() async throws -> String {
-        let netDB = I2PRouterAppContext.shared.mainnetNetDB
-        let pool = I2PRouterAppContext.shared.mainnetTunnelPool
+        let harness = try await makeIsolatedHarness()
+        defer { try? FileManager.default.removeItem(at: harness.directory) }
+        let netDB = harness.netDB
+        let pool = harness.tunnelPool
         let entriesBefore = await netDB.entryCount()
         let tokenManager = SSU2TokenManager(tokenLifetime: 600, maxRequestsPerWindow: 100, requestWindow: 60)
         let replayWindow = SSU2ReplayWindow()
@@ -233,7 +238,9 @@ enum I2PStabilityAudit {
 
         // Sustained netdb miss cycles complete without pathological stall or
         // unbounded lookup queueing.
-        let netDB = I2PRouterAppContext.shared.mainnetNetDB
+        let harness = try await makeIsolatedHarness()
+        defer { try? FileManager.default.removeItem(at: harness.directory) }
+        let netDB = harness.netDB
         let started = Date()
         for _ in 0..<60 {
             _ = await netDB.lookup(I2PCrypto.randomBytes(32), timeoutPerRound: 1, maxRounds: 1)
@@ -248,11 +255,20 @@ enum I2PStabilityAudit {
     // MARK: - Probe 4: async/await & cancellation
 
     private static func cancellationResponsiveness() async throws -> String {
-        let netDB = I2PRouterAppContext.shared.mainnetNetDB
+        let harness = try await makeIsolatedHarness(includeFloodfill: true)
+        defer { try? FileManager.default.removeItem(at: harness.directory) }
+        let netDB = harness.netDB
         let task = Task {
             _ = await netDB.lookup(I2PCrypto.randomBytes(32), timeoutPerRound: 5, maxRounds: 10)
         }
-        try await Task.sleep(for: .milliseconds(120))
+        let sendDeadline = Date().addingTimeInterval(1)
+        while harness.netDBTransport.sentMessageCount == 0 && Date() < sendDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        guard harness.netDBTransport.sentMessageCount > 0 else {
+            task.cancel()
+            throw I2PMainnetFailure(message: "isolated floodfill lookup was not dispatched")
+        }
         task.cancel()
         let started = Date()
         _ = await task.value
@@ -272,7 +288,9 @@ enum I2PStabilityAudit {
     /// while it runs: if any suite work blocked the main thread, the pings
     /// would stall and the probe would surface the hang class.
     private static func mainThreadResponsiveness() async throws -> String {
-        let suite = Task { await I2PSelfTest.runAll() }
+        // Do not inherit a caller's actor context: the synchronous crypto and
+        // parsing checks must stay off the UI executor for this responsiveness probe.
+        let suite = Task.detached(priority: .utility) { await I2PSelfTest.runAll() }
         var worstMainActorLag: TimeInterval = 0
         for _ in 0..<4 {
             let started = Date()
@@ -340,4 +358,73 @@ enum I2PStabilityAudit {
         }
         return "corrupted and mis-named netdb records are discarded at restore (no crash, no trusted garbage); clean records restore byte-identical; identity keys round-trip through the Keychain"
     }
+
+    private static func makeIsolatedHarness(includeFloodfill: Bool = false) async throws -> StabilityAuditHarness {
+        let localHash = I2PCrypto.randomBytes(32)
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("i2p-stability-harness-\(UUID().uuidString)", isDirectory: true)
+        let storage = try I2PNetDBStorage(directory: directory)
+        let netDBTransport = StabilityAuditNetDBTransport()
+        let netDB = I2PNetworkDatabase(localRouterHash: localHash,
+                                       transport: netDBTransport,
+                                       storage: storage)
+        if includeFloodfill {
+            var floodfillHash = Data(repeating: 0xA5, count: 32)
+            if floodfillHash == localHash { floodfillHash[0] ^= 0x01 }
+            await netDB.registerFloodfill(floodfillHash)
+        }
+        let tunnelTransport = StabilityAuditTunnelTransport()
+        let participant = I2PTunnelParticipant(
+            localRouterHash: localHash,
+            localEncryptionKey: Curve25519.KeyAgreement.PrivateKey(),
+            transport: tunnelTransport
+        )
+        let pool = I2PTunnelPool(localRouterHash: localHash,
+                                 participant: participant,
+                                 transport: tunnelTransport,
+                                 peerProvider: StabilityAuditPeerProvider())
+        return StabilityAuditHarness(netDB: netDB,
+                                     tunnelPool: pool,
+                                     netDBTransport: netDBTransport,
+                                     directory: directory)
+    }
+}
+
+
+/// Isolated dependencies keep the stability audit from initializing the live router.
+private struct StabilityAuditHarness {
+    let netDB: I2PNetworkDatabase
+    let tunnelPool: I2PTunnelPool
+    let netDBTransport: StabilityAuditNetDBTransport
+    let directory: URL
+}
+
+private final class StabilityAuditNetDBTransport: I2PNetDBTransport {
+    private let lock = NSLock()
+    private var sends = 0
+
+    var sentMessageCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return sends
+    }
+
+    func send(to routerHash: Data, message: I2PNetDBMessage) async throws {
+        recordSend()
+    }
+
+    private func recordSend() {
+        lock.lock()
+        sends += 1
+        lock.unlock()
+    }
+}
+
+private final class StabilityAuditTunnelTransport: I2PTunnelBuildTransport {
+    func sendBuild(_ message: I2PTunnelBuildMessage, to routerHash: Data) {}
+    func sendBuildReply(_ body: Data, to routerHash: Data) {}
+}
+
+private final class StabilityAuditPeerProvider: I2PTunnelPeerProvider {
+    func peers(count: Int, excluding: Set<Data>) -> [I2PTunnelPeer] { [] }
 }
