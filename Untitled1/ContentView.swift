@@ -4,6 +4,7 @@
 //
 
 import SwiftUI
+import UIKit
 
 struct ContentView: View {
     @State private var results: [I2PSelfTestResult] = []
@@ -103,7 +104,10 @@ struct ContentView: View {
 
     /// Runs the complete production probe set once, sequentially. Intermediate
     /// outcomes are surfaced immediately; the audit stores its active probe in
-    /// case iOS terminates the process before completion.
+    /// case iOS terminates the process before completion. A background-task
+    /// assertion spans the whole run so backgrounding the app mid-audit no
+    /// longer kills the process — a suspension kill used to leave the same
+    /// "previous run stopped during NTCP2 handshake" banner on every launch.
     private func runReadinessAudit() {
         guard !readinessRunning else { return }
         readinessRunning = true
@@ -111,6 +115,8 @@ struct ContentView: View {
         readinessCurrentProbe = "Preparing production checks"
         readinessCompletedChecks = 0
         readinessLastInterruptedPhase = nil
+        let auditLease = BackgroundTaskLease()
+        auditLease.begin(name: "I2P readiness audit")
         Task.detached(priority: .utility) {
             let fresh = await I2PReadinessAudit.runAll { phase, result in
                 await MainActor.run {
@@ -131,6 +137,7 @@ struct ContentView: View {
                 readinessRunning = false
                 readinessLastInterruptedPhase = I2PReadinessAudit.interruptedPhase
             }
+            auditLease.end()
         }
     }
 
@@ -566,4 +573,30 @@ struct ContentView: View {
 
 #Preview {
     ContentView()
+}
+
+/// Holds a UIApplication background-task assertion for the duration of a long
+/// audit so iOS does not suspend-kill the process while the app is backgrounded
+/// mid-run. Ends the assertion from the expiry handler too, so the lease is
+/// always released exactly once whichever side fires first.
+final class BackgroundTaskLease: @unchecked Sendable {
+    private let lock = NSLock()
+    private var identifier = UIBackgroundTaskIdentifier.invalid
+
+    func begin(name: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard identifier == .invalid else { return }
+        identifier = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in
+            self?.end()
+        }
+    }
+
+    func end() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard identifier != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(identifier)
+        identifier = .invalid
+    }
 }
