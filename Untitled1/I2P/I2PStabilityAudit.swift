@@ -11,6 +11,7 @@
 //
 
 import Foundation
+import CryptoKit
 
 enum I2PStabilityAudit {
     /// Runs every stability probe. Surviving probes surface as passing

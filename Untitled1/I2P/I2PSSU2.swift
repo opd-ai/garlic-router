@@ -2253,6 +2253,69 @@ enum I2PSSU2SelfTest {
             return "v3 offer signaled, Retry earned, down-negotiated to the classical handshake and established"
         }
 
+        run("ML-KEM FIPS 203 · Keccak vector, NTT homomorphism, encaps/decaps") {
+            // SHA3-256 known answer (empty input) pins the Keccak sponge.
+            guard Keccak.sha3_256(Data()).hex
+                    == "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a" else {
+                throw SSU2Error.testFailed("SHA3-256 empty-input vector mismatch")
+            }
+            // The NTT must round-trip and be a ring homomorphism: the transform
+            // product must equal the schoolbook negacyclic convolution.
+            func randomPoly() -> [Int] {
+                (0..<MLKEM.n).map { _ in Int.random(in: 0..<MLKEM.q) }
+            }
+            let f = randomPoly()
+            let g = randomPoly()
+            guard MLKEM.inverseNTT(MLKEM.ntt(f)) == f else {
+                throw SSU2Error.testFailed("NTT is not invertible")
+            }
+            var schoolbook = [Int](repeating: 0, count: MLKEM.n)
+            for i in 0..<MLKEM.n {
+                for j in 0..<MLKEM.n {
+                    let target = (i + j) % MLKEM.n
+                    let sign = (i + j) >= MLKEM.n ? MLKEM.q - 1 : 1
+                    schoolbook[target] = (schoolbook[target] + sign * f[i] * g[j]) % MLKEM.q
+                }
+            }
+            let transformed = MLKEM.inverseNTT(
+                MLKEM.multiplyNTTs(MLKEM.ntt(f), MLKEM.ntt(g)))
+            guard transformed == schoolbook else {
+                throw SSU2Error.testFailed("NTT is not a homomorphism for X^256 + 1")
+            }
+            // Both parameter sets: deterministic keygen from (d, z), exact FIPS
+            // 203 wire shapes, ENCAPS/DECAPS agreement, implicit rejection.
+            let d = [UInt8](I2PCrypto.randomBytes(32))
+            let z = [UInt8](I2PCrypto.randomBytes(32))
+            for (version, parameters) in [(I2PSSU2PQVersion.mlKem512, MLKEM.Parameters.mlKem512),
+                                          (I2PSSU2PQVersion.mlKem768, MLKEM.Parameters.mlKem768)] {
+                let first = MLKEM.keyGen(d: d, z: z, parameters: parameters)
+                let second = MLKEM.keyGen(d: d, z: z, parameters: parameters)
+                guard first.ek == second.ek else {
+                    throw SSU2Error.testFailed("\(version.name) keygen is not deterministic in (d, z)")
+                }
+                guard first.ek.count == version.mlKemEncapsulationKeyLength else {
+                    throw SSU2Error.testFailed("\(version.name) encapsulation key shape broken")
+                }
+                let peer = try I2PMLKEMPublicKey(keyData: first.ek)
+                let capsule = try peer.encapsulate()
+                guard capsule.ciphertext.count == version.mlKemCiphertextLength,
+                      capsule.sharedSecret.count == 32 else {
+                    throw SSU2Error.testFailed("\(version.name) capsule shape broken")
+                }
+                let decapsulated = try first.decapsulate(capsule.ciphertext)
+                guard decapsulated == capsule.sharedSecret else {
+                    throw SSU2Error.testFailed("\(version.name) DECAPS disagreed with ENCAPS")
+                }
+                var tampered = capsule.ciphertext
+                tampered[tampered.count / 2] ^= 0xff
+                let rejected = try first.decapsulate(tampered)
+                guard rejected != capsule.sharedSecret, rejected.count == 32 else {
+                    throw SSU2Error.testFailed("\(version.name) implicit rejection failed")
+                }
+            }
+            return "SHA3-256 vector exact; NTT inverts and multiplies homomorphically; ML-KEM-512/768 round-trip with implicit rejection"
+        }
+
         await runAsync("SSU2 PQ hybrid transport · ML-KEM-512 session over the UDP loopback") {
             try await udpHybridLoopbackTest(version: .mlKem512)
         }

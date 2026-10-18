@@ -5,9 +5,11 @@
 //
 //  • ML-KEM-512 (FIPS 203) ENCAPS output is a 768-byte ciphertext + 32-byte shared secret.
 //  • ML-KEM-768 (FIPS 203) ENCAPS output is a 1088-byte ciphertext + 32-byte shared secret.
-//  • The FIPS 203 shapes are produced by CryptoKit's ML-KEM: encapsulation keys
-//    are 800 bytes (ML-KEM-512) / 1184 bytes (ML-KEM-768), both variants stay
-//    within the SSU2 datagram budget once appended to the handshake sections.
+//  • The FIPS 203 shapes are produced by the router's pure-Swift ML-KEM
+//    (I2PMLKEM.swift — Keccak sponge, NTT ring arithmetic, K-PKE/ML-KEM with
+//    implicit rejection): encapsulation keys are 800 bytes (ML-KEM-512) /
+//    1184 bytes (ML-KEM-768), both variants stay within the SSU2 datagram
+//    budget once appended to the handshake sections.
 //  • The hybrid KDF binds BOTH legs: the classical X25519 shared secret is the HKDF
 //    input key material, and the ML-KEM encapsulation (shared secret + ciphertext
 //    binding) rides the info parameter — session material is only reproducible by a
@@ -100,51 +102,33 @@ enum I2PPQHybrid {
     }
 }
 
-// MARK: - Real ML-KEM (FIPS 203) operations via CryptoKit
+// MARK: - Real ML-KEM (FIPS 203) key establishment
 
 import CryptoKit
 
-// MARK: - ML-KEM-shaped hybrid establishment operations
-//
-// NOTE (honest scope): the SSU2 rollout below rides the router's audited
-// primitives — an ephemeral X25519 exchange key inside the ciphertext envelope
-// and HKDF-SHA256 for the encapsulated secret — while preserving the exact
-// FIPS 203 ML-KEM-512/768 wire shapes (800/1184-byte encapsulation keys,
-// 768/1088-byte ciphertexts). CryptoKit's ML-KEM symbol surface differs from
-// its published contract in this SDK; swapping this adapter to the platform's
-// hardened ML-KEM is the one remaining step and needs no transport changes.
-//
-// ENCAPS: shared = X25519(ephemeral, recipient[0..<32]); secret = HKDF-SHA256(
-// shared, salt: full advertised encapsulation key, info: "ML-KEM-ENCAPS-v1").
-// DECAPS re-derives it from the session's own key pair — byte-identical on
-// both sides, fail-closed on shape.
-
-/// The accept-side ML-KEM-shaped key pair: the X25519 exchange key rides in the
-/// first 32 bytes, the remainder completes the FIPS 203 encapsulation-key shape.
+/// The accept-side FIPS 203 ML-KEM key pair. The encapsulation key is the
+/// exact 800/1184-byte wire shape bound to the long-header version byte;
+/// decapsulation runs the real K-PKE decrypt + re-encrypt check and falls
+/// back to FIPS 203 implicit rejection on any mismatch.
 final class I2PMLKEMSecretKey {
     let version: I2PSSU2PQVersion
-    private let x25519PrivateKeyData: Data
+    private let keyPair: MLKEM.KeyPair
     let encapsulationKeyData: Data
 
     init(version: I2PSSU2PQVersion) {
         self.version = version
-        let pair = I2PCrypto.generateX25519KeyPair()
-        self.x25519PrivateKeyData = pair.privateKey
-        self.encapsulationKeyData = pair.publicKey
-            + I2PCrypto.randomBytes(version.mlKemEncapsulationKeyLength - 32)
+        let parameters: MLKEM.Parameters = version == .mlKem512 ? .mlKem512 : .mlKem768
+        self.keyPair = MLKEM.keyGen(parameters)
+        self.encapsulationKeyData = keyPair.ek
     }
 
-    /// DECAPS: derives the 32-byte encapsulated secret from the ciphertext
-    /// envelope, bound to the full encapsulation key material.
+    /// DECAPS: recovers the 32-byte encapsulated secret from the ciphertext,
+    /// bound to this key pair (fail-closed via implicit rejection).
     func decapsulate(_ ciphertext: Data) throws -> Data {
-        guard ciphertext.count == version.mlKemCiphertextLength,
-              ciphertext.count >= 64 else { throw I2PWireError.invalidFormat }
-        let shared = try I2PCrypto.x25519SharedSecret(
-            privateKey: x25519PrivateKeyData, peerPublicKey: ciphertext.prefix(32))
-        return I2PCrypto.hkdfSHA256(inputKeyMaterial: shared,
-                                    salt: encapsulationKeyData,
-                                    info: Data("ML-KEM-ENCAPS-v1".utf8),
-                                    outputLength: 32)
+        guard ciphertext.count == version.mlKemCiphertextLength else {
+            throw I2PWireError.invalidFormat
+        }
+        return keyPair.decapsulate(ciphertext)
     }
 }
 
@@ -164,19 +148,12 @@ struct I2PMLKEMPublicKey {
             ? .mlKem512 : .mlKem768
     }
 
-    /// ENCAPS: produces the version-bound ciphertext envelope and the
-    /// encapsulated secret the peer's decapsulation reproduces exactly.
+    /// ENCAPS: the FIPS 203 capsule — a version-bound ciphertext plus the
+    /// 32-byte shared secret the peer's decapsulation reproduces exactly.
     func encapsulate() throws -> I2PMLKEMEncapsulation {
-        let pair = I2PCrypto.generateX25519KeyPair()
-        let shared = try I2PCrypto.x25519SharedSecret(
-            privateKey: pair.privateKey, peerPublicKey: keyData.prefix(32))
-        let secret = I2PCrypto.hkdfSHA256(inputKeyMaterial: shared,
-                                          salt: keyData,
-                                          info: Data("ML-KEM-ENCAPS-v1".utf8),
-                                          outputLength: 32)
-        return try I2PMLKEMEncapsulation(ciphertext: pair.publicKey
-            + I2PCrypto.randomBytes(version.mlKemCiphertextLength - 64),
-                                         sharedSecret: secret)
+        let result = try MLKEM.encapsulate(encapsulationKey: keyData)
+        return try I2PMLKEMEncapsulation(ciphertext: result.ciphertext,
+                                         sharedSecret: result.sharedSecret)
     }
 }
 
