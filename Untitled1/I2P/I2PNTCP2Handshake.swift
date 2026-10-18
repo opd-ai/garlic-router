@@ -38,13 +38,16 @@ final class NTCP2InitiatorHandshake {
 
     /// Message 1 (SessionRequest): obfuscated e (AES-256-CBC per the spec KDF)
     /// + 2-byte options length prefix + AEAD(options) + padding.
-    /// Options (16 bytes): version(1)=12, paddingLen(1), m3p2len(2), timestamp(8), reserved(4).
+    /// Options (16 bytes): version(1)=2, paddingLen(1), m3p2len(2), timestamp(8), reserved(4).
     func makeSessionRequest(routerInfo: Data, padding: Int = 0) throws -> Data {
         guard stage == .awaitingSessionCreated else {
             throw NTCP2Error.handshakeFailed("session request already sent")
         }
         guard routerInfo.count + 16 <= 0xFFFF else {
             throw NTCP2Error.handshakeFailed("RouterInfo too large for SessionRequest")
+        }
+        guard (0...Int(UInt8.max)).contains(padding) else {
+            throw NTCP2Error.handshakeFailed("invalid SessionRequest padding length")
         }
         ourRouterInfo = routerInfo
         announcedPart2Length = routerInfo.count + 16
@@ -59,7 +62,7 @@ final class NTCP2InitiatorHandshake {
 
         let part2Length = routerInfo.count + 16
         var options = Data(repeating: 0, count: 16)
-        options[0] = 12
+        options[0] = 2 // NTCP2 protocol version
         options[1] = UInt8(padding)
         options[2] = UInt8((part2Length >> 8) & 0xff)
         options[3] = UInt8(part2Length & 0xff)
@@ -107,10 +110,13 @@ final class NTCP2InitiatorHandshake {
         work.mixKey(ee.withUnsafeBytes { Data($0) })
         // 2-byte options length prefix, then the AEAD-encrypted options block.
         let optionsLength = (Int(bytes[32]) << 8) | Int(bytes[33])
+        guard optionsLength == 32 else {
+            throw NTCP2Error.handshakeFailed("handshake options ciphertext must be 32 bytes")
+        }
         guard bytes.count >= 34 + optionsLength else { throw NTCP2Error.needMoreData }
         let options = try work.decrypt(Data(bytes[34..<34 + optionsLength]))
-        guard options.count == 16, options[0] == 12 else {
-            throw NTCP2Error.handshakeFailed("unsupported NTCP2 version")
+        guard options.count == 16, options[0] == 2 else {
+            throw NTCP2Error.handshakeFailed("unsupported NTCP2 version \(options.first ?? 0)")
         }
         let paddingLength = Int(options[1])
         let total = 34 + optionsLength + paddingLength
@@ -179,10 +185,13 @@ final class NTCP2ResponderHandshake {
         work.mixKey(shared.withUnsafeBytes { Data($0) })
         // 2-byte options length prefix, then the AEAD-encrypted options block.
         let optionsLength = (Int(bytes[32]) << 8) | Int(bytes[33])
+        guard optionsLength == 32 else {
+            throw NTCP2Error.handshakeFailed("handshake options ciphertext must be 32 bytes")
+        }
         guard bytes.count >= 34 + optionsLength else { throw NTCP2Error.needMoreData }
         let options = try work.decrypt(Data(bytes[34..<34 + optionsLength]))
-        guard options.count == 16, options[0] == 12 else {
-            throw NTCP2Error.handshakeFailed("unsupported NTCP2 version")
+        guard options.count == 16, options[0] == 2 else {
+            throw NTCP2Error.handshakeFailed("unsupported NTCP2 version \(options.first ?? 0)")
         }
         let paddingLength = Int(options[1])
         let announcedPart2 = (UInt16(options[2]) << 8) | UInt16(options[3])
@@ -204,8 +213,11 @@ final class NTCP2ResponderHandshake {
         let ee = try e2.sharedSecretFromKeyAgreement(with: e1)
         chain.mixKey(ee.withUnsafeBytes { Data($0) })
 
+        guard (0...Int(UInt8.max)).contains(padding) else {
+            throw NTCP2Error.handshakeFailed("invalid SessionCreated padding length")
+        }
         var options2 = Data(repeating: 0, count: 16)
-        options2[0] = 12
+        options2[0] = 2 // NTCP2 protocol version
         options2[1] = UInt8(padding)
         options2.replaceSubrange(4..<12, with: NTCP2Time.milliseconds(Date()))
         let ciphertext = try chain.encrypt(options2)

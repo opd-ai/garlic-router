@@ -85,12 +85,21 @@ enum I2PProductionAudit {
         guard initiator.announcedPart2Length == routerInfo.count + 16 else {
             throw I2PMainnetFailure(message: "SessionRequest announced m3p2len \(initiator.announcedPart2Length), expected RouterInfo + 16-byte tag (\(routerInfo.count + 16)) — m3p2len wrong")
         }
+        guard request.count == 82 else {
+            throw I2PMainnetFailure(message: "SessionRequest is \(request.count) bytes, expected 66-byte fixed envelope + 16-byte padding")
+        }
         let (reply, requestConsumed) = try responder.processSessionRequest(request, padding: 16)
         guard requestConsumed == request.count else {
             throw I2PMainnetFailure(message: "responder consumed \(requestConsumed) of \(request.count) SessionRequest bytes — m3p2len/frame mismatch")
         }
+        guard reply.count == 82 else {
+            throw I2PMainnetFailure(message: "SessionCreated is \(reply.count) bytes, expected 66-byte fixed envelope + 16-byte padding")
+        }
 
         let (confirm, createdConsumed) = try initiator.processSessionCreated(reply)
+        guard createdConsumed == reply.count else {
+            throw I2PMainnetFailure(message: "initiator consumed \(createdConsumed) of \(reply.count) SessionCreated bytes")
+        }
         guard confirm.count == routerInfo.count + 16 + 48 else {
             throw I2PMainnetFailure(message: "message 3 is \(confirm.count) bytes, expected 48 + (RouterInfo + 16 tag) — m3p2len wrong")
         }
