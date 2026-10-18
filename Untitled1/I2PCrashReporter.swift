@@ -54,4 +54,16 @@ enum I2PCrashReporter {
         try? FileManager.default.moveItem(at: url, to: seen)
         return report
     }
+
+    /// Non-destructive read: surfaces the current crash report without
+    /// retiring it, so an interrupted audit's banner can show the exact
+    /// faulting context while the stability audit's diagnostics card still
+    /// consumes the report on its own.
+    static func peekLastCrashReport() -> String? {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("i2p-last-crash.log")
+        guard let report = try? String(contentsOf: url, encoding: .utf8),
+              !report.isEmpty else { return nil }
+        return report
+    }
 }

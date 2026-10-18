@@ -37,7 +37,7 @@ enum I2PProductionAudit {
             await onProgress(name, nil)
             let result: I2PSelfTestResult
             do {
-                result = I2PSelfTestResult(name: name, passed: true, detail: try await probe())
+                result = I2PSelfTestResult(name: name, passed: true, detail: try await withWatchdog(name: name, probe))
             } catch {
                 result = I2PSelfTestResult(name: name, passed: false, detail: String(describing: error))
             }
@@ -473,6 +473,25 @@ enum I2PProductionAudit {
     }
 
     // MARK: - Helpers
+
+    /// Races every probe against a watchdog so a hung probe surfaces as a
+    /// graceful failed check with a clear reason — and the audit keeps
+    /// advancing — instead of sitting dead in one probe until an external
+    /// kill lands inside whatever checkpoint window happens to be active.
+    private static func withWatchdog(name: String, seconds: UInt64 = 90, _ body: @escaping () async throws -> String) async throws -> String {
+        try await withThrowingTaskGroup(of: String.self) { group in
+            group.addTask { try await body() }
+            group.addTask {
+                try await Task.sleep(for: .seconds(seconds))
+                throw I2PMainnetFailure(message: "\(name): probe overran its \(seconds)s watchdog — hang class, cancelled before it could stall the audit")
+            }
+            guard let first = try await group.next() else {
+                throw I2PMainnetFailure(message: "\(name): probe produced no result")
+            }
+            group.cancelAll()
+            return first
+        }
+    }
 
     private static func hex(_ string: String) -> Data {
         var data = Data(capacity: string.count / 2)

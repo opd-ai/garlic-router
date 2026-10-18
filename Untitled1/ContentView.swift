@@ -169,10 +169,19 @@ struct ContentView: View {
             }
 
             if let readinessLastInterruptedPhase {
-                Text("The previous run stopped during: \(readinessLastInterruptedPhase). The active probe is saved so interruptions can be diagnosed.")
+                Text(I2PReadinessAudit.interruptionNotice() ?? readinessLastInterruptedPhase)
                     .font(.caption2)
                     .foregroundStyle(.orange)
                     .textSelection(.enabled)
+                // If the process actually crashed mid-audit, the fatal-signal
+                // handler persisted the exact faulting context — show its
+                // header (signal + top stack frames) right under the banner.
+                if let crashReport = I2PCrashReporter.peekLastCrashReport() {
+                    Text(crashReport.split(separator: "\n").prefix(8).joined(separator: "\n"))
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.orange)
+                        .textSelection(.enabled)
+                }
             }
 
             if !readinessResults.isEmpty {
