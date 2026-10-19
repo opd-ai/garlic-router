@@ -76,4 +76,37 @@ enum I2PCrashReporter {
               !report.isEmpty else { return nil }
         return report
     }
+
+    /// Structured view of the current crash report: WHEN it was captured and
+    /// WHICH probe was executing at signal time.
+    ///
+    /// This is the authoritative interruption record. The UserDefaults
+    /// checkpoint can be stale on test devices (an older build's phase-only
+    /// write, or lost writes), while the crash report names the probe that
+    /// actually trapped — so the banner prefers crash evidence when the crash
+    /// is at least as fresh as the checkpoint.
+    static func lastCrashContext() -> (date: Date, activeProbe: String?)? {
+        guard let report = peekLastCrashReport() else { return nil }
+        let lines = report.split(separator: "\n").map(String.init)
+
+        // First line: "Signal <n> at <Date>".
+        var date: Date?
+        if let header = lines.first, header.hasPrefix("Signal "), let atRange = header.range(of: " at ") {
+            let timestamp = String(header[atRange.upperBound...])
+            let formatter = DateFormatter()
+            formatter.dateFormat = "yyyy-MM-dd HH:mm:ss Z"
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.timeZone = TimeZone(secondsFromGMT: 0)
+            date = formatter.date(from: timestamp)
+        }
+
+        // The "active probe: <name>" line, when the crash landed inside an audit.
+        var activeProbe: String?
+        for line in lines where line.hasPrefix("active probe: ") {
+            activeProbe = String(line.dropFirst("active probe: ".count)).trimmingCharacters(in: .whitespaces)
+        }
+
+        guard let capturedAt = date ?? lines.first.map({ _ in Date.distantPast }) else { return nil }
+        return (capturedAt, activeProbe)
+    }
 }

@@ -267,8 +267,16 @@ enum I2PProductionAudit {
         guard opened == plaintext else {
             throw I2PMainnetFailure(message: "ChaCha20-Poly1305 round-trip failed")
         }
-        var tampered = combined
-        tampered[10] ^= 0xff
+        // Tamper via an Array round-trip: Data carries its own index base, and
+        // an absolute Int subscript on a slice-backed Data traps with SIGTRAP
+        // (this exact trap was observed in this probe on test devices). Array
+        // indices are unconditionally zero-based, so this cannot trap.
+        var tamperedBytes = [UInt8](combined)
+        guard tamperedBytes.count > 10 else {
+            throw I2PMainnetFailure(message: "AEAD output too short for the tamper check")
+        }
+        tamperedBytes[10] ^= 0xff
+        let tampered = Data(tamperedBytes)
         guard expectThrow({ _ = try I2PCrypto.chacha20Poly1305Open(key: key, nonce: nonce, ciphertextAndTag: tampered, aad: aad) }) else {
             throw I2PMainnetFailure(message: "tampered AEAD frame was accepted")
         }
@@ -304,7 +312,9 @@ enum I2PProductionAudit {
         let seed = I2PCrypto.generateEd25519Seed()
         let message = I2PCrypto.randomBytes(64)
         let publicKey = I2PCrypto.ed25519PublicKey(fromSeed: seed)
-        guard publicKey.count == 32, publicKey[31] & 0x80 == 0 else {
+        // Absolute subscript rides an Array copy (always zero-based — see rfcVectors).
+        let publicKeyBytes = [UInt8](publicKey)
+        guard publicKeyBytes.count == 32, publicKeyBytes[31] & 0x80 == 0 else {
             throw I2PMainnetFailure(message: "Ed25519 public key encoding is not canonical (RFC 8032)")
         }
         // Pure-Swift Ed25519 and CryptoKit agree on signatures in both directions.
@@ -388,8 +398,11 @@ enum I2PProductionAudit {
         guard reparsed.serialize() == encoded else {
             throw I2PMainnetFailure(message: "RouterInfo round-trip not byte-identical — field order deviates from the spec layout")
         }
-        var tampered = encoded
-        tampered[tampered.count / 2] ^= 0xff
+        // Same Array round-trip discipline as rfcVectors: never absolute-
+        // subscript a Data whose index base is not provably zero.
+        var tamperedBytes = [UInt8](encoded)
+        tamperedBytes[tamperedBytes.count / 2] ^= 0xff
+        let tampered = Data(tamperedBytes)
         guard (try? I2PRouterInfo.parse(tampered)) == nil else {
             throw I2PMainnetFailure(message: "tampered RouterInfo accepted at parse — signature verification not enforced")
         }
@@ -405,15 +418,17 @@ enum I2PProductionAudit {
         writer.hash(I2PCrypto.randomBytes(32))
         writer.date(Date(timeIntervalSince1970: 1_000_000))
         let bytes = writer.data
+        // Absolute subscripts ride an Array copy (always zero-based — see rfcVectors).
+        let bytesArray = [UInt8](bytes)
         // 4-byte integer + 2-byte short + 32-byte hash + 8-byte date, all big-endian.
-        guard bytes.count == 46, bytes[0] == 0x11, bytes[1] == 0x22, bytes[2] == 0x33, bytes[3] == 0x44,
-              bytes[4] == 0xBE, bytes[5] == 0xEF else {
+        guard bytesArray.count == 46, bytesArray[0] == 0x11, bytesArray[1] == 0x22, bytesArray[2] == 0x33, bytesArray[3] == 0x44,
+              bytesArray[4] == 0xBE, bytesArray[5] == 0xEF else {
             throw I2PMainnetFailure(message: "big-endian encoding of integer/short primitives wrong")
         }
         // 1_000_000 seconds since the epoch encodes as 1_000_000_000 milliseconds
         // = 0x000000003B9ACA00 at offsets 38..<46.
-        guard bytes[38] == 0x00, bytes[39] == 0x00, bytes[40] == 0x00, bytes[41] == 0x00,
-              bytes[42] == 0x3B, bytes[43] == 0x9A, bytes[44] == 0xCA, bytes[45] == 0x00 else {
+        guard bytesArray[38] == 0x00, bytesArray[39] == 0x00, bytesArray[40] == 0x00, bytesArray[41] == 0x00,
+              bytesArray[42] == 0x3B, bytesArray[43] == 0x9A, bytesArray[44] == 0xCA, bytesArray[45] == 0x00 else {
             throw I2PMainnetFailure(message: "8-byte timestamp not encoded as big-endian milliseconds since epoch")
         }
         var reader = I2PReader(bytes)

@@ -169,18 +169,43 @@ struct ContentView: View {
             }
 
             if let readinessLastInterruptedPhase {
-                Text(I2PReadinessAudit.interruptionNotice() ?? readinessLastInterruptedPhase)
-                    .font(.caption2)
-                    .foregroundStyle(.orange)
-                    .textSelection(.enabled)
-                // If the process actually crashed mid-audit, the fatal-signal
-                // handler persisted the exact faulting context — show its
-                // header (signal + top stack frames) right under the banner.
-                if let crashReport = I2PCrashReporter.peekLastCrashReport() {
-                    Text(crashReport.split(separator: "\n").prefix(8).joined(separator: "\n"))
-                        .font(.system(.caption2, design: .monospaced))
+                // The crash report is the authoritative interruption record:
+                // its "active probe" line names what the process actually
+                // trapped on, while the UserDefaults checkpoint can be stale
+                // (an older build's phase-only write, or writes lost on an
+                // ephemeral test device). When the crash is at least as fresh
+                // as the checkpoint, it leads the banner.
+                let checkpoint = I2PReadinessAudit.interruptedCheckpoint
+                let crash = I2PCrashReporter.lastCrashContext()
+                let crashLeads: Bool = {
+                    guard let crash else { return false }
+                    return checkpoint?.savedAt.map({ crash.date >= $0 }) ?? true
+                }()
+                if crashLeads, let crash, let probe = crash.activeProbe {
+                    Text("The process crashed during: \(probe). The checkpoint banner below may be stale — judge by the signal report.")
+                        .font(.caption2.weight(.medium))
                         .foregroundStyle(.orange)
                         .textSelection(.enabled)
+                    if let crashReport = I2PCrashReporter.peekLastCrashReport() {
+                        Text(crashReport.split(separator: "\n").prefix(10).joined(separator: "\n"))
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.orange)
+                            .textSelection(.enabled)
+                    }
+                } else {
+                    Text(I2PReadinessAudit.interruptionNotice() ?? readinessLastInterruptedPhase)
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                        .textSelection(.enabled)
+                    // If the process actually crashed mid-audit, the fatal-signal
+                    // handler persisted the exact faulting context — show its
+                    // header (signal + top stack frames) right under the banner.
+                    if let crashReport = I2PCrashReporter.peekLastCrashReport() {
+                        Text(crashReport.split(separator: "\n").prefix(8).joined(separator: "\n"))
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.orange)
+                            .textSelection(.enabled)
+                    }
                 }
             }
 
