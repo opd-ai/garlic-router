@@ -77,6 +77,35 @@ enum I2PCrashReporter {
         return report
     }
 
+    /// The banner-relevant slice of the crash report: the header lines
+    /// (signal, thread, active probe) plus the app's own stack frames.
+    ///
+    /// The full backtrace's first frames are dominated by machinery that
+    /// carries no fault information — the signal handler itself, _sigtramp,
+    /// pthread_kill, abort, and the Swift runtime's fatal-message emitter —
+    /// while the first "Untitled1" frame names the exact app function that
+    /// called fatalError/trapped. Runtime abort chains routinely pushed those
+    /// actionable frames past the banner's line budget, so this slice skips
+    /// the noise and leads with the frames that identify the defect.
+    static func diagnosticHead(maxFrames: Int = 6) -> String {
+        guard let report = peekLastCrashReport() else { return "" }
+        let lines = report.split(separator: "\n").map(String.init)
+        var head: [String] = []
+        for line in lines {
+            if line.hasPrefix("Signal ") || line.hasPrefix("thread:")
+                || line.hasPrefix("active probe: ") {
+                head.append(line)
+            } else {
+                break
+            }
+        }
+        let appFrames = lines.filter {
+            $0.contains("Untitled1") && !$0.contains("I2PCrashReporter")
+        }.prefix(maxFrames)
+        head.append(contentsOf: appFrames)
+        return head.joined(separator: "\n")
+    }
+
     /// Structured view of the current crash report: WHEN it was captured and
     /// WHICH probe was executing at signal time.
     ///

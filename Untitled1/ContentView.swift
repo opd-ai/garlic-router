@@ -192,12 +192,10 @@ struct ContentView: View {
                         .font(.caption2.weight(.medium))
                         .foregroundStyle(.orange)
                         .textSelection(.enabled)
-                    if let crashReport = I2PCrashReporter.peekLastCrashReport() {
-                        Text(crashReport.split(separator: "\n").prefix(10).joined(separator: "\n"))
-                            .font(.system(.caption2, design: .monospaced))
-                            .foregroundStyle(.orange)
-                            .textSelection(.enabled)
-                    }
+                    Text(I2PCrashReporter.diagnosticHead(maxFrames: 4))
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.orange)
+                        .textSelection(.enabled)
                 } else {
                     Text(I2PReadinessAudit.interruptionNotice() ?? readinessLastInterruptedPhase)
                         .font(.caption2)
@@ -206,12 +204,10 @@ struct ContentView: View {
                     // If the process actually crashed mid-audit, the fatal-signal
                     // handler persisted the exact faulting context — show its
                     // header (signal + top stack frames) right under the banner.
-                    if let crashReport = I2PCrashReporter.peekLastCrashReport() {
-                        Text(crashReport.split(separator: "\n").prefix(8).joined(separator: "\n"))
-                            .font(.system(.caption2, design: .monospaced))
-                            .foregroundStyle(.orange)
-                            .textSelection(.enabled)
-                    }
+                    Text(I2PCrashReporter.diagnosticHead(maxFrames: 4))
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.orange)
+                        .textSelection(.enabled)
                 }
             }
 
@@ -449,19 +445,21 @@ struct ContentView: View {
     private func refreshCapturedCrash() {
         guard capturedCrash == nil,
               let context = I2PCrashReporter.lastCrashContext() else { return }
-        let surfacedKey = "i2p.crash.lastSurfacedAt"
+        // The surfaced marker is versioned: when the diagnostic-head format
+        // changed (app frames now lead the banner instead of the runtime
+        // abort chain), previously surfaced reports re-surface once so the
+        // actionable frames become visible for an already-captured crash.
+        let surfacedKey = "i2p.crash.lastSurfacedAt.v2"
         if let surfaced = UserDefaults.standard.object(forKey: surfacedKey) as? Date,
            context.date <= surfaced {
             return
         }
         UserDefaults.standard.set(context.date, forKey: surfacedKey)
         UserDefaults.standard.synchronize()
-        let head = I2PCrashReporter.peekLastCrashReport()?
-            .split(separator: "\n").prefix(10).joined(separator: "\n") ?? ""
         capturedCrash = CapturedCrash(
             capturedAt: context.date,
             probe: context.activeProbe,
-            reportHead: head)
+            reportHead: I2PCrashReporter.diagnosticHead())
     }
 
     private var capturedCrashBanner: some View {
