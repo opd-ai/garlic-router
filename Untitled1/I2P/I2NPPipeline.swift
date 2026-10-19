@@ -27,15 +27,21 @@ enum I2PTunnelLayerCipher {
 
     /// AES-256-ECB encryption of one 16-byte block (CBC of a single block with
     /// a zero IV), used for the spec's IV-key transform.
-    static func ecbBlock(_ block: Data, key: Data) -> Data {
-        precondition(block.count == 16 && key.count == 32,
-                     "ECB block requires a 16-byte block and a 32-byte key")
+    ///
+    /// Fail closed by throwing, never by trapping: an IV field or key of the
+    /// wrong size can arrive from any path (malformed wire data, a fuzz input,
+    /// a misbehaving caller), and a precondition here would kill the whole
+    /// router process — the exact crash class the stability audit hunts.
+    static func ecbBlock(_ block: Data, key: Data) throws -> Data {
+        guard block.count == 16, key.count == 32 else {
+            throw I2PWireError.invalidFormat
+        }
         return I2PAESCBC.encrypt(block, key: key, iv: Data(repeating: 0, count: 16))
     }
 
     /// IV_used = AES-256-ECB(IV_key, IV_field) XOR IV_field.
-    static func deriveCBCIV(ivField: Data, ivKey: Data) -> Data {
-        let transformed = ecbBlock(ivField, key: ivKey)
+    static func deriveCBCIV(ivField: Data, ivKey: Data) throws -> Data {
+        let transformed = try ecbBlock(ivField, key: ivKey)
         return Data(zip(transformed, ivField).map { $0 ^ $1 })
     }
 
@@ -63,7 +69,7 @@ enum I2PTunnelLayerCipher {
     static func wrap(content: Data, layerKey: Data, ivField: Data, ivKey: Data) throws -> Data {
         I2PAESCBC.encrypt(try padded(content),
                           key: layerKey,
-                          iv: deriveCBCIV(ivField: ivField, ivKey: ivKey))
+                          iv: try deriveCBCIV(ivField: ivField, ivKey: ivKey))
     }
 
     /// Decrypts one hop's layer: AES-256-CBC over the full 1008-byte body with
@@ -74,7 +80,7 @@ enum I2PTunnelLayerCipher {
         guard body.count == I2PTunnelDataPayload.bodySize else { throw I2NPError.invalidPayload }
         let plain = I2PAESCBC.decrypt(body,
                                       key: layerKey,
-                                      iv: deriveCBCIV(ivField: ivField, ivKey: ivKey))
+                                      iv: try deriveCBCIV(ivField: ivField, ivKey: ivKey))
         return try unpad(plain)
     }
 }

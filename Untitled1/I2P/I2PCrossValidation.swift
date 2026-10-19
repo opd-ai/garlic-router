@@ -1789,7 +1789,7 @@ enum I2PCrossValidation {
 
         // The CBC IV is exactly AES-ECB(IV_key, IV field) XOR IV field, and
         // manual CBC decryption with it recovers the padded content byte-for-byte.
-        let derived = I2PTunnelLayerCipher.deriveCBCIV(ivField: ivField, ivKey: ivKey)
+        let derived = try I2PTunnelLayerCipher.deriveCBCIV(ivField: ivField, ivKey: ivKey)
         let expectedPlain = try I2PTunnelLayerCipher.padded(content)
         guard I2PAESCBC.decrypt(body, key: layerKey, iv: derived) == expectedPlain else {
             throw I2PWireError.invalidFormat
@@ -1854,7 +1854,7 @@ enum I2PCrossValidation {
             let regionLength = ladder[index]
             let plain = I2PAESCBC.decrypt(Data(current.body.prefix(regionLength)),
                                           key: layerKeys[index],
-                                          iv: I2PTunnelLayerCipher.deriveCBCIV(ivField: current.iv,
+                                          iv: try I2PTunnelLayerCipher.deriveCBCIV(ivField: current.iv,
                                                                                ivKey: ivKeys[index]))
             let action = try participant.processTunnelData(current)
             if index < 2 {
