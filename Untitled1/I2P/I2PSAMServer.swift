@@ -337,7 +337,14 @@ final class I2PSAMConnection {
     }
 
     private let connection: NWConnection
-    private unowned let server: I2PSAMServer
+    // Strong, not unowned: a connection's async drain chain can outlive the
+    // owner that tore the server down (a test rig deallocating while a
+    // session-create chain is still inside pool filling). Resuming that chain
+    // and touching an unowned server trap-killed the process with a runtime
+    // assertion (unowned-retain failure → fatalError → SIGABRT). The server
+    // holds its connections in an array and drops them on close, so the cycle
+    // always breaks exactly once per connection.
+    private let server: I2PSAMServer
     private let lock = NSLock()
     private var phase: Phase = .awaitingHello
     private var streamPhase: StreamPhase = .idle
@@ -908,9 +915,12 @@ final class I2PSAMConnection {
     }
 
     private func handleTransportClose() {
-        guard !closed else { return }
-        closed = true
+        // Check-and-set under the lock: close callbacks and server teardown
+        // can arrive concurrently, and a double-close would tear the session
+        // down twice and race the stream phase.
         lock.lock()
+        guard !closed else { lock.unlock(); return }
+        closed = true
         let phase = streamPhase
         let nickname = session?.nickname
         session?.pendingAccept = nil
