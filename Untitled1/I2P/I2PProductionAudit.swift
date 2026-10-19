@@ -34,10 +34,25 @@ enum I2PProductionAudit {
         return activeProbeStorage
     }
 
-    private static func setActiveProbe(_ name: String?) {
+    static func setActiveProbe(_ name: String?) {
         probeLock.lock()
         defer { probeLock.unlock() }
         activeProbeStorage = name
+    }
+
+    /// Persists (or retires) the timestamped active-audit-probe checkpoint.
+    /// Shared by every audit engine so a crash during ANY audit leaves a
+    /// checkpoint naming the probe that was running — and the in-memory
+    /// active-probe name rides along into the signal handler's report.
+    static func writeCheckpoint(_ name: String?) {
+        if let name {
+            UserDefaults.standard.set(name, forKey: checkpointKey)
+            UserDefaults.standard.set(Date(), forKey: checkpointTimeKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: checkpointKey)
+            UserDefaults.standard.removeObject(forKey: checkpointTimeKey)
+        }
+        UserDefaults.standard.synchronize()
     }
 
     /// Runs each production probe serially and reports both its start and its
@@ -67,9 +82,7 @@ enum I2PProductionAudit {
             // crash reporter BEFORE the probe runs: a mid-probe trap then
             // names the exact probe in its own report.
             setActiveProbe(name)
-            UserDefaults.standard.set(name, forKey: checkpointKey)
-            UserDefaults.standard.set(Date(), forKey: checkpointTimeKey)
-            UserDefaults.standard.synchronize()
+            writeCheckpoint(name)
             await onProgress(name, nil)
             let result: I2PSelfTestResult
             do {
@@ -87,9 +100,7 @@ enum I2PProductionAudit {
         // The run completed (probe errors were folded into failed results) —
         // retire the checkpoint so no stale banner survives the session.
         setActiveProbe(nil)
-        UserDefaults.standard.removeObject(forKey: checkpointKey)
-        UserDefaults.standard.removeObject(forKey: checkpointTimeKey)
-        UserDefaults.standard.synchronize()
+        writeCheckpoint(nil)
 
         let passing = results.filter(\.passed).count
         let summary = I2PSelfTestResult(

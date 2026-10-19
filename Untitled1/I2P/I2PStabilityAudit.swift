@@ -17,7 +17,15 @@ enum I2PStabilityAudit {
     /// Runs every stability probe. Surviving probes surface as passing
     /// entries; a probe that fails returns its finding in the action-items
     /// format. The final entry carries the overall stability verdict.
-    static func runAll() async -> [I2PSelfTestResult] {
+    ///
+    /// Every probe is checkpointed through the shared audit-progress slot
+    /// (the same machinery the production audit uses) so a crash mid-probe
+    /// names the exact probe in its own crash report AND leaves a timestamped
+    /// checkpoint for the launch banner — instead of dying silently with no
+    /// surface anywhere.
+    static func runAll(
+        onProgress: (String, I2PSelfTestResult?) async -> Void = { _, _ in }
+    ) async -> [I2PSelfTestResult] {
         let probes: [(category: String, name: String, run: () async throws -> String)] = [
             ("Nil/force-unwrap & bounds", "trust-boundary parser fuzz", fuzzParsers),
             ("Threading & races", "concurrent access hammer", concurrentHammer),
@@ -31,23 +39,36 @@ enum I2PStabilityAudit {
         var failures: [String] = []
 
         for probe in probes {
+            let checkpointName = "Stability · [\(probe.category)] \(probe.name)"
+            I2PProductionAudit.setActiveProbe(checkpointName)
+            I2PProductionAudit.writeCheckpoint(checkpointName)
+            await onProgress(checkpointName, nil)
+            let result: I2PSelfTestResult
             do {
                 let detail = try await probe.run()
-                results.append(I2PSelfTestResult(
+                result = I2PSelfTestResult(
                     name: "Stability · [\(probe.category)] \(probe.name)",
                     passed: true,
                     detail: detail
-                ))
+                )
             } catch {
                 let detail = "Crash type: the probe exercised this category and the code path failed safely (typed error, no crash) — finding: \(String(describing: error))"
                 failures.append(probe.name)
-                results.append(I2PSelfTestResult(
+                result = I2PSelfTestResult(
                     name: "Stability · [\(probe.category)] \(probe.name)",
                     passed: false,
                     detail: detail
-                ))
+                )
             }
+            results.append(result)
+            await onProgress(checkpointName, result)
+            await Task.yield()
         }
+
+        // The run completed — retire the shared checkpoint so no stale
+        // banner survives the session.
+        I2PProductionAudit.setActiveProbe(nil)
+        I2PProductionAudit.writeCheckpoint(nil)
 
         let passing = results.filter(\.passed).count
         results.append(I2PSelfTestResult(
@@ -136,6 +157,11 @@ enum I2PStabilityAudit {
         var rejected = 0
         var parsed = 0
         for input in inputs {
+            // Name the exact malformed input in the in-memory active-probe
+            // slot: if this input's parse traps, the signal handler's report
+            // names the input AND the backtrace names the parser — no blind
+            // bisecting needed.
+            I2PProductionAudit.setActiveProbe("Stability parser fuzz · \(input.name)")
             var didThrow = false
             do {
                 if input.name.hasPrefix("routerinfo") {

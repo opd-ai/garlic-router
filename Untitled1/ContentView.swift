@@ -22,6 +22,10 @@ struct ContentView: View {
     @State private var readinessRunning = false
     @State private var readinessCurrentProbe = ""
     @State private var readinessCompletedChecks = 0
+    @State private var stabilityRunning = false
+    @State private var stabilityCurrentProbe = ""
+    @State private var stabilityCompletedChecks = 0
+    @State private var capturedCrash: CapturedCrash?
     @State private var readinessLastInterruptedPhase: String?
     @State private var sizes: [(name: String, bytes: Int)] = []
 
@@ -55,6 +59,7 @@ struct ContentView: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 14) {
+                    capturedCrashBanner
                     cryptoSuiteCard
                     serializationCard
                     selfTestCard
@@ -75,6 +80,7 @@ struct ContentView: View {
                 if readinessLastInterruptedPhase == nil {
                     readinessLastInterruptedPhase = I2PReadinessAudit.interruptedPhase
                 }
+                refreshCapturedCrash()
             }
         }
     }
@@ -236,13 +242,31 @@ struct ContentView: View {
 
     /// The systematic crash-safety audit: every checklist category from the
     /// crash-debugging framework is exercised by an executable probe. No
-    /// mainnet traffic involved.
+    /// mainnet traffic involved. Progress rides the same onProgress channel
+    /// as the readiness audit, and the probe engine checkpoints each probe
+    /// through the shared audit-progress slot — so a mid-probe trap leaves a
+    /// named crash report and a named checkpoint instead of a silent death.
     private func runStabilityAudit() {
-        Task.detached {
-            let fresh = await I2PStabilityAudit.runAll()
+        guard !stabilityRunning else { return }
+        stabilityRunning = true
+        stabilityResults = []
+        stabilityCurrentProbe = "Preparing stability checks"
+        stabilityCompletedChecks = 0
+        Task.detached(priority: .utility) {
+            let fresh = await I2PStabilityAudit.runAll { phase, result in
+                await MainActor.run {
+                    stabilityCurrentProbe = phase
+                    if let result {
+                        stabilityResults.append(result)
+                        stabilityCompletedChecks += 1
+                    }
+                }
+            }
             await MainActor.run {
                 stabilityResults = fresh
                 stabilityExpanded = true
+                stabilityCurrentProbe = ""
+                stabilityRunning = false
             }
         }
     }
@@ -417,12 +441,65 @@ struct ContentView: View {
         }
     }
 
+    /// A captured crash from the previous session, surfaced at launch
+    /// regardless of which audit crashed — the readiness card's banner is
+    /// gated on the readiness checkpoint, which is empty after a passing
+    /// readiness audit, so a stability-audit crash would otherwise be
+    /// invisible in the UI even though the signal handler captured it.
+    private func refreshCapturedCrash() {
+        guard capturedCrash == nil,
+              let context = I2PCrashReporter.lastCrashContext() else { return }
+        let surfacedKey = "i2p.crash.lastSurfacedAt"
+        if let surfaced = UserDefaults.standard.object(forKey: surfacedKey) as? Date,
+           context.date <= surfaced {
+            return
+        }
+        UserDefaults.standard.set(context.date, forKey: surfacedKey)
+        UserDefaults.standard.synchronize()
+        let head = I2PCrashReporter.peekLastCrashReport()?
+            .split(separator: "\n").prefix(10).joined(separator: "\n") ?? ""
+        capturedCrash = CapturedCrash(
+            capturedAt: context.date,
+            probe: context.activeProbe,
+            reportHead: head)
+    }
+
+    private var capturedCrashBanner: some View {
+        Group {
+            if let crash = capturedCrash {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                        Text("Crash captured \(crash.capturedAt.formatted(date: .abbreviated, time: .shortened))")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.orange)
+                        Spacer()
+                    }
+                    Text(crash.probe.map { "The process crashed during: \($0)." }
+                            ?? "The process crashed outside a named probe.")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.orange)
+                        .textSelection(.enabled)
+                    Text(crash.reportHead)
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.orange)
+                        .textSelection(.enabled)
+                }
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 16))
+            }
+        }
+    }
+
     private var stabilityCard: some View {
         card(title: "Crash & stability audit") {
             Button {
                 runStabilityAudit()
             } label: {
-                Label("Run stability audit", systemImage: "checkmark.shield")
+                Label(stabilityRunning ? "Running stability probes…" : "Run stability audit",
+                      systemImage: stabilityRunning ? "hourglass" : "checkmark.shield")
                     .font(.subheadline.weight(.semibold))
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 10)
@@ -430,6 +507,18 @@ struct ContentView: View {
             }
             .buttonStyle(.plain)
             .tint(accent)
+            .disabled(stabilityRunning)
+
+            if stabilityRunning {
+                VStack(alignment: .leading, spacing: 6) {
+                    ProgressView(value: Double(stabilityCompletedChecks), total: 6)
+                        .tint(accent)
+                    Text("\(stabilityCompletedChecks) of 6 probes complete · \(stabilityCurrentProbe)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
 
             if !stabilityResults.isEmpty {
                 let passed = stabilityResults.filter(\.passed).count
@@ -633,4 +722,12 @@ final class BackgroundTaskLease: @unchecked Sendable {
         UIApplication.shared.endBackgroundTask(identifier)
         identifier = .invalid
     }
+}
+
+/// One captured crash: when the process died, which audit probe was running
+/// (from the signal handler's report), and the report's header for display.
+struct CapturedCrash {
+    let capturedAt: Date
+    let probe: String?
+    let reportHead: String
 }
