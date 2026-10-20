@@ -323,10 +323,23 @@ enum I2PProductionAudit {
         let seed = I2PCrypto.generateEd25519Seed()
         let message = I2PCrypto.randomBytes(64)
         let publicKey = I2PCrypto.ed25519PublicKey(fromSeed: seed)
-        // Absolute subscript rides an Array copy (always zero-based — see rfcVectors).
-        let publicKeyBytes = [UInt8](publicKey)
-        guard publicKeyBytes.count == 32, publicKeyBytes[31] & 0x80 == 0 else {
-            throw I2PMainnetFailure(message: "Ed25519 public key encoding is not canonical (RFC 8032)")
+        // RFC 8032 §5.1.3 canonicality: the 32-byte encoding must decompress to
+        // a valid curve point AND re-encode to the identical bytes. The high bit
+        // of byte 31 records the parity of x and is PART of the canonical
+        // encoding — roughly half of all valid keys carry it set, so the old
+        // sign-bit-clear check coin-flipped the probe on perfectly valid keys.
+        // Decompression already rejects non-decodable points and the x == 0
+        // with sign bit set encoding (RFC 8032 §5.1.3 step 3).
+        let publicKeyArray = [UInt8](publicKey)
+        guard publicKeyArray.count == 32,
+              let decodedPoint = GePoint(compressed: publicKeyArray),
+              decodedPoint.encode() == publicKeyArray else {
+            throw I2PMainnetFailure(message: "Ed25519 public key encoding is not canonical (RFC 8032 §5.1.3) — decoding or re-serialization diverged")
+        }
+        // Cross-suite key derivation: the pure-Swift implementation and CryptoKit
+        // must derive the identical public key from the same seed.
+        guard I2PCrypto.ed25519PurePublicKey(fromSeed: seed) == publicKey else {
+            throw I2PMainnetFailure(message: "pure-Swift Ed25519 key derivation diverged from CryptoKit for the same seed")
         }
         // Pure-Swift Ed25519 and CryptoKit agree on signatures in both directions.
         guard let pureSignature = I2PCrypto.ed25519PureSign(message, seed: seed), pureSignature.count == 64 else {
