@@ -254,9 +254,17 @@ enum I2PExternalAddressDiscovery {
 // MARK: - Mainnet tunnel build plumbing (surfaced by the live suite)
 
 /// Carries VariableTunnelBuild / BuildReply I2NP envelopes over live NTCP2
-/// sessions — the wire path the loopback build bus could never serve.
+/// sessions — the wire path the loopback build bus could never serve. With a
+/// demand-dial hook wired, a build toward a hop we hold no session for resolves
+/// the hop's RouterInfo (netdb cache-first), dials it, and retries the send
+/// until the handshake completes — so tunnel builds reach any known hop.
 final class I2PNTCP2TunnelBuildTransport: I2PTunnelBuildTransport {
     private weak var ntcp2: NTCP2Transport?
+    /// Demand-dial hook: resolves the endpoint for a router hash and initiates
+    /// the NTCP2 connect. Wired by the running router context.
+    var dialPeer: ((Data) async -> Bool)?
+    /// Dial window before a build send gives up on a fresh handshake.
+    var dialTimeout: TimeInterval = 6
 
     init(ntcp2: NTCP2Transport) {
         self.ntcp2 = ntcp2
@@ -267,14 +275,36 @@ final class I2PNTCP2TunnelBuildTransport: I2PTunnelBuildTransport {
                                    messageID: message.messageID,
                                    expiration: Date().addingTimeInterval(120),
                                    payload: message.serialize())
-        try? ntcp2?.send(to: routerHash, data: envelope.serialize())
+        sendAfterDial(envelope.serialize(), to: routerHash)
     }
 
     func sendBuildReply(_ body: Data, to routerHash: Data) {
         let envelope = I2NPMessage(type: .tunnelBuildReply,
                                    expiration: Date().addingTimeInterval(120),
                                    payload: body)
-        try? ntcp2?.send(to: routerHash, data: envelope.serialize())
+        sendAfterDial(envelope.serialize(), to: routerHash)
+    }
+
+    /// Sends immediately over an established session; otherwise dials and
+    /// retries inside the dial window so a fresh handshake can carry the build.
+    private func sendAfterDial(_ i2npBytes: Data, to routerHash: Data) {
+        guard let ntcp2 else { return }
+        if ntcp2.hasSession(for: routerHash) {
+            try? ntcp2.send(to: routerHash, data: i2npBytes)
+            return
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            if let dialPeer {
+                _ = await dialPeer(routerHash)
+            }
+            let deadline = Date().addingTimeInterval(dialTimeout)
+            while !ntcp2.hasSession(for: routerHash), Date() < deadline {
+                try? await Task.sleep(for: .milliseconds(300))
+            }
+            guard ntcp2.hasSession(for: routerHash) else { return }
+            try? ntcp2.send(to: routerHash, data: i2npBytes)
+        }
     }
 }
 

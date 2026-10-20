@@ -119,10 +119,40 @@ final class I2PNetDBI2NPAdapter: I2PNetDBTransport {
     }
 }
 
-/// NTCP2 <-> I2NP delivery adapter with a throughput hook.
+/// Serializes demand-dial bookkeeping across concurrent callers (netdb
+/// deliveries, tunnel builds, the bootstrap dialer): at most one in-flight
+/// endpoint resolution + dial attempt per peer hash.
+actor DemandDialTracker {
+    private var inFlight: Set<Data> = []
+
+    /// Claims the dial slot for a hash; false when another caller is already
+    /// dialing it (the caller then simply waits for the session to appear).
+    func claim(_ hash: Data) -> Bool {
+        if inFlight.contains(hash) { return false }
+        inFlight.insert(hash)
+        return true
+    }
+
+    func release(_ hash: Data) {
+        inFlight.remove(hash)
+    }
+}
+
+/// NTCP2 <-> I2NP delivery adapter with a throughput hook and demand-dialing:
+/// a delivery to a peer we hold no session for resolves the peer's RouterInfo
+/// (netdb cache-first), dials it, waits for the Noise handshake, and rides the
+/// resulting session — so netdb lookups, stores and exploratory round-trips
+/// work against any signature-verified peer the netdb knows, not just the few
+/// dialed at bootstrap.
 final class I2PNTCP2DeliveryTransport: I2PDeliveryTransport {
     weak var ntcp2: NTCP2Transport?
     var onSent: ((Int) -> Void)?
+    /// Demand-dial hook: resolves the endpoint for a router hash and initiates
+    /// the NTCP2 connect. Wired by the running router context.
+    var dialPeer: ((Data) async -> Bool)?
+    /// How long a demand-dialed handshake gets to complete before the send
+    /// re-attempts (and the caller's own round timeout governs retries).
+    var dialTimeout: TimeInterval = 6
 
     init(ntcp2: NTCP2Transport) {
         self.ntcp2 = ntcp2
@@ -130,8 +160,20 @@ final class I2PNTCP2DeliveryTransport: I2PDeliveryTransport {
 
     func deliver(_ i2npBytes: Data, to routerHash: Data) async throws {
         guard let ntcp2 else { throw NTCP2Error.notEstablished }
+        if !ntcp2.hasSession(for: routerHash), dialPeer != nil {
+            _ = await dialPeer?(routerHash)
+            await waitForSession(to: routerHash)
+        }
         try ntcp2.send(to: routerHash, data: i2npBytes)
         onSent?(i2npBytes.count)
+    }
+
+    private func waitForSession(to routerHash: Data) async {
+        guard let ntcp2 else { return }
+        let deadline = Date().addingTimeInterval(dialTimeout)
+        while !ntcp2.hasSession(for: routerHash), Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(250))
+        }
     }
 }
 

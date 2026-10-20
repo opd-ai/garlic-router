@@ -25,12 +25,27 @@ final class I2PRouterAppContext {
     private let tunnelPool: I2PTunnelPool
     private let tunnelBuildTransport: I2PTunnelBuildTransport
     private let tunnelParticipant: I2PTunnelParticipant
-    private let tunnelPeerProvider: I2PTunnelPeerProvider
+    private let tunnelPeerProvider: I2PMainnetTunnelPeerProvider
     private(set) var mainnetRouterInfo: I2PRouterInfo
     private(set) var lifecycleState: LifecycleState = .suspended
     private var started = false
     private var startedNetDBMaintenance = false
     private var ntcp2Bridge: NTCP2I2NPBridge?
+
+    // MARK: Live bootstrap state
+    /// The reseed → dial → explore keep-alive loop (spawns once per process).
+    private var bootstrapTask: Task<Void, Never>?
+    /// Last successful reseed; RouterInfos expire after ~1h, so the loop
+    /// re-reseeds on a floor interval rather than waiting for the cache to drain.
+    private var lastReseedAt = Date.distantPast
+    /// Dial bookkeeping so concurrent demand-dials (netdb delivery, tunnel
+    /// builds, the bootstrap dialer) never stack duplicate connection attempts.
+    private let dialTracker = DemandDialTracker()
+    /// Keep-alive cadence: reseed refresh, session re-dialing and DHT exploration.
+    private static let bootstrapCycleInterval: TimeInterval = 900
+    /// Re-reseed floor: the netdb prunes RouterInfos after an hour; a successful
+    /// reseed older than this always refetches fresh verified seed data.
+    private static let reseedFloorInterval: TimeInterval = 2700
 
     /// Router lifecycle states: running (transports, pools, SAM socket live)
     /// or suspended (clean shutdown — netdb state rides persistent storage).
@@ -180,18 +195,42 @@ final class I2PRouterAppContext {
         i2npRouter.addTunnelParticipant(participant)
         tunnelBuildTransport = buildTransport
         tunnelParticipant = participant
-        tunnelPeerProvider = EmptyTunnelPeerProvider()
+        // Real hop candidates: signature-verified RouterInfos from the netdb,
+        // refreshed by the bootstrap cycle, so the tunnel pool can build once
+        // peers are known (the placeholder provider returned zero candidates
+        // forever — "no tunnels yet" was structural, not a bootstrap timing issue).
+        let netdbPeerProvider = I2PMainnetTunnelPeerProvider(netDB: netDB)
+        tunnelPeerProvider = netdbPeerProvider
         tunnelPool = I2PTunnelPool(
             localRouterHash: routerHash,
             participant: participant,
             transport: buildTransport,
-            peerProvider: tunnelPeerProvider
+            peerProvider: netdbPeerProvider
         )
         engine.attach(tunnelPool: tunnelPool)
+        // The dashboard and peer inspector read session counts and per-peer
+        // readings through the status engine — it must observe the transport.
+        engine.attach(ntcp2: transport)
+
+        // Demand-dial hooks: a netdb delivery or tunnel build that finds no
+        // session resolves the peer's RouterInfo (netdb cache-first, so the
+        // hook never recurses into a network lookup for reseeded peers) and
+        // dials it. Assigned after full initialization so the closures can
+        // capture self safely.
+        deliveryTransport.dialPeer = { [weak self] hash in
+            guard let self else { return false }
+            return await self.dial(routerHash: hash)
+        }
+        buildTransport.dialPeer = { [weak self] hash in
+            guard let self else { return false }
+            return await self.dial(routerHash: hash)
+        }
     }
 
-    /// Starts the router: listener, netdb maintenance, tunnel pool
-    /// maintenance, the status engine's event stream, and the SAMv3.3 socket.
+    /// Starts the router: listener, netdb maintenance, the live bootstrap
+    /// cycle (reseed → floodfill dialing → DHT exploration → tunnel-hop
+    /// refresh), the tunnel pool maintenance, the status engine's event stream,
+    /// and the SAMv3.3 socket.
     func start() {
         guard !started else { return }
         started = true
@@ -206,24 +245,33 @@ final class I2PRouterAppContext {
             startedNetDBMaintenance = true
             Task { await netDB.startMaintenance() }
         }
-        // Reachability advertisement (surfaced by the mainnet CI suite): a
-        // real router publishes its external address so mainnet peers can
-        // dial us for inbound tunnel participation. Re-running after a
-        // resume picks up network-interface changes (WiFi ↔ cellular).
-        Task { await advertiseReachableAddress() }
+        // The live bootstrap pipeline: this is what turns an empty netdb
+        // (own RouterInfo only) into a connected router — reseed the netdb
+        // from public reseed servers, dial floodfill sessions, publish the
+        // advertised RouterInfo to them, explore the DHT, and refresh tunnel
+        // hop candidates. Re-runs every cycle interval until shutdown, since
+        // RouterInfos expire after about an hour and sessions decay.
+        if bootstrapTask == nil {
+            bootstrapTask = Task { [weak self] in
+                await self?.bootstrapLoop()
+            }
+        }
         tunnelPool.start()
         engine.start()
         samServer.start()
     }
 
     /// Clean shutdown for app termination or background suspension: stops the
-    /// NTCP2 listener and sessions, the tunnel pool's maintenance loop and the
-    /// SAM socket. Netdb state rides persistent storage, so suspension loses
-    /// nothing; a later resume restarts everything gracefully.
+    /// NTCP2 listener and sessions, the bootstrap cycle, the tunnel pool's
+    /// maintenance loop and the SAM socket. Netdb state rides persistent
+    /// storage, so suspension loses nothing; a later resume restarts everything
+    /// gracefully.
     func shutdownForTermination() {
         guard started else { return }
         started = false
         lifecycleState = .suspended
+        bootstrapTask?.cancel()
+        bootstrapTask = nil
         ntcp2.shutdown()
         tunnelPool.stop()
         samServer.stop()
@@ -253,6 +301,78 @@ final class I2PRouterAppContext {
         ) else { return }
         mainnetRouterInfo = advertised
         _ = await netDB.publish(routerInfo: advertised)
+    }
+
+    // MARK: Live bootstrap
+
+    /// The keep-alive bootstrap loop: one full pipeline cycle, then a rest,
+    /// until shutdown. Failed cycles (a reseed host down, a handshake refused)
+    /// simply retry on the next cycle.
+    private func bootstrapLoop() async {
+        while !Task.isCancelled {
+            await bootstrapOnce()
+            try? await Task.sleep(for: .seconds(Self.bootstrapCycleInterval))
+        }
+    }
+
+    /// One live bootstrap cycle, in dependency order:
+    /// reseed (floodfill RouterInfos, Ed25519-verified) → dial NTCP2 sessions
+    /// to the closest floodfills → advertise our external address (a store
+    /// needs reachable floodfill targets) → iterative DHT exploration through
+    /// the established sessions → refresh tunnel-hop candidates.
+    private func bootstrapOnce() async {
+        let now = Date()
+        let knownFloodfills = await netDB.floodfillCount()
+        let reseedDue = now.timeIntervalSince(lastReseedAt) >= Self.reseedFloorInterval
+            || knownFloodfills < 8
+        if reseedDue {
+            if (try? await I2PReseedService.reseed(into: netDB)) != nil {
+                lastReseedAt = now
+            }
+        }
+        await dialFloodfills(targetSessions: 4)
+        await advertiseReachableAddress()
+        let seeds = await netDB.selectFloodfills(for: routerHash, count: 8)
+        _ = await netDB.bootstrap(seedFloodfills: seeds, targetPeers: 32, maxRounds: 4)
+        await tunnelPeerProvider.refreshCandidates(limit: 12)
+    }
+
+    /// Dials NTCP2 sessions to the closest known floodfills until
+    /// `targetSessions` are established, so netdb traffic has live transports.
+    /// Every candidate's RouterInfo is already in the netdb cache (reseeded),
+    /// so endpoint resolution is cache-first and never recurses into a lookup.
+    private func dialFloodfills(targetSessions: Int) async {
+        let candidates = await netDB.selectFloodfills(for: routerHash, count: 24)
+        for hash in candidates {
+            guard !ntcp2.hasSession(for: hash) else { continue }
+            _ = await dial(routerHash: hash)
+            let deadline = Date().addingTimeInterval(4)
+            while !ntcp2.hasSession(for: hash), Date() < deadline {
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+            if ntcp2.sessionCount() >= targetSessions { break }
+        }
+    }
+
+    /// Resolves a peer's NTCP2 endpoint from the netdb (cache-first) and
+    /// initiates a dial. Returns true when a session already exists, a fresh
+    /// dial was initiated, or another dial for the same peer is already in
+    /// flight (the caller then waits for the session to appear). Reentrancy is
+    /// serialized through the dial tracker so duplicate connection attempts
+    /// never stack.
+    private func dial(routerHash: Data) async -> Bool {
+        if ntcp2.hasSession(for: routerHash) { return true }
+        guard await dialTracker.claim(routerHash) else { return true }
+        defer {
+            Task { await dialTracker.release(routerHash) }
+        }
+        guard let info = await netDB.lookupRouterInfo(routerHash, timeoutPerRound: 1, maxRounds: 1),
+              let endpoint = info.addresses.compactMap({ NTCP2PeerEndpoint(routerAddress: $0) }).first else {
+            return false
+        }
+        guard !ntcp2.hasSession(for: routerHash) else { return true }
+        ntcp2.connect(host: endpoint.host, port: endpoint.port, remoteStaticKey: endpoint.staticKey)
+        return true
     }
 
     /// A signed RouterInfo for our own identity (real key material).
