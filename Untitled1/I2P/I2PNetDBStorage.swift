@@ -53,7 +53,14 @@ final class I2PNetDBStorage {
                 continue
             }
             guard let key = Self.dataFromHex(file.deletingPathExtension().lastPathComponent),
-                  key.count == 32 else { continue }
+                  key.count == 32 else {
+                // A decodable record whose file name is not a valid 32-byte hex
+                // key can never be addressed again — remove() and every restore
+                // key off the hex name — so it would survive every load forever
+                // as unaddressable state. Fail closed: reclaim the orphan.
+                try? fm.removeItem(at: file)
+                continue
+            }
             out.append((key, record))
         }
         return out

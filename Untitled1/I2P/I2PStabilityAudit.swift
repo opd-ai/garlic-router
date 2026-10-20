@@ -75,8 +75,8 @@ enum I2PStabilityAudit {
             name: "Stability · overall verdict",
             passed: failures.isEmpty,
             detail: failures.isEmpty
-                ? "\(passing)/\(results.count - 1) crash-safety probes passed: every checklist category ran clean. Surviving probes are the systematic equivalent of an empty crash log — no crash-class reproducible through any exercised code path."
-                : "\(passing)/\(results.count - 1) crash-safety probes passed; open findings: \(failures.joined(separator: ", ")). Each failing entry carries the action-items breakdown."
+                ? "\(passing)/\(results.count) crash-safety probes passed: every checklist category ran clean. Surviving probes are the systematic equivalent of an empty crash log — no crash-class reproducible through any exercised code path."
+                : "\(passing)/\(results.count) crash-safety probes passed; open findings: \(failures.joined(separator: ", ")). Each failing entry carries the action-items breakdown."
         ))
         return results
     }
@@ -342,6 +342,7 @@ enum I2PStabilityAudit {
         // trusted, never a crash (the "saved state corrupted" checklist item).
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("i2p-stability-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
         let storage = try I2PNetDBStorage(directory: directory)
         let key = I2PCrypto.randomBytes(32)
         let record = I2PNetDBStorage.Record(
@@ -352,16 +353,31 @@ enum I2PStabilityAudit {
         )
         try storage.persist(key: key, record: record)
 
-        let fileURL = directory.appendingPathComponent(key.hex + ".json")
-        try Data("{not json at all".utf8).write(to: fileURL)
-        guard storage.loadAll().isEmpty else {
-            throw I2PMainnetFailure(message: "corrupted netdb record survived restore")
+        // A restore failure must name its exact sub-condition (restored count,
+        // key match, payload match, surviving files) instead of a bare message —
+        // the next run then pinpoints the broken restore step without bisecting.
+        func describe(_ restored: [(key: Data, record: I2PNetDBStorage.Record)]) -> String {
+            let files = (try? FileManager.default.contentsOfDirectory(
+                at: directory, includingPropertiesForKeys: nil))?
+                .map(\.lastPathComponent).sorted().joined(separator: ", ") ?? "<listing failed>"
+            let keyMatch = restored.first.map { $0.key == key } ?? false
+            let payloadMatch = restored.first.map { $0.record.payload == record.payload } ?? false
+            return "restored=\(restored.count) keyMatch=\(keyMatch) payloadMatch=\(payloadMatch) files=[\(files)]"
         }
 
-        // A mis-named file is dropped by the key validation as well.
+        let fileURL = directory.appendingPathComponent(key.hex + ".json")
+        try Data("{not json at all".utf8).write(to: fileURL)
+        let afterCorruption = storage.loadAll()
+        guard afterCorruption.isEmpty else {
+            throw I2PMainnetFailure(message: "corrupted netdb record survived restore — \(describe(afterCorruption))")
+        }
+
+        // A file whose name is not a valid 32-byte hex key is reclaimed at
+        // restore as well — it could never be addressed again.
         try Data("{}".utf8).write(to: directory.appendingPathComponent("garbage-name.json"))
-        guard storage.loadAll().isEmpty else {
-            throw I2PMainnetFailure(message: "mis-named netdb file survived restore")
+        let afterMisnamed = storage.loadAll()
+        guard afterMisnamed.isEmpty else {
+            throw I2PMainnetFailure(message: "mis-named netdb file survived restore — \(describe(afterMisnamed))")
         }
 
         // Round-trip after corruption cleanup: clean persistence still restores.
@@ -370,7 +386,17 @@ enum I2PStabilityAudit {
         guard restored.count == 1,
               restored.first?.key == key,
               restored.first?.record.payload == record.payload else {
-            throw I2PMainnetFailure(message: "clean netdb record failed to restore after corruption cleanup")
+            throw I2PMainnetFailure(message: "clean netdb record failed to restore after corruption cleanup — \(describe(restored))")
+        }
+
+        // Restart fidelity: a fresh storage instance over the same directory —
+        // which is what an app restart actually does — restores the same record.
+        let restartStorage = try I2PNetDBStorage(directory: directory)
+        let afterRestart = restartStorage.loadAll()
+        guard afterRestart.count == 1,
+              afterRestart.first?.key == key,
+              afterRestart.first?.record.payload == record.payload else {
+            throw I2PMainnetFailure(message: "clean netdb record failed a fresh-instance restore — \(describe(afterRestart))")
         }
 
         // Identity persistence: the Keychain round-trips and cleans up probes.
@@ -383,7 +409,7 @@ enum I2PStabilityAudit {
         guard I2PRouterKeychain.read(account: "stability-probe") == nil else {
             throw I2PMainnetFailure(message: "Keychain delete did not remove the probe")
         }
-        return "corrupted and mis-named netdb records are discarded at restore (no crash, no trusted garbage); clean records restore byte-identical; identity keys round-trip through the Keychain"
+        return "corrupted and mis-named netdb records are discarded and reclaimed at restore (no crash, no trusted garbage); clean records restore byte-identical, including through a fresh storage instance (restart fidelity); identity keys round-trip through the Keychain"
     }
 
     private static func makeIsolatedHarness(includeFloodfill: Bool = false) async throws -> StabilityAuditHarness {
