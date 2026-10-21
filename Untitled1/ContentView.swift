@@ -12,6 +12,9 @@ struct ContentView: View {
     @State private var stabilityResults: [I2PSelfTestResult] = []
     @State private var hardeningResults: [I2PSelfTestResult] = []
     @State private var specResults: [I2PSelfTestResult] = []
+    @State private var specRunning = false
+    @State private var specCurrentProbe = ""
+    @State private var specCompletedChecks = 0
     @State private var productionResults: [I2PSelfTestResult] = []
     @State private var resultsExpanded = false
     @State private var readinessExpanded = false
@@ -327,13 +330,43 @@ struct ContentView: View {
     /// (I2NP header format, SSU2 packet-number windows, RFC crypto primitives,
     /// RouterInfo verification) plus a blanket gate over the local conformance
     /// suite. Live-network interop probes ride the mainnet suite.
+    ///
+    /// The blanket gate runs the ENTIRE local suite (SAM sockets, tunnel
+    /// pools, SSU2 loopbacks), so the run legitimately takes a while — it
+    /// gets the same progress surface and background-task lease as the
+    /// readiness audit, so it visibly runs and survives backgrounding.
     private func runSpecAudit() {
-        Task.detached {
-            let fresh = await I2PSpecConformanceAudit.runAll()
-            await MainActor.run {
-                specResults = fresh
-                specExpanded = true
+        guard !specRunning else { return }
+        specRunning = true
+        specResults = []
+        specCurrentProbe = "Preparing spec conformance probes"
+        specCompletedChecks = 0
+        let auditLease = BackgroundTaskLease()
+        auditLease.begin(name: "I2P spec conformance audit")
+        Task.detached(priority: .utility) {
+            let fresh = await I2PSpecConformanceAudit.runAll { phase, result in
+                await MainActor.run {
+                    specCurrentProbe = phase
+                    if let result {
+                        specResults.append(I2PSelfTestResult(
+                            name: "Spec · \(result.name)",
+                            passed: result.passed,
+                            detail: result.detail))
+                        specCompletedChecks += 1
+                    }
+                }
             }
+            await MainActor.run {
+                specResults = fresh.map {
+                    I2PSelfTestResult(name: "Spec · \($0.name)",
+                                      passed: $0.passed,
+                                      detail: $0.detail)
+                }
+                specExpanded = true
+                specCurrentProbe = ""
+                specRunning = false
+            }
+            auditLease.end()
         }
     }
 
@@ -342,7 +375,8 @@ struct ContentView: View {
             Button {
                 runSpecAudit()
             } label: {
-                Label("Run spec conformance audit", systemImage: "checkmark.seal.fill")
+                Label(specRunning ? "Running check \(specCompletedChecks + 1) of 6…" : "Run spec conformance audit",
+                      systemImage: specRunning ? "hourglass" : "checkmark.seal.fill")
                     .font(.subheadline.weight(.semibold))
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 10)
@@ -350,6 +384,18 @@ struct ContentView: View {
             }
             .buttonStyle(.plain)
             .tint(accent)
+            .disabled(specRunning)
+
+            if specRunning {
+                VStack(alignment: .leading, spacing: 6) {
+                    ProgressView(value: Double(specCompletedChecks), total: 6)
+                        .tint(accent)
+                    Text("\(specCompletedChecks) of 6 checks complete · \(specCurrentProbe)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
 
             if !specResults.isEmpty {
                 let passed = specResults.filter(\.passed).count

@@ -17,7 +17,12 @@
 import Foundation
 
 enum I2PSpecConformanceAudit {
-    static func runAll() async -> [I2PSelfTestResult] {
+    /// Runs the spec probes sequentially. The optional `onProgress` channel
+    /// mirrors the readiness audit's: the phase name arrives before each probe
+    /// starts (result nil), then the finished probe's result — so intermediate
+    /// outcomes surface immediately and the UI shows the audit is alive even
+    /// while the blanket gate (the full local conformance suite) is grinding.
+    static func runAll(onProgress: ((String, I2PSelfTestResult?) async -> Void)? = nil) async -> [I2PSelfTestResult] {
         let probes: [(String, () async throws -> String)] = [
             ("Spec gate · local conformance suite (handshake KDFs, frames, structures, tunnels, garlic)",
              conformanceGate),
@@ -32,20 +37,27 @@ enum I2PSpecConformanceAudit {
         ]
         var results: [I2PSelfTestResult] = []
         for (name, probe) in probes {
+            await onProgress?(name, nil)
             do {
-                results.append(I2PSelfTestResult(name: name, passed: true, detail: try await probe()))
+                let result = I2PSelfTestResult(name: name, passed: true, detail: try await probe())
+                results.append(result)
+                await onProgress?(name, result)
             } catch {
-                results.append(I2PSelfTestResult(name: name, passed: false, detail: String(describing: error)))
+                let result = I2PSelfTestResult(name: name, passed: false, detail: String(describing: error))
+                results.append(result)
+                await onProgress?(name, result)
             }
         }
         let passing = results.filter(\.passed).count
-        results.append(I2PSelfTestResult(
+        let verdict = I2PSelfTestResult(
             name: "Spec conformance · overall",
             passed: passing == results.count,
             detail: passing == results.count
                 ? "\(passing) conformance probes passed against the official-spec checklist; live-network interop rides the mainnet suite"
                 : "\(passing) of \(results.count) probes passed — findings above"
-        ))
+        )
+        await onProgress?(verdict.name, verdict)
+        results.append(verdict)
         return results
     }
 
