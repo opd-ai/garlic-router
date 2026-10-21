@@ -233,11 +233,19 @@ struct SSU2PacketHeader {
         let rawType = bytes[12]
         guard let type = SSU2MessageType(rawValue: rawType) else { throw SSU2Error.invalidHeader }
         if type == .sessionConfirmed || type == .data {
-            // Short header.
+            // Short header. The fragment byte is unauthenticated wire data, so
+            // its range is enforced here with a thrown error — the header
+            // initializer's preconditions only cover legitimate construction,
+            // and a precondition over attacker-controlled bytes would trap
+            // (SIGTRAP, fail-fast) instead of failing closed.
             let fragmentByte = bytes[13]
+            let total = Int(fragmentByte & 0x0f) + 1
+            let index = Int(fragmentByte >> 4)
+            guard total >= 1 && total <= 15 else { throw SSU2Error.invalidHeader }
+            guard index < total else { throw SSU2Error.invalidHeader }
             let header = SSU2PacketHeader(
                 shortDestinationConnectionID: dst, packetNumber: pn, type: type,
-                fragmentIndex: Int(fragmentByte >> 4), totalFragments: Int(fragmentByte & 0x0f) + 1)
+                fragmentIndex: index, totalFragments: total)
             return header
         }
         // Long header. Versions 2 (classical Noise_XK) and 3/4 (the ML-KEM
