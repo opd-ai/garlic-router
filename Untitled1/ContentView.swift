@@ -30,6 +30,9 @@ struct ContentView: View {
     @State private var stabilityCompletedChecks = 0
     @State private var capturedCrash: CapturedCrash?
     @State private var readinessLastInterruptedPhase: String?
+    @State private var mainnetRunning = false
+    @State private var mainnetCurrentProbe = ""
+    @State private var mainnetCompletedChecks = 0
     @State private var sizes: [(name: String, bytes: Int)] = []
 
     private let accent = Color(red: 0.47, green: 0.44, blue: 0.97)
@@ -101,13 +104,44 @@ struct ContentView: View {
 
     /// The live mainnet suite runs explicitly (it performs real network
     /// exchanges with reseed servers and floodfill routers), never on launch.
+    /// Each probe rides a live-network round trip (HTTPS reseed, NTCP2
+    /// handshakes, DHT lookups with 10s waits, a 20s monitor window), so the
+    /// run legitimately takes a minute or more — it gets the same running
+    /// state, progress surface and background-task lease as the readiness and
+    /// spec audits so it visibly runs and survives backgrounding.
     private func runMainnetAudit() {
-        Task.detached {
-            let fresh = await I2PMainnetVerification.runAll()
-            await MainActor.run {
-                results = fresh
-                resultsExpanded = true
+        guard !mainnetRunning else { return }
+        mainnetRunning = true
+        results = []
+        mainnetCurrentProbe = "Preparing mainnet checks"
+        mainnetCompletedChecks = 0
+        resultsExpanded = false
+        let auditLease = BackgroundTaskLease()
+        auditLease.begin(name: "I2P mainnet audit")
+        Task.detached(priority: .utility) {
+            let fresh = await I2PMainnetVerification.runAll { phase, result in
+                await MainActor.run {
+                    mainnetCurrentProbe = phase
+                    if let result {
+                        results.append(I2PSelfTestResult(
+                            name: "Mainnet · \(result.name)",
+                            passed: result.passed,
+                            detail: result.detail))
+                        mainnetCompletedChecks += 1
+                    }
+                }
             }
+            await MainActor.run {
+                results = fresh.map {
+                    I2PSelfTestResult(name: "Mainnet · \($0.name)",
+                                      passed: $0.passed,
+                                      detail: $0.detail)
+                }
+                resultsExpanded = true
+                mainnetCurrentProbe = ""
+                mainnetRunning = false
+            }
+            auditLease.end()
         }
     }
 
@@ -645,7 +679,8 @@ struct ContentView: View {
             Button {
                 runMainnetAudit()
             } label: {
-                Label("Run mainnet audit (live network)", systemImage: "antenna.radiowaves.left.and.right")
+                Label(mainnetRunning ? "Running mainnet check \(mainnetCompletedChecks + 1) of 9…" : "Run mainnet audit (live network)",
+                      systemImage: mainnetRunning ? "hourglass" : "antenna.radiowaves.left.and.right")
                     .font(.subheadline.weight(.semibold))
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 10)
@@ -653,6 +688,18 @@ struct ContentView: View {
             }
             .buttonStyle(.plain)
             .tint(accent)
+            .disabled(mainnetRunning)
+
+            if mainnetRunning {
+                VStack(alignment: .leading, spacing: 6) {
+                    ProgressView(value: Double(mainnetCompletedChecks), total: 9)
+                        .tint(accent)
+                    Text("\(mainnetCompletedChecks) of 9 checks complete · \(mainnetCurrentProbe)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
 
             if !results.isEmpty {
                 let passed = results.filter(\.passed).count

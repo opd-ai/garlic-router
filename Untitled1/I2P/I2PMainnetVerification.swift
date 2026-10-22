@@ -26,18 +26,23 @@ struct I2PMainnetFailure: Error, CustomStringConvertible {
 }
 
 enum I2PMainnetVerification {
-    static func runAll() async -> [I2PSelfTestResult] {
+    static func runAll(onProgress: ((String, I2PSelfTestResult?) async -> Void)? = nil) async -> [I2PSelfTestResult] {
         var results: [I2PSelfTestResult] = []
 
         func run(_ name: String, _ body: () async throws -> String) async {
+            await onProgress?(name, nil)
             do {
                 let detail = try await body()
-                results.append(I2PSelfTestResult(name: name, passed: true, detail: detail))
+                let result = I2PSelfTestResult(name: name, passed: true, detail: detail)
+                results.append(result)
+                await onProgress?(name, result)
             } catch {
-                results.append(I2PSelfTestResult(
+                let result = I2PSelfTestResult(
                     name: name,
                     passed: false,
-                    detail: I2PLiveFailureClassifier.annotated(error)))
+                    detail: I2PLiveFailureClassifier.annotated(error))
+                results.append(result)
+                await onProgress?(name, result)
             }
         }
 
