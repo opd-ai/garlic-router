@@ -320,7 +320,11 @@ enum I2PSelfTest {
         run("BLAKE2b-512 vector") {
             let digest = BLAKE2b.digest([], outLen: 64)
             let hex = Data(digest).hex
-            guard hex.hasPrefix("786a02f7673b5856") else { throw I2PWireError.invalidFormat }
+            guard hex.hasPrefix("786a02f7673b5856") else {
+                // Name the digest this build actually produced: a pure function
+                // missing a fixed vector is otherwise undiagnosable from a tag.
+                throw SSU2Error.testFailed("empty-input digest \(hex.prefix(16))… diverges from the RFC 7693 vector 786a02f7673b5856…")
+            }
             return "empty-input digest matches reference vector"
         }
 

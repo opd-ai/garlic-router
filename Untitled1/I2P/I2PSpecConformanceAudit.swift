@@ -89,7 +89,8 @@ enum I2PSpecConformanceAudit {
             // names: the detail distinguishes a stale fixture epoch from a
             // port collision between simultaneously running audits from a
             // real regression — and names the exact assertion that broke.
-            let breakdown = failed.prefix(12).map { "\($0.name) — \($0.detail)" }
+            // The window is wide enough to show the whole first wave.
+            let breakdown = failed.prefix(24).map { "\($0.name) — \($0.detail)" }
                 .joined(separator: "; ")
             throw I2PMainnetFailure(message: "\(failed.count) conformance test(s) failed (first: \(breakdown))")
         }

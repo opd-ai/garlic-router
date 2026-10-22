@@ -857,19 +857,21 @@ enum I2PCrossValidation {
         let message = I2NPMessage(
             type: .databaseLookup,
             messageID: 0x0A11_B2C3,
-            expiration: Date(timeIntervalSince1970: 1_700_000_123),
+            // The spec's parse-time expiry enforcement rejects lapsed messages,
+            // so fixtures ride a live epoch instead of a pinned past one.
+            expiration: Date().addingTimeInterval(300),
             payload: Data(repeating: 0x3C, count: 71))
         let encoded = message.serialize()
         let parsed = try I2NPMessage.parse(encoded)
         guard parsed.serialize() == encoded else { throw I2PWireError.invalidFormat }
         let header = try I2NPMessageHeader.parse(encoded)
         guard header.size == 71, header.type == .databaseLookup,
-              I2NPMessageHeader.length == 17 else {
+              I2NPMessageHeader.length == 16 else {
             throw I2PWireError.invalidFormat
         }
         // Oversize: declared payload larger than the buffer is rejected.
         var oversize = encoded
-        for index in 13...16 { oversize[index] = 0xFF }
+        for index in 13...14 { oversize[index] = 0xFF }
         guard expectThrow({ _ = try I2NPMessage.parse(oversize) }) else {
             throw I2PCrossValidationError.unexpectedSuccess
         }
@@ -877,35 +879,38 @@ enum I2PCrossValidation {
         guard expectThrow({ _ = try I2NPMessage.parse(Data(encoded.prefix(9))) }) else {
             throw I2PCrossValidationError.unexpectedSuccess
         }
-        return "17-byte header round trip identical; oversize and truncated payloads rejected"
+        return "16-byte spec full header (type + ID + ms expiry + size + checksum byte) round trip identical; oversize and truncated payloads rejected"
     }
 
-    /// The 5-byte short tunnel header that NTCP2 data blocks carry: type (1) +
-    /// expiration (4 BE seconds) + payload, with the payload bounded by the
-    /// transport block framing. This is the wire shape mainnet routers use.
+    /// The spec's 9-byte short header carried by NTCP2/SSU2 data blocks:
+    /// type (1) + message ID (4 BE) + expiration (4 BE seconds), with size and
+    /// checksum provided by the transport frame. The message ID rides the wire,
+    /// exactly as real routers frame it.
     private static func i2npShortHeaderSpec() throws -> String {
         let payload = I2PCrypto.randomBytes(180)
-        let expiration = Date(timeIntervalSince1970: 1_800_000_123.456)
+        let expiration = Date().addingTimeInterval(300)
         let message = I2NPMessage(type: .garlic, messageID: 0x0123_4567,
                                   expiration: expiration, payload: payload)
         let short = message.serializeShort()
-        // Layout: type (1) + expiration seconds (4 BE) + payload; the message
-        // ID does not ride the short header (it is regenerated internally).
-        guard short.count == 5 + payload.count, short[0] == I2NPMessageType.garlic.rawValue else {
+        // Layout: type (1) + message ID (4 BE) + expiration seconds (4 BE) + payload.
+        guard short.count == 9 + payload.count, short[0] == I2NPMessageType.garlic.rawValue else {
             throw I2PWireError.invalidFormat
         }
-        let seconds = (UInt32(short[1]) << 24) | (UInt32(short[2]) << 16)
-                      | (UInt32(short[3]) << 8) | UInt32(short[4])
+        let messageID = (UInt32(short[1]) << 24) | (UInt32(short[2]) << 16)
+                        | (UInt32(short[3]) << 8) | UInt32(short[4])
+        guard messageID == 0x0123_4567 else { throw I2PWireError.invalidFormat }
+        let seconds = (UInt32(short[5]) << 24) | (UInt32(short[6]) << 16)
+                      | (UInt32(short[7]) << 8) | UInt32(short[8])
         guard abs(TimeInterval(seconds) - expiration.timeIntervalSince1970.rounded()) < 1 else {
             throw I2PWireError.invalidFormat
         }
         let parsed = try I2NPMessage.parseShort(short)
         guard parsed.type == .garlic, parsed.payload == payload,
-              parsed.messageID != message.messageID else {
+              parsed.messageID == message.messageID else {
             throw I2PWireError.invalidFormat
         }
         // The transport round trip: full internal framing → short wire framing
-        // → parse back; the payload and type survive byte-for-byte.
+        // → parse back; the payload, type and message ID survive byte-for-byte.
         guard try I2NPMessage.parseShort(message.serializeShort()).payload == payload else {
             throw I2PWireError.invalidFormat
         }
@@ -915,7 +920,7 @@ enum I2PCrossValidation {
         guard expectThrow({ _ = try I2NPMessage.parseShort(unknown) }) else {
             throw I2PCrossValidationError.unexpectedSuccess
         }
-        return "5-byte short header (type + seconds-level expiry) parses; payload rides ungated; unknown types rejected"
+        return "9-byte spec short header (type + message ID + seconds-level expiry) round-trips with the ID riding the wire; unknown types rejected"
     }
 
     private static func i2npExpiryEnforcement() throws -> String {
@@ -1474,7 +1479,9 @@ enum I2PCrossValidation {
         // RFC 7693 Appendix B, empty input: the digest begins 786a02f7673b5856.
         let empty = BLAKE2b.digest([], outLen: 64)
         guard empty.count == 64, Data(empty).hex.hasPrefix("786a02f7673b5856") else {
-            throw I2PWireError.invalidFormat
+            // Name the digest this build actually produced — a pure function
+            // failing a fixed vector is otherwise undiagnosable from a bare tag.
+            throw SSU2Error.testFailed("empty-input digest \(Data(empty).hex.prefix(16))… diverges from the RFC 7693 vector 786a02f7673b5856…")
         }
         // Digest length is a parameter: distinct lengths give distinct digests,
         // each with its declared size.
