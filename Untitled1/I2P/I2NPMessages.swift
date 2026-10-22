@@ -10,6 +10,7 @@ enum I2NPError: Error {
     case invalidPayload
     case invalidConfiguration
     case unknownTunnel
+    case expired
 }
 
 /// I2NP message type codes on the wire per the I2P common message spec.
@@ -34,21 +35,27 @@ enum I2NPMessageType: UInt8, CaseIterable {
     case tunnelBuildReply = 22
 }
 
-/// I2NP wire header: type byte, message ID, expiry and big-endian size.
+/// I2NP wire header per the spec's full-header layout: type byte, message ID,
+/// expiry (8-byte ms), big-endian payload size (2 bytes) and the checksum byte
+/// — the first byte of SHA-256(payload). Tunnel hops verify that byte to catch
+/// AES-CBC malleability before touching the payload, so it is part of the
+/// contract, not decoration.
 struct I2NPMessageHeader {
     let type: I2NPMessageType
     let messageID: UInt32
     let expiration: Date
     let size: Int
+    let checksum: UInt8
 
-    static let length = 17
+    static let length = 16
 
     func serialize() -> Data {
         var w = I2PWriter()
         w.byte(type.rawValue)
         w.integer(messageID)
         w.long(UInt64((expiration.timeIntervalSince1970 * 1000).rounded()))
-        w.integer(UInt32(size))
+        w.short(UInt16(clamping: size)) // the spec caps I2NP payloads at 64 KiB
+        w.byte(checksum)
         return w.data
     }
 
@@ -58,12 +65,14 @@ struct I2NPMessageHeader {
         guard let type = I2NPMessageType(rawValue: try r.byte()) else { throw I2NPError.unsupportedType }
         let messageID = try r.integer()
         let ms = try r.long()
-        let size = Int(try r.integer())
+        let size = Int(try r.short())
+        let checksum = try r.byte()
         return I2NPMessageHeader(
             type: type,
             messageID: messageID,
             expiration: Date(timeIntervalSince1970: Double(ms) / 1000),
-            size: size
+            size: size,
+            checksum: checksum
         )
     }
 }
@@ -89,7 +98,8 @@ struct I2NPMessage {
         w.byte(type.rawValue)
         w.integer(messageID)
         w.long(UInt64((expiration.timeIntervalSince1970 * 1000).rounded()))
-        w.integer(UInt32(payload.count))
+        w.short(UInt16(clamping: payload.count))
+        w.byte(I2PCrypto.sha256(payload)[0])
         w.raw(payload)
         return w.data
     }
@@ -99,15 +109,24 @@ struct I2NPMessage {
         guard let type = I2NPMessageType(rawValue: try r.byte()) else { throw I2NPError.unsupportedType }
         let messageID = try r.integer()
         let ms = try r.long()
-        let size = Int(try r.integer())
+        let size = Int(try r.short())
+        let checksum = try r.byte()
         let payload = try r.raw(size)
         guard r.remaining == 0 else { throw I2PWireError.trailingData }
-        return I2NPMessage(
+        // Parse-time verification per the spec's full-header contract: the
+        // checksum byte must equal the first byte of SHA-256(payload). A
+        // tampered or corrupt payload is rejected whole, before any
+        // interpretation rides on it.
+        guard checksum == I2PCrypto.sha256(payload)[0] else { throw I2PWireError.invalidFormat }
+        let message = I2NPMessage(
             type: type,
             messageID: messageID,
             expiration: Date(timeIntervalSince1970: Double(ms) / 1000),
             payload: payload
         )
+        // Spec expiry enforcement: an expired message is never processed.
+        guard !message.isExpired() else { throw I2NPError.expired }
+        return message
     }
 
     static func parseHeader(_ data: Data) throws -> I2NPMessageHeader {
@@ -119,40 +138,46 @@ struct I2NPMessage {
         expiration.timeIntervalSince(now) <= 0
     }
 
-    /// The 5-byte short tunnel header used by NTCP2 data blocks and tunnel
-    /// messages: type (1) + expiration (4 BE, seconds). The payload rides
-    /// ungated after it; the receiving transport bounds it by its framing.
+    /// The spec's 9-byte short header used by NTCP2/SSU2 data-phase framing:
+    /// type (1) + message ID (4 BE) + expiration (4 BE seconds). Size and
+    /// checksum are provided by the transport frame. The message ID rides the
+    /// wire so ID-based correlation (delivery status, reply tokens) works
+    /// across transports, exactly as real routers frame it.
     func serializeShort() -> Data {
         var w = I2PWriter()
         w.byte(type.rawValue)
+        w.integer(messageID)
         w.integer(UInt32(max(0, (expiration.timeIntervalSince1970).rounded())))
         w.raw(payload)
         return w.data
     }
 
-    /// Parses one short-header I2NP message: [type (1)][expiration (4 BE s)][payload].
-    /// The message ID is regenerated for internal handling (it never rode the
-    /// short header; every protocol that correlates by ID — build messages,
-    /// reply tokens, garlic tags — carries its own identifier in the body).
+    /// Parses one short-header I2NP message:
+    /// [type (1)][message ID (4 BE)][expiration (4 BE s)][payload].
+    /// Real mainnet short-header messages carry the message ID — parsing it
+    /// back (rather than regenerating one) is what makes inbound traffic from
+    /// Java I2P / i2pd peers readable at all.
     static func parseShort(_ data: Data) throws -> I2NPMessage {
-        guard data.count >= 5, let type = I2NPMessageType(rawValue: data[0]) else {
+        guard data.count >= 9, let type = I2NPMessageType(rawValue: data[0]) else {
             throw I2NPError.unsupportedType
         }
-        let seconds = (UInt32(data[1]) << 24) | (UInt32(data[2]) << 16)
-                      | (UInt32(data[3]) << 8) | UInt32(data[4])
+        let messageID = (UInt32(data[1]) << 24) | (UInt32(data[2]) << 16)
+                        | (UInt32(data[3]) << 8) | UInt32(data[4])
+        let seconds = (UInt32(data[5]) << 24) | (UInt32(data[6]) << 16)
+                      | (UInt32(data[7]) << 8) | UInt32(data[8])
         return I2NPMessage(
             type: type,
-            messageID: UInt32.random(in: 1...UInt32.max),
+            messageID: messageID,
             expiration: Date(timeIntervalSince1970: TimeInterval(seconds)),
-            payload: data.subdata(in: 5..<data.count)
+            payload: data.subdata(in: 9..<data.count)
         )
     }
 
     /// True when `data` begins with a valid short header (a known type code and
-    /// at least the 5-byte header). Transport receivers use this to distinguish
+    /// the full 9-byte header). Transport receivers use this to distinguish
     /// mainnet short-header messages from raw non-I2NP payloads.
     static func looksLikeShortHeaderMessage(_ data: Data) -> Bool {
-        data.count >= 5 && I2NPMessageType(rawValue: data[0]) != nil
+        data.count >= 9 && I2NPMessageType(rawValue: data[0]) != nil
     }
 
     /// Typed payload parsing for every standard message type.

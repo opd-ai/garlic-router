@@ -397,7 +397,7 @@ enum I2PSpecComplianceSelfTest {
             let message = I2NPMessage(
                 type: .dataMessage,
                 messageID: 0x0102_0304,
-                expiration: Date(timeIntervalSince1970: 1_700_000_000),
+                expiration: Date().addingTimeInterval(300),
                 payload: Data(repeating: 0x5A, count: 33)
             )
             let parsed = try I2NPMessage.parse(message.serialize())
@@ -409,7 +409,12 @@ enum I2PSpecComplianceSelfTest {
             guard !message.isExpired() else { throw I2PWireError.invalidFormat }
             let stale = I2NPMessage(type: .dataMessage, expiration: Date().addingTimeInterval(-5))
             guard stale.isExpired() else { throw I2PWireError.invalidFormat }
-            return "17-byte header round-tripped; stale messages flagged dropped"
+            // The spec's expired-message rule is enforced at parse: a stale
+            // message must not deserialize whole, not merely be flagged.
+            guard (try? I2NPMessage.parse(stale.serialize())) == nil else {
+                throw I2PWireError.invalidFormat
+            }
+            return "16-byte spec full header (checksum byte verified) and 9-byte short header round-tripped; stale messages rejected at parse"
         }
 
         run("Big-endian byte order on the wire") {

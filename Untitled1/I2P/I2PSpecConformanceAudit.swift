@@ -85,8 +85,13 @@ enum I2PSpecConformanceAudit {
         }
         let failed = results.filter { !$0.passed }
         guard failed.isEmpty else {
-            let names = failed.prefix(3).map(\.name).joined(separator: ", ")
-            throw I2PMainnetFailure(message: "\(failed.count) conformance test(s) failed (first: \(names))")
+            // Surface every failing test with its thrown detail, not just bare
+            // names: the detail distinguishes a stale fixture epoch from a
+            // port collision between simultaneously running audits from a
+            // real regression — and names the exact assertion that broke.
+            let breakdown = failed.prefix(12).map { "\($0.name) — \($0.detail)" }
+                .joined(separator: "; ")
+            throw I2PMainnetFailure(message: "\(failed.count) conformance test(s) failed (first: \(breakdown))")
         }
         let ntcp2 = results.filter { $0.name.contains("NTCP2") }.count
         let ssu2 = results.filter { $0.name.contains("SSU2") }.count
