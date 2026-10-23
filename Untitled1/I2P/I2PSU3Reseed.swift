@@ -32,9 +32,18 @@
 //  User-Agent convention: reseed servers deliberately filter agents to keep
 //  browsers from accidentally downloading multi-megabyte archives through
 //  their root, and they reject unrecognized agents with HTTP 403 on the data
-//  path. The agent they expect is the wget-style one i2pd presents — the full
-//  "Wget/1.14 (linux-gnu)" string, which is what cleared diva's data path.
-//  Browser-grade or router-custom agents are refused.
+//  path. The agents they accept are wget-style identifiers — the reseed spec
+//  names the family, and the two reference routers present exactly two of
+//  them: i2pd sends "Wget/1.14 (linux-gnu)" and Java I2P's ReseedHandler has
+//  historically sent "Wget/1.11.4". The reseed carries BOTH and rotates per
+//  pass: pass 1 presents the i2pd agent, the second pass retries whatever
+//  failed with the Java agent — a different accepted identifier, not a
+//  browser fallback. The live runs distinguish the two server responses:
+//  diva answered the reseed path with HTTP 429 (an accepted agent hitting its
+//  rate limit) rather than the 403 the agent filter returns, which pins the
+//  wget agents as accepted. The hosts that still 403 both agents reject at
+//  their edge (TLS fingerprint / bot-detection reputation), which no
+//  User-Agent string can satisfy.
 //
 //  Content-Encoding: reseed archives can arrive GZIPPED, and the big ones are
 //  streamed as MULTI-MEMBER gzip (RFC 1952 allows concatenated members).
@@ -134,8 +143,14 @@ enum I2PReseedService {
             }
             for host in hosts {
                 if pass == 2, rateLimited.contains(host) { continue }
+                // Pass 1 presents the i2pd agent; the second pass retries
+                // whatever failed with Java I2P's classic reseed agent — a
+                // different accepted wget-style identifier, not the identical
+                // request a third time.
+                let agent = pass == 1 ? userAgent : alternateAgent
                 do {
-                    return try await reseed(from: host, into: netDB, deferCount: deferCount)
+                    return try await reseed(from: host, into: netDB, deferCount: deferCount,
+                                            userAgent: agent)
                 } catch I2PReseedError.rateLimited {
                     rateLimited.insert(host)
                     failures.append("\(host) — rate limited (HTTP 429)")
@@ -172,13 +187,16 @@ enum I2PReseedService {
         return String(describing: error)
     }
 
-    /// The user agent reseed servers require on the data path (see the header
-    /// comment): the full wget-style string i2pd presents. The bare "Wget/1.14"
-    /// cleared diva but some hosts 403'd it; the exact i2pd agent is what the
-    /// server operators see from a working router.
+    /// The agents the reseed spec's server-side filter accepts: wget-style
+    /// identifiers, not browsers. Both are carried and rotated per pass —
+    /// pass 1 presents the i2pd agent, the second pass retries whatever
+    /// failed with Java I2P's classic reseed agent. The 429-vs-403 split the
+    /// live runs produced pins these as accepted (see the header comment).
     static let userAgent = "Wget/1.14 (linux-gnu)"
+    static let alternateAgent = "Wget/1.11.4"
 
-    static func reseed(from host: String, into netDB: I2PNetworkDatabase, deferCount: Int) async throws -> I2PReseedReport {
+    static func reseed(from host: String, into netDB: I2PNetworkDatabase, deferCount: Int,
+                       userAgent: String) async throws -> I2PReseedReport {
         // The SU3 archive lives at the standard reseed path off the base URL
         // (see the header comment). Some configured hosts omit the trailing
         // slash; normalize before appending the filename.
@@ -186,15 +204,16 @@ enum I2PReseedService {
         guard let url = URL(string: trimmed + reseedPath) else {
             throw I2PReseedError.invalidSU3("invalid reseed host url")
         }
-        return try await fetchAndIngest(url: url, host: host, netDB: netDB, deferCount: deferCount)
+        return try await fetchAndIngest(url: url, host: host, netDB: netDB, deferCount: deferCount,
+                                        userAgent: userAgent)
     }
 
     private static func fetchAndIngest(url: URL, host: String, netDB: I2PNetworkDatabase,
-                                       deferCount: Int) async throws -> I2PReseedReport {
+                                       deferCount: Int, userAgent: String) async throws -> I2PReseedReport {
         var lastError: Error?
         for attempt in 1...2 {
             do {
-                let (rawData, http) = try await fetch(url: url)
+                let (rawData, http) = try await fetch(url: url, userAgent: userAgent)
                 guard (200...299).contains(http.statusCode) else {
                     if http.statusCode == 429 {
                         throw I2PReseedError.rateLimited
@@ -283,14 +302,18 @@ enum I2PReseedService {
         return message.contains("truncated transfer")
     }
 
-    private static func fetch(url: URL) async throws -> (Data, HTTPURLResponse) {
+    private static func fetch(url: URL, userAgent: String) async throws -> (Data, HTTPURLResponse) {
         var request = URLRequest(url: url)
         // The full archive over a cold mobile link needs more than a 15s
         // window; the timeout is per-request idle time, not total duration.
         request.timeoutInterval = 30
-        // Reseed servers require the wget-style agent on the data path (see
-        // the header comment).
+        // Reseed servers require a wget-style agent on the data path (see the
+        // header comment); the caller picks which accepted agent this request
+        // presents.
         request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        // wget also sends Accept: */* — carry the header so the request looks
+        // like the accepted client end to end.
+        request.setValue("*/*", forHTTPHeaderField: "Accept")
         // Identity encoding: with an explicit Accept-Encoding, URLSession does
         // not transparently decompress — so the body we receive is the wire
         // body, its Content-Length cross-check is meaningful, and any gzip
