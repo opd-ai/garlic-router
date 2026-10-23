@@ -63,6 +63,10 @@ struct I2PReseedReport {
 
 enum I2PReseedError: Error {
     case allHostsFailed
+    /// The host answered the reseed path with HTTP 429: an explicit "later",
+    /// not "never" — the host is skipped for the remainder of the run instead
+    /// of being hammered into a longer limit.
+    case rateLimited
     case invalidSU3(String)
     case invalidZip(String)
 }
@@ -73,12 +77,16 @@ enum I2PReseedService {
     /// every host refuses or times out.
     static let hosts = [
         "https://reseed.i2p-projekt.de/",
+        "https://reseed-pl.i2p-projekt.de/",
+        "https://uk.reseed.i2p-projekt.de/",
         "https://i2p.mooo.com/",
         "https://reseed.diva.exchange/",
         "https://reseed.stormycloud.org/",
         "https://banana.incognet.io/",
         "https://www.torontocrypto.org:8443/",
-        "https://reseed.milli.pe/",
+        "https://i2p.novg.net/",
+        "https://i2pgit.org/",
+        "https://kingfox.org/",
         "https://i2pseed.creativecowpat.net:8443/",
     ]
 
@@ -103,14 +111,26 @@ enum I2PReseedService {
     /// into the netdb.
     static func reseed(into netDB: I2PNetworkDatabase, deferCount: Int = 2) async throws -> I2PReseedReport {
         var failures: [String] = []
+        var rateLimited: Set<String> = []
         // Two passes over the host list: cold-network TLS handshakes and
         // transit routes to these hosts frequently stall on the first attempt
         // and clear on the second, and a per-host retry would double the
         // worst-case wall time of the whole sweep for the same coverage.
         for pass in 1...2 {
+            if pass == 2 {
+                // A 429 is the server saying "later", not "never": give the
+                // limit a moment before the second sweep (diva 429'd a request
+                // arriving seconds after the first), and skip hosts that
+                // already declared a limit this run instead of deepening it.
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+            }
             for host in hosts {
+                if pass == 2, rateLimited.contains(host) { continue }
                 do {
                     return try await reseed(from: host, into: netDB, deferCount: deferCount)
+                } catch I2PReseedError.rateLimited {
+                    rateLimited.insert(host)
+                    failures.append("\(host) — rate limited (HTTP 429)")
                 } catch {
                     // Aggregate every host outcome — a report that names each
                     // refusal mode (connection refused vs TLS rejection vs
@@ -162,54 +182,87 @@ enum I2PReseedService {
 
     private static func fetchAndIngest(url: URL, host: String, netDB: I2PNetworkDatabase,
                                        deferCount: Int) async throws -> I2PReseedReport {
-        var request = URLRequest(url: url)
-        // Reseed servers can be slow to establish TLS on a cold network; the
-        // bare-host fetches that returned HTML never reached here. Give each
-        // host a full window instead of failing the first two on timeout.
-        request.timeoutInterval = 15
-        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-        let (data, response) = try await session.data(for: request)
-        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            throw I2PReseedError.invalidSU3("reseed host returned HTTP status \(status)")
-        }
-
-        let zipData = try parseSU3(data)
-        let payloads = try routerInfoPayloads(fromZip: zipData)
-        guard !payloads.isEmpty else {
-            throw I2PReseedError.invalidZip("no routerInfo entries in the reseed archive")
-        }
-
-        // Ingest everything except up to `deferCount` non-floodfill RouterInfos,
-        // which are kept out of the local cache as live DHT lookup targets.
-        var ingested = 0
-        var rejected = 0
-        var deferredHashes: [Data] = []
-        for payload in payloads {
-            let parsed = try? I2PRouterInfo.parse(payload)
-            let isFloodfill = parsed?.options["caps"]?.contains("f") == true
-            if !isFloodfill, deferredHashes.count < deferCount {
-                if let parsed {
-                    deferredHashes.append(parsed.identity.hash)
-                }
-                continue
-            }
+        var lastError: Error?
+        for attempt in 1...2 {
             do {
-                try await netDB.ingestRouterInfo(payload)
-                ingested += 1
+                let (data, response) = try await fetch(url: url)
+                guard let http = response as? HTTPURLResponse else {
+                    throw I2PReseedError.invalidSU3("reseed host answered with a non-HTTP response")
+                }
+                guard (200...299).contains(http.statusCode) else {
+                    if http.statusCode == 429 {
+                        throw I2PReseedError.rateLimited
+                    }
+                    throw I2PReseedError.invalidSU3("reseed host returned HTTP status \(http.statusCode)")
+                }
+
+                let zipData = try parseSU3(data)
+                let payloads = try routerInfoPayloads(fromZip: zipData)
+                guard !payloads.isEmpty else {
+                    throw I2PReseedError.invalidZip("no routerInfo entries in the reseed archive")
+                }
+
+                // Ingest everything except up to `deferCount` non-floodfill RouterInfos,
+                // which are kept out of the local cache as live DHT lookup targets.
+                var ingested = 0
+                var rejected = 0
+                var deferredHashes: [Data] = []
+                for payload in payloads {
+                    let parsed = try? I2PRouterInfo.parse(payload)
+                    let isFloodfill = parsed?.options["caps"]?.contains("f") == true
+                    if !isFloodfill, deferredHashes.count < deferCount {
+                        if let parsed {
+                            deferredHashes.append(parsed.identity.hash)
+                        }
+                        continue
+                    }
+                    do {
+                        try await netDB.ingestRouterInfo(payload)
+                        ingested += 1
+                    } catch {
+                        rejected += 1
+                    }
+                }
+                let floodfills = await netDB.floodfillCount()
+                return I2PReseedReport(
+                    fetchedFrom: host,
+                    totalEntries: payloads.count,
+                    ingested: ingested,
+                    rejected: rejected,
+                    floodfillCount: floodfills,
+                    deferredHashes: deferredHashes
+                )
             } catch {
-                rejected += 1
+                // The ~100-200 KB SU3 archive can arrive cut short: an edge
+                // closes the connection cleanly before the full body lands,
+                // URLSession reports no error, and the SU3 header then
+                // promises more content than arrived. A fresh connection
+                // frequently carries the complete body, so transport
+                // failures and truncation both get one retry before the
+                // host is abandoned.
+                let retriable = error is URLError || isTruncatedBody(error)
+                guard attempt == 1, retriable else { throw error }
+                lastError = error
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
         }
-        let floodfills = await netDB.floodfillCount()
-        return I2PReseedReport(
-            fetchedFrom: host,
-            totalEntries: payloads.count,
-            ingested: ingested,
-            rejected: rejected,
-            floodfillCount: floodfills,
-            deferredHashes: deferredHashes
-        )
+        throw lastError ?? I2PReseedError.invalidSU3("reseed fetch failed")
+    }
+
+    private static func isTruncatedBody(_ error: Error) -> Bool {
+        guard case I2PReseedError.invalidSU3(let message) = error else { return false }
+        return message.contains("content length") && message.contains("truncated transfer")
+    }
+
+    private static func fetch(url: URL) async throws -> (Data, URLResponse) {
+        var request = URLRequest(url: url)
+        // The full archive over a cold mobile link needs more than a 15s
+        // window; the timeout is per-request idle time, not total duration.
+        request.timeoutInterval = 30
+        // Reseed servers require the wget-style agent on the data path (see
+        // the header comment).
+        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        return try await session.data(for: request)
     }
 
     // MARK: SU3 container
@@ -247,7 +300,11 @@ enum I2PReseedService {
             throw I2PReseedError.invalidSU3("empty SU3 content")
         }
         guard bytes.count >= contentEnd + signatureLength + paddingLength else {
-            throw I2PReseedError.invalidSU3("content length exceeds the file")
+            // Name the arithmetic: the header promises this much content, the
+            // transfer delivered less. That is a cut-short response body, not
+            // garbage — the message says so and carries the received size.
+            throw I2PReseedError.invalidSU3(
+                "content length \(contentLength) exceeds the file (received \(bytes.count) bytes — truncated transfer)")
         }
         return Data(bytes[contentStart..<contentEnd])
     }
