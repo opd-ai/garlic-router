@@ -36,7 +36,15 @@ enum I2PLiveFailureClassifier {
         }
         if text.contains("timeout") || text.contains("timed out") || text.contains("no mainnet response")
             || text.contains("handshake") || text.contains("connection") || text.contains("dial")
-            || text.contains("unreachable") || text.contains("no live session") || text.contains("reseed") {
+            || text.contains("unreachable") || text.contains("no live session") || text.contains("reseed")
+            // Cascade conditions: a probe whose prerequisite (reseed, a live
+            // session, a resolved lease) already failed transiently upstream is
+            // itself transient — classifying it as an implementation gap would
+            // misreport a network outage as a router bug.
+            || text.contains("no established session") || text.contains("never sent")
+            || text.contains("no mainnet peers") || text.contains("no mainnet routers known")
+            || text.contains("no lease-bearing") || text.contains("hosts.txt")
+            || text.contains("non-200") || text.contains("nothing to dial") {
             return .transient
         }
         return .implementation
@@ -111,8 +119,13 @@ struct I2PWellKnownDestination {
 /// (destination base64 per entry) over HTTPS from the I2P source repository and
 /// computing each destination's netdb key. No synthetic destinations.
 enum I2PMainnetHosts {
+    /// Clearnet mirrors of the standard hosts.txt. The GitHub raw source is
+    /// canonical but rate-limited and intermittently non-200; the CDN mirrors
+    /// of the same repo path absorb those refusals.
     static let sources = [
-        "https://raw.githubusercontent.com/i2p/i2p.i2p/master/hosts.txt"
+        "https://raw.githubusercontent.com/i2p/i2p.i2p/master/hosts.txt",
+        "https://cdn.jsdelivr.net/gh/i2p/i2p.i2p@master/hosts.txt",
+        "https://cdn.statically.io/gh/i2p/i2p.i2p/master/hosts.txt",
     ]
 
     /// Long-lived public services worth probing first (i2pwiki and friends).

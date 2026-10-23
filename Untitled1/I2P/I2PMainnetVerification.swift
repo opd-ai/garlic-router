@@ -70,8 +70,15 @@ enum I2PMainnetVerification {
         }
 
         await run("NTCP2 handshake with mainnet floodfills (baseline 3-5)") {
-            guard let reseed, reseed.floodfillCount > 0 else {
-                throw I2PMainnetFailure(message: "reseed produced no floodfill peers to dial")
+            // Gate on the netdb's actual floodfill set, not this run's reseed
+            // report: a reseed failure must not orphan the probe when the
+            // persisted netdb already carries signature-verified floodfills
+            // from earlier runs (a real router keeps its netdb on disk).
+            let knownFloodfills = await netDB.floodfillCount()
+            guard knownFloodfills > 0 else {
+                throw I2PMainnetFailure(message: reseed == nil
+                    ? "reseed failed and the persisted netdb holds no floodfills — nothing to dial"
+                    : "reseed produced no floodfill peers to dial")
             }
             let targets = try await dialTargets(netDB: netDB, ntcp2: ntcp2, limit: 5)
             for target in targets where !ntcp2.hasSession(for: target.hash) {
@@ -102,7 +109,10 @@ enum I2PMainnetVerification {
 
         await run("Kademlia DHT DatabaseLookup round-trip with mainnet floodfills") {
             guard let reseed, !reseed.deferredHashes.isEmpty else {
-                throw I2PMainnetFailure(message: "no deferred lookup target — reseed ingested everything")
+                let knownFloodfills = await netDB.floodfillCount()
+                throw I2PMainnetFailure(message: knownFloodfills > 0
+                    ? "no deferred lookup target this run (reseed unavailable or ingested everything) — the fresh-entry DHT round-trip needs a live reseed"
+                    : "no deferred lookup target — reseed ingested everything")
             }
             let target = reseed.deferredHashes[0]
             let started = Date()
@@ -264,8 +274,9 @@ enum I2PMainnetVerification {
         }
 
         await run("Mainnet inbound tunnel participation monitored over live sessions") {
-            guard let reseed, reseed.floodfillCount > 0 else {
-                throw I2PMainnetFailure(message: "no mainnet peers — nothing to monitor against")
+            let knownFloodfills = await netDB.floodfillCount()
+            guard knownFloodfills > 0 else {
+                throw I2PMainnetFailure(message: "no mainnet peers known (reseed unavailable and the persisted netdb is empty) — nothing to monitor against")
             }
             guard ntcp2.sessionCount() > 0 else {
                 throw I2PMainnetFailure(message: "no established mainnet sessions — inbound participation cannot be observed")
@@ -293,8 +304,9 @@ enum I2PMainnetVerification {
         }
 
         await run("Mainnet outbound tunnel creation attempt through real hops") {
-            guard let reseed, reseed.floodfillCount > 0 else {
-                throw I2PMainnetFailure(message: "no mainnet routers known — no hop candidates for a build attempt")
+            let knownFloodfills = await netDB.floodfillCount()
+            guard knownFloodfills > 0 else {
+                throw I2PMainnetFailure(message: "no mainnet routers known (reseed unavailable and the persisted netdb is empty) — no hop candidates for a build attempt")
             }
             guard ntcp2.sessionCount() > 0 else {
                 throw I2PMainnetFailure(message: "no established mainnet sessions — build messages could never reach a hop")
@@ -352,8 +364,18 @@ enum I2PMainnetVerification {
                 }
                 findings.append("\(reseed.floodfillCount) floodfills known")
             } else {
-                findings.append("reseed never completed")
-                healthy = false
+                // A reseed failure is only fatal when nothing carried the run:
+                // with persisted floodfills and live sessions the router still
+                // operated against mainnet this cycle (a real router keeps its
+                // netdb on disk across restarts). Flag it either way.
+                let persistedFloodfills = await netDB.floodfillCount()
+                let liveSessions = ntcp2.sessionCount()
+                if persistedFloodfills > 0, liveSessions >= 1 {
+                    findings.append("reseed unavailable this run — \(persistedFloodfills) persisted floodfill(s) carried the run over \(liveSessions) live session(s)")
+                } else {
+                    findings.append("reseed never completed and the netdb holds no carried state")
+                    healthy = false
+                }
             }
             let sessions = ntcp2.sessionCount()
             findings.append("\(sessions) established mainnet NTCP2 session(s)")

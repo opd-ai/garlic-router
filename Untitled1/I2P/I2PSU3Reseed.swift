@@ -41,13 +41,18 @@ enum I2PReseedError: Error {
 }
 
 enum I2PReseedService {
-    /// Well-known public reseed servers (HTTPS, SU3 reseed files).
+    /// Well-known public reseed servers (HTTPS, SU3 reseed files), ordered
+    /// most-reliable first. All are tried in sequence; the run only fails when
+    /// every host refuses or times out.
     static let hosts = [
         "https://reseed.i2p-projekt.de/",
+        "https://i2p.mooo.com/",
         "https://reseed.diva.exchange/",
-        "https://reseed.milli.pe/",
-        "https://www.torontocrypto.org:8443/",
+        "https://reseed.stormycloud.org/",
         "https://banana.incognet.io/",
+        "https://www.torontocrypto.org:8443/",
+        "https://reseed.milli.pe/",
+        "https://i2pseed.creativecowpat.net:8443/",
     ]
 
     /// Fetches the first working reseed host, parses the SU3 container,
@@ -70,7 +75,7 @@ enum I2PReseedService {
             throw I2PReseedError.invalidSU3("invalid reseed host url")
         }
         var request = URLRequest(url: url)
-        request.timeoutInterval = 8
+        request.timeoutInterval = 10
         request.setValue("I2P-Swift-Router/0.1", forHTTPHeaderField: "User-Agent")
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
