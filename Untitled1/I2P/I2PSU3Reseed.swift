@@ -32,10 +32,21 @@
 //  User-Agent convention: reseed servers deliberately filter agents to keep
 //  browsers from accidentally downloading multi-megabyte archives through
 //  their root, and they reject unrecognized agents with HTTP 403 on the data
-//  path. The agent they expect is the wget-style one i2pd presents: Wget/1.14
-//  (Java I2P sends its own reseed agent, which the same servers also accept).
-//  Browser-grade or router-custom agents are refused — a browser UA retry was
-//  tried and also 403'd, so the fetch presents Wget/1.14 from the first byte.
+//  path. The agent they expect is the wget-style one i2pd presents — the full
+//  "Wget/1.14 (linux-gnu)" string, which is what cleared diva's data path.
+//  Browser-grade or router-custom agents are refused.
+//
+//  Content-Encoding: reseed archives can arrive GZIPPED, and the big ones are
+//  streamed as MULTI-MEMBER gzip (RFC 1952 allows concatenated members).
+//  URLSession's transparent decompressor stops at the END of the first member
+//  and reports success — diva's ~17MB full-netdb reseed arrived as exactly its
+//  first member (67,328 bytes, twice, cleanly) while the SU3 header honestly
+//  promised the rest. The reseed therefore asks for identity encoding (honest
+//  servers then send raw bytes) and inflates any gzip that still arrives
+//  itself, member after member, so no archive loses its tail. The wire body
+//  is also cross-checked against the server's own Content-Length before
+//  parsing, so a genuinely cut-short transfer is named as such instead of
+//  surfacing as a parse mystery.
 //
 //  Zip layout: end-of-central-directory scan, central directory entries and
 //  local headers; entries are stored (method 0) or raw-deflate (method 8),
@@ -77,16 +88,12 @@ enum I2PReseedService {
     /// every host refuses or times out.
     static let hosts = [
         "https://reseed.i2p-projekt.de/",
-        "https://reseed-pl.i2p-projekt.de/",
-        "https://uk.reseed.i2p-projekt.de/",
         "https://i2p.mooo.com/",
         "https://reseed.diva.exchange/",
         "https://reseed.stormycloud.org/",
         "https://banana.incognet.io/",
         "https://www.torontocrypto.org:8443/",
         "https://i2p.novg.net/",
-        "https://i2pgit.org/",
-        "https://kingfox.org/",
         "https://i2pseed.creativecowpat.net:8443/",
     ]
 
@@ -165,9 +172,10 @@ enum I2PReseedService {
     }
 
     /// The user agent reseed servers require on the data path (see the header
-    /// comment): the wget-style agent i2pd presents. Custom and browser agents
-    /// are deliberately rejected with 403.
-    static let userAgent = "Wget/1.14"
+    /// comment): the full wget-style string i2pd presents. The bare "Wget/1.14"
+    /// cleared diva but some hosts 403'd it; the exact i2pd agent is what the
+    /// server operators see from a working router.
+    static let userAgent = "Wget/1.14 (linux-gnu)"
 
     static func reseed(from host: String, into netDB: I2PNetworkDatabase, deferCount: Int) async throws -> I2PReseedReport {
         // The SU3 archive lives at the standard reseed path off the base URL
@@ -185,10 +193,7 @@ enum I2PReseedService {
         var lastError: Error?
         for attempt in 1...2 {
             do {
-                let (data, response) = try await fetch(url: url)
-                guard let http = response as? HTTPURLResponse else {
-                    throw I2PReseedError.invalidSU3("reseed host answered with a non-HTTP response")
-                }
+                let (rawData, http) = try await fetch(url: url)
                 guard (200...299).contains(http.statusCode) else {
                     if http.statusCode == 429 {
                         throw I2PReseedError.rateLimited
@@ -196,7 +201,30 @@ enum I2PReseedService {
                     throw I2PReseedError.invalidSU3("reseed host returned HTTP status \(http.statusCode)")
                 }
 
-                let zipData = try parseSU3(data)
+                // Cross-check the wire body against the server's own
+                // Content-Length before any parsing: a body cut short in
+                // transport is a retriable transfer failure with a name, not a
+                // parse mystery. Chunked responses report -1 and skip this.
+                let expected = http.expectedContentLength
+                if expected > 0, rawData.count < expected {
+                    throw I2PReseedError.invalidSU3(
+                        "server sent Content-Length \(expected) but the transfer delivered \(rawData.count) bytes — truncated transfer")
+                }
+
+                // Identity encoding was requested; if the server gzipped
+                // anyway, inflate it ourselves with full multi-member support
+                // (URLSession's transparent decompressor stops at the first
+                // member and reports success — the exact diva failure mode).
+                let raw = [UInt8](rawData)
+                let encoding = (http.value(forHTTPHeaderField: "Content-Encoding") ?? "").lowercased()
+                let body: Data
+                if encoding.contains("gzip") || (raw.count >= 2 && raw[0] == 0x1f && raw[1] == 0x8b) {
+                    body = try inflateGzip(Data(raw))
+                } else {
+                    body = Data(raw)
+                }
+
+                let zipData = try parseSU3(body)
                 let payloads = try routerInfoPayloads(fromZip: zipData)
                 guard !payloads.isEmpty else {
                     throw I2PReseedError.invalidZip("no routerInfo entries in the reseed archive")
@@ -251,10 +279,10 @@ enum I2PReseedService {
 
     private static func isTruncatedBody(_ error: Error) -> Bool {
         guard case I2PReseedError.invalidSU3(let message) = error else { return false }
-        return message.contains("content length") && message.contains("truncated transfer")
+        return message.contains("truncated transfer")
     }
 
-    private static func fetch(url: URL) async throws -> (Data, URLResponse) {
+    private static func fetch(url: URL) async throws -> (Data, HTTPURLResponse) {
         var request = URLRequest(url: url)
         // The full archive over a cold mobile link needs more than a 15s
         // window; the timeout is per-request idle time, not total duration.
@@ -262,7 +290,17 @@ enum I2PReseedService {
         // Reseed servers require the wget-style agent on the data path (see
         // the header comment).
         request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-        return try await session.data(for: request)
+        // Identity encoding: with an explicit Accept-Encoding, URLSession does
+        // not transparently decompress — so the body we receive is the wire
+        // body, its Content-Length cross-check is meaningful, and any gzip
+        // that still arrives is inflated by inflateGzip with multi-member
+        // support instead of being silently cut at the first member.
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw I2PReseedError.invalidSU3("reseed host answered with a non-HTTP response")
+        }
+        return (data, http)
     }
 
     // MARK: SU3 container
@@ -307,6 +345,109 @@ enum I2PReseedService {
                 "content length \(contentLength) exceeds the file (received \(bytes.count) bytes — truncated transfer)")
         }
         return Data(bytes[contentStart..<contentEnd])
+    }
+
+    // MARK: Gzip
+
+    /// Inflates a gzip body with FULL multi-member support (RFC 1952 allows
+    /// concatenated members). URLSession's transparent decompressor stops at
+    /// the END of the first member and reports success — diva's large reseed
+    /// arrived as exactly its first member (~67KB of a 17MB archive) with no
+    /// error. The reseed requests identity encoding first (honest servers then
+    /// send raw bytes); any gzip that still arrives is walked member after
+    /// member here, so no archive loses its tail.
+    static func inflateGzip(_ raw: Data) throws -> Data {
+        let bytes = [UInt8](raw)
+        var output = Data()
+        var position = 0
+        while position + 2 <= bytes.count {
+            guard bytes[position] == 0x1f, bytes[position + 1] == 0x8b else {
+                // Trailing non-gzip bytes end the walk cleanly once output
+                // exists; a non-gzip body with no output is a real refusal.
+                if !output.isEmpty { break }
+                let head = bytes.prefix(8).map { String(format: "%02x", $0) }.joined()
+                throw I2PReseedError.invalidSU3("gzip body does not begin with a gzip member (payload begins \(head))")
+            }
+            let headerEnd = try gzipMemberHeaderEnd(bytes, position)
+            let (member, consumed) = try inflateRawDeflate(Array(bytes[headerEnd...]))
+            guard !member.isEmpty else {
+                throw I2PReseedError.invalidSU3("gzip member inflated to nothing")
+            }
+            output.append(member)
+            // Each member closes with CRC32 (4) + ISIZE (4).
+            position = headerEnd + consumed + 8
+        }
+        guard !output.isEmpty else {
+            throw I2PReseedError.invalidSU3("gzip body inflated to nothing")
+        }
+        return output
+    }
+
+    /// Walks one gzip member header (RFC 1952): magic(2) CM(1) FLG(1) MTIME(4)
+    /// XFL(1) OS(1), then the optional FEXTRA/FNAME/FCOMMENT/FHCRC fields the
+    /// FLG bits announce. Returns the offset where the raw DEFLATE stream
+    /// starts.
+    private static func gzipMemberHeaderEnd(_ bytes: [UInt8], _ start: Int) throws -> Int {
+        var p = start + 10
+        let flg = bytes[start + 3]
+        if flg & 0x04 != 0 { // FEXTRA
+            guard p + 2 <= bytes.count else { throw I2PReseedError.invalidSU3("truncated gzip header") }
+            let xlen = Int(bytes[p]) | (Int(bytes[p + 1]) << 8)
+            p += 2 + xlen
+        }
+        if flg & 0x08 != 0 { // FNAME
+            while p < bytes.count, bytes[p] != 0 { p += 1 }
+            p += 1
+        }
+        if flg & 0x10 != 0 { // FCOMMENT
+            while p < bytes.count, bytes[p] != 0 { p += 1 }
+            p += 1
+        }
+        if flg & 0x02 != 0 { p += 2 } // FHCRC
+        guard p <= bytes.count else { throw I2PReseedError.invalidSU3("truncated gzip header") }
+        return p
+    }
+
+    /// Raw-DEFLATE inflates one member through the Compression framework's
+    /// streaming decoder and reports how many input bytes the member consumed,
+    /// so the caller can locate the next member in a multi-member stream.
+    private static func inflateRawDeflate(_ bytes: [UInt8]) throws -> (Data, Int) {
+        let dstBufferSize = 65_536
+        let dstBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: dstBufferSize)
+        defer { dstBuffer.deallocate() }
+        return try bytes.withUnsafeBufferPointer { srcBuffer -> (Data, Int) in
+            guard let srcBase = srcBuffer.baseAddress, !bytes.isEmpty else {
+                throw I2PReseedError.invalidSU3("empty gzip member")
+            }
+            var stream = compression_stream(dst_ptr: dstBuffer, dst_size: 0,
+                                            src_ptr: srcBase, src_size: Int(bytes.count), state: nil)
+            guard compression_stream_init(&stream, COMPRESSION_STREAM_DECODE, COMPRESSION_ZLIB)
+                    == COMPRESSION_STATUS_OK else {
+                throw I2PReseedError.invalidSU3("gzip decoder failed to initialize")
+            }
+            defer { compression_stream_destroy(&stream) }
+            var output = Data()
+            while true {
+                stream.dst_ptr = dstBuffer
+                stream.dst_size = dstBufferSize
+                let status = compression_stream_process(&stream, 0)
+                let produced = dstBufferSize - stream.dst_size
+                if produced > 0 { output.append(dstBuffer, count: produced) }
+                let consumed = bytes.count - Int(stream.src_size)
+                switch status {
+                case COMPRESSION_STATUS_END:
+                    return (output, consumed)
+                case COMPRESSION_STATUS_OK:
+                    // No output produced with the input exhausted means the
+                    // member's deflate stream never completed: truncated.
+                    guard produced > 0 || stream.src_size > 0 else {
+                        throw I2PReseedError.invalidSU3("truncated transfer (gzip member cut short)")
+                    }
+                default:
+                    throw I2PReseedError.invalidSU3("gzip inflate failed")
+                }
+            }
+        }
     }
 
     // MARK: Zip
