@@ -11,11 +11,13 @@
 //  destinations resolve through DatabaseLookup (see I2PNetDB.swift).
 //
 //  Encrypted LeaseSet2 (type 3): the envelope is parsed and signature-verified
-//  exactly as a floodfill verifies a store — destination (carrying the real
-//  X25519 ECIES key), published/expires, flags, transient delegation block,
-//  encrypted-body length + opaque body, trailing signature. The inner leases
-//  ride the encrypted body and only decrypt under the spec's b33 blinding /
-//  authentication path (a client-side concern, not a netdb verify concern).
+//  exactly as a floodfill verifies a store — destination (carrying the blinded
+//  signing key plus the real X25519 ECIES key), published/expires, flags,
+//  transient delegation block, encrypted-body length + body, trailing signature
+//  made by the blinded private key k' = alpha·k mod L. The inner leases ride
+//  the encrypted body and decrypt through the b33 blinding path implemented in
+//  I2PB33Blinding.swift (resolveEncryptedBody), surfaced through the same
+//  resolvedLeaseSet() delivery path plain LS2s use.
 //
 //  Meta LeaseSet2 (type 5): carries a list of complete inner LeaseSet2s
 //  (plain or encrypted). Plain inner entries yield delivery-usable leases.

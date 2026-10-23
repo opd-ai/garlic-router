@@ -558,6 +558,49 @@ actor I2PNetworkDatabase {
         await lookup(key, timeoutPerRound: timeoutPerRound, maxRounds: maxRounds)?.leaseSet2
     }
 
+    // MARK: Encrypted LeaseSet2 (b33) resolution
+
+    /// Resolves an encrypted LeaseSet2 (store type 3) published under its
+    /// blinded key for a destination we hold credentials for: derives the
+    /// blinded destination key and blinded netdb key per the blinding spec
+    /// (I2PB33Blinding), looks the entry up under its blinded netdb key over
+    /// the same DHT path any netdb lookup rides, decrypts the authenticated
+    /// inner body, and returns the inner plain LeaseSet2 — parse-verified
+    /// under the real destination's signing key. Without credentials the
+    /// entry stays opaque, exactly as the spec intends.
+    func lookupEncryptedLeaseSet2(credentials: I2PB33Credentials,
+                                  timeoutPerRound: TimeInterval = 1.5,
+                                  maxRounds: Int = 2) async -> I2PLeaseSet2? {
+        guard let encryptionPublicKey = I2PB33Blinding.destinationEncryptionPublicKey(credentials) else {
+            return nil
+        }
+        guard let blinded = try? I2PB33Blinding.blind(
+            destinationSeed: credentials.ed25519Seed,
+            encryptionPublicKey: encryptionPublicKey,
+            secret: credentials.secret) else {
+            return nil
+        }
+        guard let entry = await lookup(blinded.netDBKey,
+                                       timeoutPerRound: timeoutPerRound,
+                                       maxRounds: maxRounds),
+              let encrypted = entry.leaseSet2,
+              encrypted.storeType == .encrypted else {
+            return nil
+        }
+        return try? encrypted.resolveEncryptedBody(credentials: credentials)
+    }
+
+    /// Delivery-path resolution for an encrypted (b33) destination: the same
+    /// I2PLeaseSet shape plain LS2 resolution feeds garlic delivery with —
+    /// the resolved inner LS2's leases ride `resolvedLeaseSet()` unchanged.
+    func resolveEncryptedDestination(credentials: I2PB33Credentials,
+                                     timeoutPerRound: TimeInterval = 1.5,
+                                     maxRounds: Int = 2) async -> I2PLeaseSet? {
+        await lookupEncryptedLeaseSet2(credentials: credentials,
+                                       timeoutPerRound: timeoutPerRound,
+                                       maxRounds: maxRounds)?.resolvedLeaseSet()
+    }
+
     // MARK: Refresh / expiration / maintenance
 
     /// Re-publishes our own RouterInfo and LeaseSet to the floodfills (periodic refresh).

@@ -59,6 +59,14 @@ enum I2PCrypto {
         return shared.withUnsafeBytes { Data($0) }
     }
 
+    /// Derives the X25519 public key matching a private key (e.g. the
+    /// destination ECIES key of a b33 credential set, which rides the
+    /// blinded envelope for keying).
+    static func x25519PublicKey(fromPrivateKey privateKey: Data) -> Data? {
+        try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: privateKey)
+            .publicKey.rawRepresentation
+    }
+
     // MARK: HKDF-SHA256 key derivation
 
     static func hkdfSHA256(inputKeyMaterial: Data, salt: Data, info: Data, outputLength: Int) -> Data {
@@ -121,6 +129,17 @@ enum I2PCrypto {
     static func ed25519Verify(signature: Data, message: Data, publicKey: Data) -> Bool {
         guard let key = try? Curve25519.Signing.PublicKey(rawRepresentation: publicKey) else { return false }
         return key.isValidSignature(signature, for: message)
+    }
+
+    /// Ed25519 signing with an explicit scalar — the blinded private key of
+    /// the b33 blinding spec (k' = alpha·k mod L), not an RFC 8032 seed. The
+    /// signature verifies with any conformant verifier against K' = k'·G.
+    static func ed25519SignWithScalar(message: Data, scalar: Data, noncePrefix: Data) -> Data? {
+        guard let signature = Ed25519Pure.signWithScalar(
+            message: Array(message), scalar: Array(scalar), noncePrefix: Array(noncePrefix)) else {
+            return nil
+        }
+        return Data(signature)
     }
 
     // MARK: Ed25519ph (SigType 11) — pure-Swift pre-hashed EdDSA

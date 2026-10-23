@@ -575,6 +575,24 @@ enum Ed25519Pure {
         return R + Ed25519Scalar.limbsToBytes(S)
     }
 
+    /// Signs with an explicit scalar and a secret nonce prefix — the blinded
+    /// private key path of the encrypted LeaseSet blinding spec, where the
+    /// signing key is the derived scalar k' = alpha·k mod L rather than an
+    /// RFC 8032 seed. The scalar must already be clamped and reduced mod L;
+    /// the nonce prefix is the signer's secret per-signature nonce material.
+    /// Verification is unchanged: the signature checks against K' = k'·G.
+    static func signWithScalar(message: [UInt8], scalar: [UInt8], noncePrefix: [UInt8]) -> [UInt8]? {
+        guard scalar.count == 32, noncePrefix.count == 32 else { return nil }
+        let publicKey = GePoint.multiply(Ed25519Curve.base, scalar).encode()
+        let r = Ed25519Scalar.reduceModL(Ed25519Scalar.bytesToLimbs(sha512(noncePrefix + message), limbCount: 8))
+        let R = GePoint.multiply(Ed25519Curve.base, Ed25519Scalar.limbsToBytes(r)).encode()
+        let k = Ed25519Scalar.reduceModL(Ed25519Scalar.bytesToLimbs(sha512(R + publicKey + message), limbCount: 8))
+        let aLimbs = Ed25519Scalar.bytesToLimbs(scalar, limbCount: 4)
+        let S = Ed25519Scalar.reduceModL(Ed25519Scalar.addWide(
+            Ed25519Scalar.mulWide(k, aLimbs), r))
+        return R + Ed25519Scalar.limbsToBytes(S)
+    }
+
     static func verify(message: [UInt8], signature: [UInt8], publicKey: [UInt8], prehashed: Bool) -> Bool {
         guard signature.count == 64, publicKey.count == 32 else { return false }
         let sLimbs = Ed25519Scalar.bytesToLimbs(Array(signature[32..<64]), limbCount: 4)
