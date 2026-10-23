@@ -95,18 +95,24 @@ enum I2PReseedService {
     /// into the netdb.
     static func reseed(into netDB: I2PNetworkDatabase, deferCount: Int = 2) async throws -> I2PReseedReport {
         var failures: [String] = []
-        for host in hosts {
-            do {
-                return try await reseed(from: host, into: netDB, deferCount: deferCount)
-            } catch {
-                // Aggregate every host outcome — a report that names each
-                // refusal mode (connection refused vs TLS rejection vs
-                // timeout) turns "all hosts failed" from a guess into a
-                // diagnosis instead of exposing only the last raw URLError.
-                failures.append("\(host) — \(summarize(error))")
+        // Two passes over the host list: cold-network TLS handshakes and
+        // transit routes to these hosts frequently stall on the first attempt
+        // and clear on the second, and a per-host retry would double the
+        // worst-case wall time of the whole sweep for the same coverage.
+        for pass in 1...2 {
+            for host in hosts {
+                do {
+                    return try await reseed(from: host, into: netDB, deferCount: deferCount)
+                } catch {
+                    // Aggregate every host outcome — a report that names each
+                    // refusal mode (connection refused vs TLS rejection vs
+                    // timeout) turns "all hosts failed" from a guess into a
+                    // diagnosis instead of exposing only the last raw URLError.
+                    failures.append("\(host) — \(summarize(error))")
+                }
             }
         }
-        throw I2PMainnetFailure(message: "all \(hosts.count) reseed hosts failed: \(failures.joined(separator: "; "))")
+        throw I2PMainnetFailure(message: "all \(hosts.count) reseed hosts failed over two passes: \(failures.joined(separator: "; "))")
     }
 
     /// Collapses a host failure to its refusal mode: the URLError blob's
@@ -138,12 +144,32 @@ enum I2PReseedService {
         guard let url = URL(string: trimmed + reseedPath) else {
             throw I2PReseedError.invalidSU3("invalid reseed host url")
         }
+        do {
+            return try await fetchAndIngest(url: url, host: host, netDB: netDB,
+                                            deferCount: deferCount,
+                                            userAgent: "I2P-Swift-Router/0.1")
+        } catch let error as I2PReseedError {
+            // Some reseed hosts sit behind edge filters that answer the data
+            // path with 403 for an unrecognized user agent (the HTML index at
+            // the root serves fine). Retry once presenting a browser-grade
+            // agent before giving up on the host.
+            if case .invalidSU3(let message) = error, message.contains("403") {
+                return try await fetchAndIngest(url: url, host: host, netDB: netDB,
+                                                deferCount: deferCount,
+                                                userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)")
+            }
+            throw error
+        }
+    }
+
+    private static func fetchAndIngest(url: URL, host: String, netDB: I2PNetworkDatabase,
+                                       deferCount: Int, userAgent: String) async throws -> I2PReseedReport {
         var request = URLRequest(url: url)
         // Reseed servers can be slow to establish TLS on a cold network; the
         // bare-host fetches that returned HTML never reached here. Give each
         // host a full window instead of failing the first two on timeout.
         request.timeoutInterval = 15
-        request.setValue("I2P-Swift-Router/0.1", forHTTPHeaderField: "User-Agent")
+        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
@@ -203,11 +229,19 @@ enum I2PReseedService {
             let head = bytes.prefix(8).map { String(format: "%02x", $0) }.joined()
             throw I2PReseedError.invalidSU3("bad SU3 magic (payload begins \(head))")
         }
-        let signatureLength = Int(u16(bytes, 10))
+        // SU3 header numeric fields are BIG-endian (I2P wire convention) — the
+        // little-endian helpers below belong to the ZIP container, whose fields
+        // are little-endian per the zip spec. Reading the SU3 lengths with the
+        // zip helpers byte-swapped every field: signature length 0x0040 (64)
+        // parsed as 0x4000, and the 8-byte content length became astronomically
+        // large — the exact "content length exceeds the file" failure real
+        // archives produced while synthetic round-trips stayed green (the test
+        // builder made the same byte swap, so parser and builder agreed).
+        let signatureLength = Int(be16(bytes, 10))
         let paddingLength = Int(bytes[12])
-        let versionLength = Int(u16(bytes, 13))
-        let signerLength = Int(u16(bytes, 15))
-        let contentLength = Int(u64(bytes, 17))
+        let versionLength = Int(be16(bytes, 13))
+        let signerLength = Int(be16(bytes, 15))
+        let contentLength = Int(be64(bytes, 17))
         let headerEnd = 33 + versionLength + signerLength
         let contentStart = headerEnd
         let contentEnd = contentStart + contentLength
@@ -309,6 +343,18 @@ enum I2PReseedService {
         return out
     }
 
+    // SU3 header fields: big-endian, per the SU3 reseed spec.
+    private static func be16(_ bytes: [UInt8], _ offset: Int) -> UInt16 {
+        (UInt16(bytes[offset]) << 8) | UInt16(bytes[offset + 1])
+    }
+
+    private static func be64(_ bytes: [UInt8], _ offset: Int) -> UInt64 {
+        var value: UInt64 = 0
+        for i in 0..<8 { value = (value << 8) | UInt64(bytes[offset + i]) }
+        return value
+    }
+
+    // ZIP container fields: little-endian, per the zip spec.
     private static func u16(_ bytes: [UInt8], _ offset: Int) -> UInt16 {
         UInt16(bytes[offset]) | (UInt16(bytes[offset + 1]) << 8)
     }
