@@ -22,6 +22,13 @@
 //  verification the netdb ingest performs on every entry — the same bar
 //  network-sourced RouterInfos already clear.
 //
+//  Reseed URL convention: every well-known reseed server serves its SU3
+//  archive at "<base>/i2pseeds.su3" — Java I2P's ReseedHandler and i2pd
+//  append exactly that filename to each configured base URL. Fetching the
+//  bare base URL returns the server's HTML index page: HTTP 200, "bad SU3
+//  magic" at parse. The hosts list therefore holds base URLs and the fetch
+//  always targets the standard reseed path.
+//
 //  Zip layout: end-of-central-directory scan, central directory entries and
 //  local headers; entries are stored (method 0) or raw-deflate (method 8),
 //  decompressed through the Compression framework's zlib codec.
@@ -66,6 +73,11 @@ enum I2PReseedService {
         "https://reseed.milli.pe/",
         "https://i2pseed.creativecowpat.net:8443/",
     ]
+
+    /// The standard reseed filename every well-known reseed server serves off
+    /// its base URL — the "latest reseed" archive, regenerated continuously by
+    /// each server from the current netdb state.
+    static let reseedPath = "i2pseeds.su3"
 
     /// The reseed session rides the documented transport-trust model: default
     /// certificate evaluation first, then a self-signed-leaf fallback (see
@@ -119,11 +131,18 @@ enum I2PReseedService {
     }
 
     static func reseed(from host: String, into netDB: I2PNetworkDatabase, deferCount: Int) async throws -> I2PReseedReport {
-        guard let url = URL(string: host) else {
+        // The SU3 archive lives at the standard reseed path off the base URL
+        // (see the header comment). Some configured hosts omit the trailing
+        // slash; normalize before appending the filename.
+        let trimmed = host.hasSuffix("/") ? host : host + "/"
+        guard let url = URL(string: trimmed + reseedPath) else {
             throw I2PReseedError.invalidSU3("invalid reseed host url")
         }
         var request = URLRequest(url: url)
-        request.timeoutInterval = 10
+        // Reseed servers can be slow to establish TLS on a cold network; the
+        // bare-host fetches that returned HTML never reached here. Give each
+        // host a full window instead of failing the first two on timeout.
+        request.timeoutInterval = 15
         request.setValue("I2P-Swift-Router/0.1", forHTTPHeaderField: "User-Agent")
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
@@ -178,7 +197,11 @@ enum I2PReseedService {
         }
         let magic = Array("I2Psu3".utf8)
         guard Array(bytes[0..<6]) == magic else {
-            throw I2PReseedError.invalidSU3("bad SU3 magic")
+            // Surface what actually arrived: a server that answers the reseed
+            // path with an HTML page, a captive-portal block page, or garbage
+            // shows up here as the payload's first bytes, not a bare refusal.
+            let head = bytes.prefix(8).map { String(format: "%02x", $0) }.joined()
+            throw I2PReseedError.invalidSU3("bad SU3 magic (payload begins \(head))")
         }
         let signatureLength = Int(u16(bytes, 10))
         let paddingLength = Int(bytes[12])
