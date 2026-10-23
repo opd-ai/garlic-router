@@ -11,16 +11,28 @@
 //  signer, content (zip), padding and signature. The reseed container
 //  signature is NOT verified — a documented deviation: the container signature
 //  algorithms used in the wild sit outside the modern-only crypto policy.
-//  Integrity rides on the HTTPS transport, and every RouterInfo inside is
-//  Ed25519 signature-verified again when ingested into the netdb.
+//
+//  Transport trust: reseed servers in the wild commonly present SELF-SIGNED
+//  TLS certificates — which is why Java I2P and i2pd ship pinned copies of
+//  every reseed server certificate, a pin set this build cannot embed. The
+//  reseed session therefore accepts a self-signed leaf (single-certificate
+//  chain) when default trust evaluation fails, and still rejects any chain
+//  issued by a different CA (corporate MITM proxies carry two or more
+//  certificates). Authenticity rests on the per-RouterInfo Ed25519 signature
+//  verification the netdb ingest performs on every entry — the same bar
+//  network-sourced RouterInfos already clear.
 //
 //  Zip layout: end-of-central-directory scan, central directory entries and
 //  local headers; entries are stored (method 0) or raw-deflate (method 8),
 //  decompressed through the Compression framework's zlib codec.
 //
+//  The reseed session aggregates every host's failure reason (connection
+//  refused vs TLS rejection vs timeout) so a total reseed failure names each
+//  host's refusal mode instead of exposing only the last raw URLError.
 
 import Foundation
 import Compression
+import Security
 
 struct I2PReseedReport {
     let fetchedFrom: String
@@ -55,19 +67,55 @@ enum I2PReseedService {
         "https://i2pseed.creativecowpat.net:8443/",
     ]
 
+    /// The reseed session rides the documented transport-trust model: default
+    /// certificate evaluation first, then a self-signed-leaf fallback (see
+    /// I2PReseedTrustDelegate). Hosts with publicly-trusted certificates
+    /// behave exactly as before.
+    static let session: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 15
+        config.waitsForConnectivity = false
+        return URLSession(configuration: config, delegate: I2PReseedTrustDelegate(), delegateQueue: nil)
+    }()
+
     /// Fetches the first working reseed host, parses the SU3 container,
     /// unpacks the RouterInfo entries and ingests them (signature verified)
     /// into the netdb.
     static func reseed(into netDB: I2PNetworkDatabase, deferCount: Int = 2) async throws -> I2PReseedReport {
-        var lastError: Error = I2PReseedError.allHostsFailed
+        var failures: [String] = []
         for host in hosts {
             do {
                 return try await reseed(from: host, into: netDB, deferCount: deferCount)
             } catch {
-                lastError = error
+                // Aggregate every host outcome — a report that names each
+                // refusal mode (connection refused vs TLS rejection vs
+                // timeout) turns "all hosts failed" from a guess into a
+                // diagnosis instead of exposing only the last raw URLError.
+                failures.append("\(host) — \(summarize(error))")
             }
         }
-        throw lastError
+        throw I2PMainnetFailure(message: "all \(hosts.count) reseed hosts failed: \(failures.joined(separator: "; "))")
+    }
+
+    /// Collapses a host failure to its refusal mode: the URLError blob's
+    /// security-relevant content is the code, not the trust-chain dump.
+    static func summarize(_ error: Error) -> String {
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .cannotConnectToHost: return "connection refused"
+            case .timedOut: return "timed out"
+            case .cannotFindHost: return "dns resolution failed"
+            case .networkConnectionLost: return "network connection lost"
+            case .notConnectedToInternet: return "no internet connection"
+            case .secureConnectionFailed: return "TLS rejected the server certificate"
+            case .serverCertificateUntrusted: return "server certificate not trusted"
+            case .serverCertificateHasBadDate: return "server certificate expired"
+            case .serverCertificateHasUnknownRoot: return "server certificate from an unknown CA"
+            case .serverCertificateNotYetValid: return "server certificate not yet valid"
+            default: return urlError.localizedDescription.lowercased()
+            }
+        }
+        return String(describing: error)
     }
 
     static func reseed(from host: String, into netDB: I2PNetworkDatabase, deferCount: Int) async throws -> I2PReseedReport {
@@ -77,9 +125,10 @@ enum I2PReseedService {
         var request = URLRequest(url: url)
         request.timeoutInterval = 10
         request.setValue("I2P-Swift-Router/0.1", forHTTPHeaderField: "User-Agent")
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
-            throw I2PReseedError.allHostsFailed
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            throw I2PReseedError.invalidSU3("reseed host returned HTTP status \(status)")
         }
 
         let zipData = try parseSU3(data)
@@ -257,5 +306,42 @@ enum I2PReseedService {
             | (UInt64(bytes[offset + 5]) << 40)
             | (UInt64(bytes[offset + 6]) << 48)
             | (UInt64(bytes[offset + 7]) << 56)
+    }
+}
+/// Server-trust policy for reseed hosts ONLY. Reseed servers in the wild
+/// commonly present SELF-SIGNED TLS certificates — Java I2P and i2pd ship
+/// pinned copies of every reseed server certificate for exactly this reason,
+/// and this build cannot embed that pin set. The policy:
+///
+///   1. Default evaluation runs first — publicly-trusted certificates behave
+///      exactly as stock URLSession does.
+///   2. When evaluation fails, the credential is accepted ONLY for a
+///      single-certificate chain: a self-signed leaf presents no issuer chain,
+///      while any CA-issued chain (including a corporate MITM proxy) carries
+///      two or more certificates and stays rejected.
+///   3. Authenticity rests downstream: every RouterInfo in the SU3 archive is
+///      Ed25519 signature-verified again at netdb ingest — the same bar
+///      network-sourced RouterInfos already clear — so a tampered reseed
+///      stream cannot poison the netdb, only fail to bootstrap it.
+final class I2PReseedTrustDelegate: NSObject, URLSessionDataDelegate {
+    func urlSession(_ session: URLSession,
+                    didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+              let trust = challenge.protectionSpace.serverTrust else {
+            completionHandler(.performDefaultHandling, nil)
+            return
+        }
+        var evaluationError: CFError?
+        if SecTrustEvaluateWithError(trust, &evaluationError) {
+            completionHandler(.useCredential, URLCredential(trust: trust))
+            return
+        }
+        guard let chain = SecTrustCopyCertificateChain(trust) as? [SecCertificate],
+              chain.count == 1 else {
+            completionHandler(.cancelAuthenticationChallenge, nil)
+            return
+        }
+        completionHandler(.useCredential, URLCredential(trust: trust))
     }
 }

@@ -21,6 +21,16 @@
 	</array>
 	<key>UILaunchScreen</key>
 	<dict/>
+	<!-- An I2P router tunnels cleartext HTTP payloads (eepsites, outproxies)
+	     and exchanges bootstrap material with servers that present
+	     non-trusted certificates; the system ATS layer must not block these
+	     loads. Authenticity is enforced by the router's own signature
+	     verification, not by the transport. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
 	<key>UISupportedInterfaceOrientations~ipad</key>
 	<array>
 		<string>UIInterfaceOrientationLandscapeLeft</string>
