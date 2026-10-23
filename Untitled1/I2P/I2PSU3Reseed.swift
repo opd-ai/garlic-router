@@ -94,6 +94,7 @@ enum I2PReseedService {
         "https://banana.incognet.io/",
         "https://www.torontocrypto.org:8443/",
         "https://i2p.novg.net/",
+        "https://reseed2.i2pgit.org/",
         "https://i2pseed.creativecowpat.net:8443/",
     ]
 
