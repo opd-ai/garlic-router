@@ -29,6 +29,14 @@
 //  magic" at parse. The hosts list therefore holds base URLs and the fetch
 //  always targets the standard reseed path.
 //
+//  User-Agent convention: reseed servers deliberately filter agents to keep
+//  browsers from accidentally downloading multi-megabyte archives through
+//  their root, and they reject unrecognized agents with HTTP 403 on the data
+//  path. The agent they expect is the wget-style one i2pd presents: Wget/1.14
+//  (Java I2P sends its own reseed agent, which the same servers also accept).
+//  Browser-grade or router-custom agents are refused — a browser UA retry was
+//  tried and also 403'd, so the fetch presents Wget/1.14 from the first byte.
+//
 //  Zip layout: end-of-central-directory scan, central directory entries and
 //  local headers; entries are stored (method 0) or raw-deflate (method 8),
 //  decompressed through the Compression framework's zlib codec.
@@ -136,6 +144,11 @@ enum I2PReseedService {
         return String(describing: error)
     }
 
+    /// The user agent reseed servers require on the data path (see the header
+    /// comment): the wget-style agent i2pd presents. Custom and browser agents
+    /// are deliberately rejected with 403.
+    static let userAgent = "Wget/1.14"
+
     static func reseed(from host: String, into netDB: I2PNetworkDatabase, deferCount: Int) async throws -> I2PReseedReport {
         // The SU3 archive lives at the standard reseed path off the base URL
         // (see the header comment). Some configured hosts omit the trailing
@@ -144,26 +157,11 @@ enum I2PReseedService {
         guard let url = URL(string: trimmed + reseedPath) else {
             throw I2PReseedError.invalidSU3("invalid reseed host url")
         }
-        do {
-            return try await fetchAndIngest(url: url, host: host, netDB: netDB,
-                                            deferCount: deferCount,
-                                            userAgent: "I2P-Swift-Router/0.1")
-        } catch let error as I2PReseedError {
-            // Some reseed hosts sit behind edge filters that answer the data
-            // path with 403 for an unrecognized user agent (the HTML index at
-            // the root serves fine). Retry once presenting a browser-grade
-            // agent before giving up on the host.
-            if case .invalidSU3(let message) = error, message.contains("403") {
-                return try await fetchAndIngest(url: url, host: host, netDB: netDB,
-                                                deferCount: deferCount,
-                                                userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)")
-            }
-            throw error
-        }
+        return try await fetchAndIngest(url: url, host: host, netDB: netDB, deferCount: deferCount)
     }
 
     private static func fetchAndIngest(url: URL, host: String, netDB: I2PNetworkDatabase,
-                                       deferCount: Int, userAgent: String) async throws -> I2PReseedReport {
+                                       deferCount: Int) async throws -> I2PReseedReport {
         var request = URLRequest(url: url)
         // Reseed servers can be slow to establish TLS on a cold network; the
         // bare-host fetches that returned HTML never reached here. Give each
