@@ -361,6 +361,7 @@ enum I2PSAMConformanceTest {
         await run("SAM handshake + command grammar edge cases over loopback TCP", handshakeTest)
         await run("SAM STREAM session create, LeaseSet publication + session registry", sessionTest)
         await run("SAM NAMING lookup (ME/b32/addressbook) + DEST GENERATE round trip", namingTest)
+        await run("SAM NAMING b33 lookup (credentialled resolve + stranger opaque failure)", b33NamingTest)
         await run("SAM STREAM CONNECT/ACCEPT end-to-end through tunnels", streamE2ETest)
         await run("SAM DATAGRAM SEND fragmentation + reassembly", datagramTest)
         await run("SAM RAW anonymous datagram delivery", rawTest)
@@ -518,6 +519,94 @@ enum I2PSAMConformanceTest {
         }
         client.close()
         return "ME/b32/addressbook lookups + import verified; DEST GENERATE pub/priv round-trips"
+    }
+
+    /// NAMING LOOKUP with b33 blinded addresses: a session holding the
+    /// destination's credentials (Ed25519 seed + ECIES X25519 private key)
+    /// resolves the encrypted LeaseSet2 through the blinding path; a stranger
+    /// host's b33 — and a corrupted one — fail closed with the spec result.
+    private static func b33NamingTest() async throws -> String {
+        let rig = try SAMTestRig(label: "b33-naming")
+        rig.start()
+        defer { rig.stop() }
+        guard let port = await waitForPort(rig) else { throw I2PSAMError.timeout }
+
+        // A session with known credentials (imported keys, not TRANSIENT) so
+        // the test can derive the destination's b33 and publish its encrypted
+        // LeaseSet2 under the blinded key.
+        let keys = I2PSAMDestinationKeys.generate()
+        let client = SAMTestClient()
+        try await client.connect(port: port)
+        client.send("HELLO VERSION MIN=3.0 MAX=3.3")
+        _ = try await client.readLine()
+        client.send("SESSION CREATE STYLE=STREAM ID=b33 DESTINATION=\(keys.privateKeyData.base64EncodedString())")
+        let status = try await client.readLine()
+        guard status.hasPrefix("SESSION STATUS RESULT=OK") else {
+            throw I2PSAMError.invalidCommand("b33 session failed: \(status)")
+        }
+
+        let credentials = I2PB33Credentials(
+            ed25519Seed: keys.signingSeed,
+            x25519PrivateKey: keys.encryptionKey.rawRepresentation)
+        let blinded = try I2PB33Blinding.blind(
+            destinationSeed: keys.signingSeed,
+            encryptionPublicKey: keys.encryptionKey.publicKey.rawRepresentation)
+
+        // Publish an encrypted LS2 envelope for the destination under its
+        // blinded netdb key; the inner plain LS2 carries one live lease.
+        let inner = try I2PLeaseSet2.build(
+            storeType: .plain,
+            destination: keys.destination,
+            published: Date(),
+            expiresOffsetSeconds: 600,
+            leases: [
+                I2PLease2(gatewayHash: rig.hopNodes[0].routerHash,
+                          tunnelId: 0x0BAD_F00D,
+                          expiration: Date().addingTimeInterval(600), cost: 3),
+            ],
+            signingSeed: keys.signingSeed)
+        let envelope = try I2PB33Blinding.buildEncryptedLeaseSet2(
+            inner: inner, credentials: credentials)
+        try await rig.netDB.ingestLeaseSet2(envelope.serialize(),
+                                            entryType: .encryptedLeaseSet2)
+
+        // The session's own b33 resolves to the real destination.
+        client.send("NAMING LOOKUP NAME=\(blinded.b33Address)")
+        let resolved = try await client.readLine()
+        guard resolved.hasPrefix("NAMING REPLY RESULT=OK NAME="),
+              replyValue(after: "VALUE", in: resolved) == keys.destination.raw.base64EncodedString() else {
+            throw I2PSAMError.invalidCommand("b33 resolution failed: \(resolved)")
+        }
+
+        // A stranger's b33 (credentials we do not hold) fails closed: the
+        // encrypted inner body stays opaque, the lookup answers the spec
+        // resolution failure and no destination material surfaces.
+        let strangerKeys = I2PSAMDestinationKeys.generate()
+        let strangerBlinded = try I2PB33Blinding.blind(
+            destinationSeed: strangerKeys.signingSeed,
+            encryptionPublicKey: strangerKeys.encryptionKey.publicKey.rawRepresentation)
+        client.send("NAMING LOOKUP NAME=\(strangerBlinded.b33Address)")
+        let stranger = try await client.readLine()
+        guard stranger.hasPrefix("NAMING REPLY RESULT=KEY_NOT_FOUND"),
+              replyValue(after: "VALUE", in: stranger) == nil else {
+            throw I2PSAMError.invalidCommand("stranger b33 leaked or resolved: \(stranger)")
+        }
+
+        // A corrupted b33 checksum is rejected by the codec — still no leak.
+        var tampered = Array(strangerBlinded.b33Address)
+        let original = tampered[2]
+        let replacement = I2PB33Blinding.b33ChecksumSecond.first { $0 != original } ?? "a"
+        guard replacement != original else { throw I2PSAMError.invalidCommand("checksum probe degenerate") }
+        tampered[2] = replacement
+        client.send("NAMING LOOKUP NAME=\(String(tampered))")
+        let corrupt = try await client.readLine()
+        guard corrupt.hasPrefix("NAMING REPLY RESULT=KEY_NOT_FOUND")
+                || corrupt.hasPrefix("NAMING REPLY RESULT=I2P_ERROR") else {
+            throw I2PSAMError.invalidCommand("corrupt b33 resolved: \(corrupt)")
+        }
+
+        client.close()
+        return "credentialled b33 resolved to the real destination; stranger and corrupt b33 failed closed"
     }
 
     private static func streamE2ETest() async throws -> String {

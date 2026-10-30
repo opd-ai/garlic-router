@@ -260,6 +260,27 @@ final class I2PSAMServer {
 
     // MARK: Naming / destinations
 
+    /// Resolves a b33 blinded address for a querying session's credentials:
+    /// decodes and validates the address through the b33 codec (checksum,
+    /// flag/scheme/encType bytes), checks it against the blinded key the
+    /// session's own destination credentials (Ed25519 seed + ECIES X25519
+    /// private key) derive, and resolves through the encrypted-LS2 blinding
+    /// path. A b33 the credentials do not derive is a stranger host — its
+    /// encrypted inner body stays opaque, so nothing resolves and nothing
+    /// leaks: the caller surfaces the spec resolution failure. Returns nil
+    /// when the address does not resolve.
+    func resolveB33(_ address: String, credentials: I2PB33Credentials) async -> I2PDestination? {
+        guard let blindedPublicKey = I2PB33Blinding.b33Decode(address),
+              let encryptionPublicKey = I2PB33Blinding.destinationEncryptionPublicKey(credentials),
+              let blinded = try? I2PB33Blinding.blind(destinationSeed: credentials.ed25519Seed,
+                                                      encryptionPublicKey: encryptionPublicKey,
+                                                      secret: credentials.secret),
+              blinded.blindedPublicKey == blindedPublicKey else {
+            return nil
+        }
+        return await core.netDB.resolveEncryptedDestination(credentials: credentials)?.destination
+    }
+
     /// Resolves a SAM destination spec: base64 destination, `.b32.i2p` host
     /// (DHT LeaseSet lookup), B64: prefix, or an addressbook entry.
     func resolveDestination(_ spec: String) async throws -> I2PDestination {
@@ -877,8 +898,35 @@ final class I2PSAMConnection {
             let destination = try serverDestination(fromBase64: String(name.dropFirst(4)))
             return destination.raw.base64EncodedString()
         }
+        // b33 blinded addresses: resolve through the encrypted-LS2 blinding
+        // path when this session holds the destination's credentials (its
+        // Ed25519 seed + ECIES X25519 private key). A b33 the credentials
+        // cannot derive is a stranger host — the encrypted inner body stays
+        // opaque, so the lookup answers the spec resolution failure without
+        // leaking anything. Without a session there are no credentials at all.
+        if let b33 = Self.b33Spec(address: name) {
+            guard let session = boundSession() else {
+                throw I2PSAMError.destinationNotFound
+            }
+            let credentials = I2PB33Credentials(
+                ed25519Seed: session.keys.signingSeed,
+                x25519PrivateKey: session.keys.encryptionKey.rawRepresentation)
+            guard let destination = await server.resolveB33(b33, credentials: credentials) else {
+                throw I2PSAMError.destinationNotFound
+            }
+            return destination.raw.base64EncodedString()
+        }
         let destination = try await server.resolveDestination(name)
         return destination.raw.base64EncodedString()
+    }
+
+    /// Extracts a b33 address from a SAM name spec: the raw 57-character
+    /// blinded address or a "b33:"-prefixed form. Returns nil for anything
+    /// else so plain hosts fall through to the ordinary naming path.
+    private static func b33Spec(address name: String) -> String? {
+        var candidate = name.lowercased().trimmingCharacters(in: .whitespaces)
+        if candidate.hasPrefix("b33:") { candidate.removeFirst(4) }
+        return I2PB33Blinding.b33Decode(candidate) != nil ? candidate : nil
     }
 
     private func namingAdd(name: String, destinationSpec: String) {
