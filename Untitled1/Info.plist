@@ -4,6 +4,8 @@
 <dict>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleDisplayName</key>
+	<string>Garlic Router</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.organizationName.Untitled1</string>
 	<key>CFBundleName</key>
