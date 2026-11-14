@@ -13,26 +13,26 @@ enum I2NPError: Error {
     case expired
 }
 
-/// I2NP message type codes on the wire per the I2P common message spec.
-/// The live mainnet suite surfaced that the router previously rode provisional
-/// codes (67/98/99/21/18/15/31/123/124) that real routers drop as unknown
-/// types; these are the spec's codes — DatabaseStore 1, DatabaseLookup 2,
-/// DatabaseSearchReply 3, DeliveryStatus 4, Garlic 5, TunnelData 6,
-/// TunnelGateway 7, DataMessage 8, VariableTunnelBuild 21 and its reply 22.
-/// `options` keeps a router-internal status channel on the obsolete type-12
-/// slot (TunnelCreateStatus); it is never sent to mainnet peers.
+/// I2NP message type codes on the wire per the I2P common message spec:
+/// DatabaseStore 1, DatabaseLookup 2, DatabaseSearchReply 3, DeliveryStatus 10,
+/// Garlic 11, TunnelData 18, TunnelGateway 19, Data 20, and the short tunnel
+/// build pair 25/26. Earlier revisions of this router used 4/5/6/7/8 for the
+/// middle five, which reference routers drop as unknown types.
+///
+/// The spec defines no "Options" I2NP message (and Java I2P has no
+/// OptionsMessage class): router options and status ride RouterInfo options and
+/// the NTCP2 handshake Options block, so no non-spec type slot exists here.
 enum I2NPMessageType: UInt8, CaseIterable {
     case databaseStore = 1
     case databaseLookup = 2
     case databaseSearchReply = 3
-    case deliveryStatus = 4
-    case garlic = 5
-    case tunnelData = 6
-    case tunnelGateway = 7
-    case dataMessage = 8
-    case options = 12
-    case tunnelBuild = 21
-    case tunnelBuildReply = 22
+    case deliveryStatus = 10
+    case garlic = 11
+    case tunnelData = 18
+    case tunnelGateway = 19
+    case dataMessage = 20
+    case tunnelBuild = 25
+    case tunnelBuildReply = 26
 }
 
 /// I2NP wire header per the spec's full-header layout: type byte, message ID,
@@ -89,7 +89,9 @@ struct I2NPMessage {
          expiration: Date? = nil, payload: Data = Data()) {
         self.type = type
         self.messageID = messageID ?? UInt32.random(in: 1...UInt32.max)
-        self.expiration = expiration ?? Date().addingTimeInterval(120)
+        // Spec note: implementations may reject expirations too far in the
+        // future; the recommended maximum is 60 s.
+        self.expiration = expiration ?? Date().addingTimeInterval(60)
         self.payload = payload
     }
 
@@ -195,9 +197,6 @@ struct I2NPMessage {
             let id = try r.integer()
             let ms = try r.long()
             return .deliveryStatus(messageID: id, timestamp: Date(timeIntervalSince1970: Double(ms) / 1000))
-        case .options:
-            var r = I2PReader(payload)
-            return .options(try r.mapping())
         case .dataMessage:
             return .dataMessage(payload)
         case .garlic:
@@ -220,7 +219,6 @@ enum I2NPBody {
     case databaseLookup(I2PDatabaseLookup)
     case databaseSearchReply(I2PDatabaseSearchReply)
     case deliveryStatus(messageID: UInt32, timestamp: Date)
-    case options([String: String])
     case dataMessage(Data)
     case garlic(Data)
     case tunnelData(I2PTunnelDataPayload)
@@ -291,79 +289,86 @@ struct I2PTunnelGatewayPayload {
     }
 }
 
-/// Delivery instructions: local, tunnel and router delivery with an optional
-/// delay. Serialized as [mode][flags][mode-specific][delay?]; the byte count
-/// consumed is returned on parse so larger structures can embed instructions.
+/// Garlic clove delivery instructions, per I2NP §"GarlicCloveDeliveryInstructions":
+/// one flag byte (bit 7 encrypted — never set; bits 6-5 delivery type:
+/// 0 LOCAL, 1 DESTINATION, 2 ROUTER, 3 TUNNEL; bit 4 delay — never present;
+/// bits 3-0 reserved zero), then the 32-byte "to" hash for
+/// DESTINATION/ROUTER/TUNNEL, then the 4-byte tunnel ID for TUNNEL. Wire
+/// lengths are therefore exactly 1, 33 or 37 bytes.
 enum I2PDeliveryMode: UInt8 {
     case local = 0
-    case tunnel = 1
+    case destination = 1
     case router = 2
+    case tunnel = 3
 }
 
 struct I2PDeliveryInstructions {
     let mode: I2PDeliveryMode
     let tunnelID: UInt32?
+    /// Destination hash, router hash, or tunnel gateway hash depending on mode.
     let routerHash: Data?
-    let delayMilliseconds: UInt32?
 
     init(mode: I2PDeliveryMode, tunnelID: UInt32? = nil,
-         routerHash: Data? = nil, delayMilliseconds: UInt32? = nil) {
+         routerHash: Data? = nil) {
         switch mode {
         case .local:
             precondition(tunnelID == nil && routerHash == nil)
-        case .tunnel:
-            // Tunnel delivery names both the tunnel and its gateway router
-            // (real I2P format: [1][tunnelID][routerHash]).
-            precondition(tunnelID != nil && routerHash?.count == 32)
-        case .router:
+        case .destination, .router:
             precondition(tunnelID == nil && routerHash?.count == 32)
+        case .tunnel:
+            precondition(tunnelID != nil && tunnelID != 0 && routerHash?.count == 32)
         }
         self.mode = mode
         self.tunnelID = tunnelID
         self.routerHash = routerHash
-        self.delayMilliseconds = delayMilliseconds
+    }
+
+    var flag: UInt8 {
+        UInt8(mode.rawValue & 0x03) << 5
     }
 
     func serialize() -> Data {
         var w = I2PWriter()
-        w.byte(mode.rawValue)
-        var flags: UInt8 = 0
-        if delayMilliseconds != nil { flags |= 0x01 }
-        w.byte(flags)
+        w.byte(flag)
         switch mode {
         case .local:
             break
+        case .destination, .router:
+            w.hash(routerHash!)
         case .tunnel:
+            // Hash precedes the tunnel ID, per the spec.
+            w.hash(routerHash!)
             w.integer(tunnelID!)
-            w.raw(routerHash!)
-        case .router:
-            w.raw(routerHash!)
         }
-        if let delay = delayMilliseconds { w.integer(delay) }
         return w.data
     }
 
     static func parse(_ data: Data) throws -> (instructions: I2PDeliveryInstructions, consumed: Int) {
         var r = I2PReader(data)
-        guard let mode = I2PDeliveryMode(rawValue: try r.byte()) else { throw I2NPError.invalidPayload }
-        let flags = try r.byte()
+        let flag = try r.byte()
+        // Bit 7 would introduce a 32-byte session key; the spec never emits it
+        // (1/33/37-byte forms only), so reject rather than misparse.
+        guard flag & 0x80 == 0 else { throw I2NPError.invalidPayload }
+        let type = (flag >> 5) & 0x03
+        guard let mode = I2PDeliveryMode(rawValue: type) else {
+            throw I2NPError.invalidPayload
+        }
+        // Bits 4-0 (delay/reserved) are never present on the wire.
         var tunnelID: UInt32?
         var routerHash: Data?
         switch mode {
         case .local:
             break
+        case .destination, .router:
+            routerHash = try r.raw(32)
         case .tunnel:
+            routerHash = try r.raw(32)
             tunnelID = try r.integer()
-            routerHash = try r.raw(32)
-        case .router:
-            routerHash = try r.raw(32)
+            guard tunnelID != 0 else { throw I2NPError.invalidPayload }
         }
-        var delay: UInt32?
-        if flags & 0x01 != 0 { delay = try r.integer() }
         let consumed = data.count - r.remaining
-        let instructions = I2PDeliveryInstructions(
-            mode: mode, tunnelID: tunnelID, routerHash: routerHash, delayMilliseconds: delay
-        )
+        let instructions = I2PDeliveryInstructions(mode: mode, tunnelID: tunnelID,
+                                                   routerHash: routerHash)
         return (instructions, consumed)
     }
 }

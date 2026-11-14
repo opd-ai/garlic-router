@@ -18,7 +18,10 @@ struct RouterDashboardView: View {
                 VStack(spacing: 14) {
                     if let snapshot {
                         headerCard(snapshot)
+                        eepsiteBrowserCard
+                        participationCard
                         statGrid(snapshot)
+                        b33HostsCard
                         peersCard(snapshot)
                         tunnelsCard(snapshot)
                         throughputCard(snapshot)
@@ -41,6 +44,9 @@ struct RouterDashboardView: View {
                             .buttonStyle(.plain)
                             .tint(accent)
                         }
+                        eepsiteBrowserCard
+                        participationCard
+                        b33HostsCard
                     }
                 }
                 .padding(.horizontal, 16)
@@ -137,6 +143,116 @@ struct RouterDashboardView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(14)
         .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 16))
+    }
+
+    // MARK: - Eepsite browser
+
+    /// The in-app eepsite browser: .i2p pages fetched through this router's
+    /// outbound tunnel pool and rendered natively.
+    private var eepsiteBrowserCard: some View {
+        NavigationLink {
+            EepsiteBrowserView()
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "globe")
+                    .font(.title3)
+                    .foregroundStyle(accent)
+                    .frame(width: 32, height: 32)
+                    .background(accent.opacity(0.14), in: RoundedRectangle(cornerRadius: 10))
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Eepsite Browser")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                    Text("Browse .i2p pages over this router's tunnels")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                }
+                Spacer(minLength: 6)
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(16)
+            .background(accent.opacity(0.10), in: RoundedRectangle(cornerRadius: 18))
+            .overlay(
+                RoundedRectangle(cornerRadius: 18)
+                    .strokeBorder(accent.opacity(0.25), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: - b33 host book
+
+    /// The b33 host book: the blinded destinations the router knows about,
+    /// which ones its credentials unlock, and their last lease resolution.
+    private var b33HostsCard: some View {
+        NavigationLink {
+            B33HostsView()
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "book.closed")
+                    .font(.subheadline)
+                    .foregroundStyle(accent)
+                    .frame(width: 22)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("b33 Hosts")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                    Text("Blinded destinations · credentials, leases and resolution")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                }
+                Spacer(minLength: 6)
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(16)
+            .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 18))
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: - Participation controls
+
+    /// The network-participation controls: bandwidth caps, tunnel share and the
+    /// floodfill role, each with its live measured value.
+    private var participationCard: some View {
+        NavigationLink {
+            ParticipationView()
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "slider.horizontal.3")
+                    .font(.subheadline)
+                    .foregroundStyle(accent)
+                    .frame(width: 22)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Participation")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                    Text("Bandwidth caps, tunnel share and floodfill role")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                }
+                Spacer(minLength: 6)
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(16)
+            .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 18))
+        }
+        .buttonStyle(.plain)
     }
 
     // MARK: - Peers & sessions

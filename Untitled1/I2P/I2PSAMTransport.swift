@@ -38,6 +38,9 @@ final class I2PSAMGarlicTransport {
     private let lock = NSLock()
     private var gluedOutbound: Set<UInt32> = []
     private var gluedInbound: Set<UInt32> = []
+    /// Diagnostics hook into the bridge's activity log: the tunnel glue sits
+    /// between the tunnel pipeline and garlic, where a drop is otherwise silent.
+    var onEvent: ((String) -> Void)?
 
     init(core: I2PSAMRouterCore) {
         self.core = core
@@ -66,14 +69,32 @@ final class I2PSAMGarlicTransport {
 
     /// Wraps `message` in a garlic envelope addressed to `lease`, routes it
     /// through `pool`'s best outbound tunnel and delivers it to the first hop.
+    /// A failure names the stage it happened in, so the SAM client (and the
+    /// bridge log) can tell a missing tunnel from an oversized envelope.
     func send(_ message: I2NPMessage, to lease: I2PGarlicLease,
               garlicSession: I2PGarlicSession, pool: I2PTunnelPool) async throws {
-        let transmission = try I2PGarlicEndToEndPipeline.sendMessage(message, to: lease, session: garlicSession)
-        guard let tunnel = pool.selectOutboundTunnel() else { throw I2PSAMError.noTunnels }
-        installOutboundGlueIfNeeded(tunnel)
-        let (payload, firstHop) = try I2PGarlicEndToEndPipeline.routeThroughTunnelPool(transmission, via: tunnel)
-        let envelope = I2NPMessage(type: .tunnelData, payload: payload.serialize())
-        try await core.delivery.deliver(envelope.serialize(), to: firstHop)
+        var stage = "garlic_envelope"
+        do {
+            let transmission = try I2PGarlicEndToEndPipeline.sendMessage(
+                message, to: lease, session: garlicSession)
+            stage = "tunnel_selection"
+            guard let tunnel = pool.selectOutboundTunnel() else { throw I2PSAMError.noTunnels }
+            installOutboundGlueIfNeeded(tunnel)
+            stage = "tunnel_layer"
+            let serialized = transmission.message.serialize()
+            let (payload, firstHop): (I2PTunnelDataPayload, Data)
+            do {
+                (payload, firstHop) = try I2PGarlicEndToEndPipeline.routeThroughTunnelPool(transmission, via: tunnel)
+            } catch {
+                throw I2PSAMError.invalidCommand(
+                    "tunnel_layer_failed:\(error) inner=\(serialized.count)B hops=\(tunnel.hops.count)")
+            }
+            let envelope = I2NPMessage(type: .tunnelData, payload: payload.serialize())
+            stage = "delivery"
+            try await core.delivery.deliver(envelope.serialize(), to: firstHop)
+        } catch {
+            throw I2PSAMError.invalidCommand("\(stage)_failed:\(error)")
+        }
     }
 
     // MARK: Tunnel glue
@@ -94,7 +115,11 @@ final class I2PSAMGarlicTransport {
             // `inner` is the lease-addressed TunnelGateway I2NP message.
             guard let self,
                   case .tunnelGateway(let leaseTunnelID, _) = try? inner.parseBody(),
-                  let gatewayHash = self.registry.gateway(forTunnelID: leaseTunnelID) else { return }
+                  let gatewayHash = self.registry.gateway(forTunnelID: leaseTunnelID) else {
+                self?.onEvent?("OBEP glue: inner \(inner.payload.count)B dropped (no lease route)")
+                return
+            }
+            self.onEvent?("OBEP glue: \(inner.payload.count)B → \(gatewayHash.hex.prefix(8))")
             Task { try? await self.core.delivery.deliver(inner.serialize(), to: gatewayHash) }
         }
     }
@@ -112,8 +137,12 @@ final class I2PSAMGarlicTransport {
         lock.unlock()
         guard let router = core.controlledRouter(tunnel.hops[0].routerHash) else { return }
         router.registerGateway(tunnelID: gatewayID) { [weak self] garlicMessage, _ in
-            guard let self,
-                  let payload = try? I2PTunnelDataProcessor.preprocess(garlicMessage.serialize(), via: tunnel) else { return }
+            guard let self else { return }
+            guard let payload = try? I2PTunnelDataProcessor.preprocess(garlicMessage.serialize(), via: tunnel) else {
+                self.onEvent?("IBGW glue: \(garlicMessage.payload.count)B dropped (preprocess failed)")
+                return
+            }
+            self.onEvent?("IBGW glue: \(garlicMessage.payload.count)B into tunnel \(tunnel.gatewayTunnelID)")
             let envelope = I2NPMessage(type: .tunnelData, payload: payload.serialize())
             Task { try? await self.core.delivery.deliver(envelope.serialize(), to: tunnel.hops[0].routerHash) }
         }

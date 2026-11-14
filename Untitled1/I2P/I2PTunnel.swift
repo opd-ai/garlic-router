@@ -80,9 +80,23 @@ struct I2PTunnelPeer {
     let encryptionPublicKey: Data
 }
 
-/// Supplies random candidate hops for tunnel builds.
+/// Supplies candidate hops for tunnel builds.
 protocol I2PTunnelPeerProvider: AnyObject {
     func peers(count: Int, excluding: Set<Data>) -> [I2PTunnelPeer]
+
+    /// Asks the provider to refresh its candidate set; returns true when at
+    /// least one hop candidate is available afterwards. Default: no-op.
+    func refreshPeers() async -> Bool
+
+    /// Reports the outcome of a build attempt so the provider can keep a
+    /// profile per hop (failures bench a hop with exponential backoff).
+    /// Default: no-op.
+    func recordBuildOutcome(_ outcome: I2PTunnelPeerBuildOutcome)
+}
+
+extension I2PTunnelPeerProvider {
+    func refreshPeers() async -> Bool { false }
+    func recordBuildOutcome(_ outcome: I2PTunnelPeerBuildOutcome) {}
 }
 
 /// Carries tunnel build traffic between routers. The NTCP2 transport layer
@@ -140,15 +154,37 @@ final class I2PTunnelLoopbackTransport: I2PTunnelBuildTransport {
 /// State a router keeps when it participates in a tunnel as a hop.
 struct I2PTunnelHopState {
     let receiveTunnelID: UInt32
+    /// The record's next-hop router. Transit hops forward to it, and an
+    /// outbound endpoint answers the build to it (flags bit 6).
     let nextHopHash: Data
     let nextTunnelID: UInt32
     /// True for the last hop in the build message path: after decrypting its
-    /// layer it delivers the inner TunnelGateway payload to nextHopHash
-    /// (the tunnel's gateway router for outbound, the originator for inbound).
+    /// layer it delivers the inner TunnelGateway payload (outbound: to the
+    /// router the creator designated, inbound: to the originator).
     let isMessagePathEnd: Bool
     let layerKey: Data
     let ivKey: Data
     let registeredAt: Date
+    /// Where the decrypted inner TunnelGateway payload goes at the end of the
+    /// message path. Separate from `nextHopHash` because those are two
+    /// different addresses: the spec gives the next-hop fields to the build
+    /// reply (an outbound endpoint answers there) and routes the payload by its
+    /// own delivery instructions. Defaults to the next hop, which is the right
+    /// answer for every hop that is not an outbound endpoint.
+    let payloadDeliveryHash: Data
+
+    init(receiveTunnelID: UInt32, nextHopHash: Data, nextTunnelID: UInt32,
+         isMessagePathEnd: Bool, layerKey: Data, ivKey: Data, registeredAt: Date,
+         payloadDeliveryHash: Data? = nil) {
+        self.receiveTunnelID = receiveTunnelID
+        self.nextHopHash = nextHopHash
+        self.nextTunnelID = nextTunnelID
+        self.isMessagePathEnd = isMessagePathEnd
+        self.layerKey = layerKey
+        self.ivKey = ivKey
+        self.registeredAt = registeredAt
+        self.payloadDeliveryHash = payloadDeliveryHash ?? nextHopHash
+    }
 
     /// Hop participation state expires with the tunnel (~30 min upper bound).
     static let participationTTL: TimeInterval = 1800
@@ -171,17 +207,46 @@ final class I2PTunnelParticipant {
     /// return code (nil = normal acceptance logic).
     var forcedRejectCode: UInt8?
 
+    /// Ceiling on concurrently participating tunnels (nil = unlimited).
+    /// The participation screen derives it from the tunnel-share ratio: 0 turns
+    /// transit participation off entirely, 100% admits the full quota.
+    private var transitBudget: Int?
+
+    /// The number of participating tunnels the share ratio allows: 0% none,
+    /// 100% the 32-tunnel transit budget, proportional in between.
+    static func transitTunnelBudget(forSharePercent share: Int) -> Int {
+        guard share > 0 else { return 0 }
+        return max(1, Int((Double(min(share, 100)) / 100) * 32))
+    }
+
+    /// Applies the tunnel-share ratio as the participating-tunnel ceiling.
+    func setTransitBudget(_ budget: Int?) {
+        lock.lock()
+        transitBudget = budget
+        lock.unlock()
+    }
+
+    /// Live (non-expired) hop states, i.e. tunnels we currently carry for
+    /// other participants.
+    var activeHopStateCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return hopStates.values.filter { !$0.isExpired() }.count
+    }
+
     /// Builds we forwarded: message ID → the peer we received it from, plus
     /// the material needed to append our reply record on the way back.
     private struct PendingBuild {
         let source: Data
-        let receiveTunnelID: UInt32
-        let replyKey: Data
-        let replyIV: Data
+        /// The hop this build was forwarded to; its reply comes back from it.
+        let nextHopHash: Data
+        let recordIndex: UInt8
+        let recordCount: Int
+        let material: I2PTunnelBuildReplyMaterial
         let deadline: Date
     }
 
-    private var pendingBuilds: [UInt32: PendingBuild] = [:]
+    private var pendingBuilds: [PendingBuild] = []
     private var hopStates: [UInt32: I2PTunnelHopState] = [:]
     /// Reply consumers registered by originators (builders) on this router.
     private var replyConsumers: [(I2PTunnelBuildReply) -> Void] = []
@@ -205,24 +270,33 @@ final class I2PTunnelParticipant {
     }
 
     func handleBuild(_ message: I2PTunnelBuildMessage, from source: Data) {
-        var found: (record: I2PTunnelBuildRequestRecord, index: Int)?
+        var found: (record: I2PTunnelBuildRequestRecord,
+                    material: I2PTunnelBuildReplyMaterial,
+                    index: Int)?
         for (index, wire) in message.records.enumerated() {
-            if let plaintext = try? I2PTunnelBuildCrypto.decryptRecord(
+            if let (plaintext, material) = try? I2PTunnelBuildCrypto.decryptRecordWithMaterial(
                     wire,
                     localEncryptionKey: localEncryptionKey,
+                    localRouterHash: localRouterHash,
                     recordIndex: UInt8(index)),
                let parsed = try? I2PTunnelBuildRequestRecord.parse(plaintext) {
-                found = (parsed, index)
+                found = (parsed, material, index)
                 break
             }
         }
         guard let match = found else { return } // no record for us; drop
         let record = match.record
+        let isMessagePathEnd = record.isMessagePathEnd
+            || record.nextHopHash.allSatisfy { $0 == 0 }
 
         let code = acceptanceCode(for: record)
         if code != I2PTunnelBuildReturnCode.accepted.rawValue {
             // Reject: reply immediately with our record; do not forward.
-            initiateReply(messageID: message.messageID, record: record, code: code, to: source)
+            initiateReply(recordCount: message.records.count,
+                          recordIndex: UInt8(match.index),
+                          material: match.material,
+                          code: code,
+                          to: source)
             return
         }
 
@@ -230,65 +304,75 @@ final class I2PTunnelParticipant {
             receiveTunnelID: record.receiveTunnelID,
             nextHopHash: record.nextHopHash,
             nextTunnelID: record.nextTunnelID,
-            isMessagePathEnd: record.isMessagePathEnd,
-            layerKey: record.layerKey,
-            ivKey: record.ivKey,
-            registeredAt: Date()
+            isMessagePathEnd: isMessagePathEnd,
+            layerKey: match.material.layerKey,
+            ivKey: match.material.ivKey,
+            registeredAt: Date(),
+            payloadDeliveryHash: record.payloadDeliveryHash
         )
         lock.lock()
         hopStates[record.receiveTunnelID] = state
-        if !record.isMessagePathEnd {
-            pendingBuilds[message.messageID] = PendingBuild(
+        if !isMessagePathEnd {
+            pendingBuilds.append(PendingBuild(
                 source: source,
-                receiveTunnelID: record.receiveTunnelID,
-                replyKey: record.replyKey,
-                replyIV: record.replyIV,
+                nextHopHash: record.nextHopHash,
+                recordIndex: UInt8(match.index),
+                recordCount: message.records.count,
+                material: match.material,
                 deadline: Date().addingTimeInterval(Self.pendingReplyTTL)
-            )
+            ))
         }
         pruneHopStatesLocked()
         lock.unlock()
 
-        if record.isMessagePathEnd {
+        if isMessagePathEnd {
             // Message-path end (outbound endpoint or inbound gateway hop).
-            initiateReply(
-                messageID: message.messageID,
-                record: record,
-                code: I2PTunnelBuildReturnCode.accepted.rawValue,
-                to: source
-            )
+            initiateReply(recordCount: message.records.count,
+                          recordIndex: UInt8(match.index),
+                          material: match.material,
+                          code: I2PTunnelBuildReturnCode.accepted.rawValue,
+                          to: source)
         } else {
             transport.sendBuild(message, to: record.nextHopHash)
         }
     }
 
-    /// Receives a reply body on the build's way back: appends our encrypted
-    /// reply record and forwards to the router we received the request from,
-    /// or hands the reply to a registered originator consumer.
+    /// Receives a reply body on the build's way back: re-encrypts the other
+    /// records, installs our Poly1305 reply at our index, and forwards to the
+    /// router we received the request from; otherwise hands the reply to a
+    /// registered originator consumer.
     func handleBuildReply(_ body: Data, from source: Data) {
         guard let reply = try? I2PTunnelBuildReply.parse(body) else { return }
         lock.lock()
-        if var pending = pendingBuilds[reply.messageID], Date() < pending.deadline {
-            pendingBuilds[reply.messageID] = nil
-            lock.unlock()
-            var records = reply.encryptedRecords
-            if let ours = try? I2PTunnelBuildCrypto.encryptReplyRecord(
-                    I2PTunnelBuildReplyRecord(
-                        receiveTunnelID: pending.receiveTunnelID,
-                        returnCode: I2PTunnelBuildReturnCode.accepted.rawValue
-                    ),
-                    replyKey: pending.replyKey,
-                    replyIV: pending.replyIV,
-                    messageID: reply.messageID) {
-                records.append(ours)
-            }
-            let updated = I2PTunnelBuildReply(messageID: reply.messageID, encryptedRecords: records)
-            transport.sendBuildReply(updated.serialize(), to: pending.source)
+        let match = pendingBuilds.first { pending in
+            guard Date() < pending.deadline,
+                  pending.nextHopHash == source,
+                  pending.recordCount == reply.encryptedRecords.count,
+                  Int(pending.recordIndex) < reply.encryptedRecords.count else { return false }
+            return true
+        }
+        if let match {
+            pendingBuilds.removeAll { $0.recordIndex == match.recordIndex && $0.source == match.source }
+        }
+        lock.unlock()
+        guard let match else {
+            let consumers = replyConsumers
+            consumers.forEach { $0(reply) }
             return
         }
-        let consumers = replyConsumers
-        lock.unlock()
-        consumers.forEach { $0(reply) }
+        guard let own = try? I2PTunnelBuildCrypto.encryptReplyRecord(
+            I2PTunnelBuildReplyRecord(receiveTunnelID: 0,
+                                      returnCode: I2PTunnelBuildReturnCode.accepted.rawValue),
+            material: match.material,
+            recordIndex: match.recordIndex) else { return }
+        var records = reply.encryptedRecords.enumerated().map { index, wire -> Data in
+            if index == Int(match.recordIndex) { return own }
+            return I2PTunnelBuildCrypto.reencryptReplyRecord(
+                wire, material: match.material, recordIndex: UInt8(index))
+        }
+        if records.count > Int(match.recordIndex) { records[Int(match.recordIndex)] = own }
+        let updated = I2PTunnelBuildReply(encryptedRecords: records)
+        transport.sendBuildReply(updated.serialize(), to: match.source)
     }
 
     func hasHopState(receiveTunnelID: UInt32) -> Bool {
@@ -326,7 +410,7 @@ final class I2PTunnelParticipant {
     private func pruneHopStatesLocked(now: Date = Date()) -> Int {
         let before = hopStates.count
         hopStates = hopStates.filter { !$0.value.isExpired(now: now) }
-        pendingBuilds = pendingBuilds.filter { $0.value.deadline > now }
+        pendingBuilds = pendingBuilds.filter { $0.deadline > now }
         return before - hopStates.count
     }
 
@@ -340,18 +424,34 @@ final class I2PTunnelParticipant {
         }
         lock.lock()
         let inUse = hopStates[record.receiveTunnelID] != nil
+        let liveCount = hopStates.values.filter { !$0.isExpired() }.count
+        let budget = transitBudget
         lock.unlock()
         if inUse { return I2PTunnelBuildReturnCode.tunnelIDInUse.rawValue }
+        // The tunnel-share ratio caps how many tunnels we carry for others:
+        // 0% refuses transit builds outright, a full budget reports overload.
+        if let budget, liveCount >= budget {
+            return budget == 0
+                ? I2PTunnelBuildReturnCode.bandwidthExceeded.rawValue
+                : I2PTunnelBuildReturnCode.overload.rawValue
+        }
         return I2PTunnelBuildReturnCode.accepted.rawValue
     }
 
-    private func initiateReply(messageID: UInt32, record: I2PTunnelBuildRequestRecord, code: UInt8, to target: Data) {
-        guard let encrypted = try? I2PTunnelBuildCrypto.encryptReplyRecord(
-                I2PTunnelBuildReplyRecord(receiveTunnelID: record.receiveTunnelID, returnCode: code),
-                replyKey: record.replyKey,
-                replyIV: record.replyIV,
-                messageID: messageID) else { return }
-        let reply = I2PTunnelBuildReply(messageID: messageID, encryptedRecords: [encrypted])
+    private func initiateReply(recordCount: Int,
+                               recordIndex: UInt8,
+                               material: I2PTunnelBuildReplyMaterial,
+                               code: UInt8,
+                               to target: Data) {
+        guard let own = try? I2PTunnelBuildCrypto.encryptReplyRecord(
+            I2PTunnelBuildReplyRecord(receiveTunnelID: 0, returnCode: code),
+            material: material,
+            recordIndex: recordIndex) else { return }
+        var records = (0..<max(1, recordCount)).map { _ in
+            I2PCrypto.randomBytes(I2PTunnelBuildReply.encryptedRecordLength)
+        }
+        if records.count > Int(recordIndex) { records[Int(recordIndex)] = own }
+        let reply = I2PTunnelBuildReply(encryptedRecords: records)
         transport.sendBuildReply(reply.serialize(), to: target)
     }
 }
@@ -390,7 +490,7 @@ extension I2PTunnelParticipant {
         if state.isMessagePathEnd {
             // Innermost content is the TunnelGateway payload: [gatewayID][I2NP].
             guard content.count >= 4 else { throw I2NPError.invalidPayload }
-            return .deliverGateway(toRouterHash: state.nextHopHash, gatewayPayload: content)
+            return .deliverGateway(toRouterHash: state.payloadDeliveryHash, gatewayPayload: content)
         }
         // Transit hop: [nextTunnelID (4)][nextIV (16)][next ciphertext region].
         guard content.count >= 20 else { throw I2NPError.invalidPayload }
@@ -419,8 +519,9 @@ final class I2PTunnelBuilder {
         let receiveIDs: [UInt32]
         let layerKeys: [Data]
         let ivKeys: [Data]
-        let replyKeys: [Data]
-        let replyIVs: [Data]
+        /// Per-hop reply material (reply key, handshake hash, record index),
+        /// the originator's side of the short-build record KDF.
+        let replyMaterials: [I2PTunnelBuildReplyMaterial]
         let originatorEndpointID: UInt32
         let sentAt: Date
         let lifetime: TimeInterval
@@ -452,35 +553,59 @@ final class I2PTunnelBuilder {
     /// inbound tunnel the last hop is the one nearest the originator. The
     /// build message follows this same order, so each hop's state, layer key
     /// and next-hop info describe the data path it will actually process.
+    ///
+    /// `replyRoute` is where an outbound build's endpoint sends its build reply:
+    /// per the spec's message flow, "Reply through existing inbound D-E-F" — an
+    /// existing inbound tunnel of the creator, because an outbound endpoint
+    /// cannot dial a creator behind NAT. Without one, pass the creator's own
+    /// router hash plus a local endpoint ID the router hands back to the
+    /// participant.
     func buildTunnel(direction: I2PTunnel.Direction,
                      hops: [I2PTunnelPeer],
                      lifetime: TimeInterval,
-                     timeout: TimeInterval = 15) async throws -> I2PTunnel {
+                     timeout: TimeInterval = 15,
+                     replyRoute: (gateway: Data, tunnelID: UInt32)? = nil) async throws -> I2PTunnel {
         guard hops.count >= 1 && hops.count <= 4 else {
             throw I2PTunnelBuildError.invalidConfiguration
         }
         let messageID = UInt32.random(in: 1...UInt32.max)
         let receiveIDs = hops.map { _ in UInt32.random(in: 1...UInt32.max) }
-        let layerKeys = hops.map { _ in I2PCrypto.randomBytes(32) }
-        let ivKeys = hops.map { _ in I2PCrypto.randomBytes(32) }
-        let replyKeys = hops.map { _ in I2PCrypto.randomBytes(32) }
-        let replyIVs = hops.map { _ in I2PCrypto.randomBytes(16) }
         let originatorEndpointID = UInt32.random(in: 1...UInt32.max)
 
         var records: [Data] = []
+        var materials: [I2PTunnelBuildReplyMaterial] = []
         for (index, peer) in hops.enumerated() {
             let isLast = index == hops.count - 1
             var nextHopHash = Data(repeating: 0, count: 32)
             var nextTunnelID: UInt32 = 0
             var isEnd = false
             var nextIsOriginator = false
+            var flags: UInt8 = 0
+            var payloadDelivery: Data?
+            if direction == .inbound && index == 0 {
+                // The build's first recipient is the inbound gateway.
+                flags |= I2PTunnelBuildRequestRecord.flagInboundGateway
+            }
             if isLast {
                 if direction == .outbound {
-                    // The endpoint learns the tunnel's gateway so it can
-                    // deliver the inner TunnelGateway payload there.
-                    nextHopHash = hops[0].routerHash
-                    nextTunnelID = receiveIDs[0]
+                    // Flags bit 6 (tunnel-creation-ecies): an outbound endpoint
+                    // "send[s] the reply to the specified next hop in a Tunnel
+                    // Build Reply Message". Those next-hop fields are the reply's
+                    // address — an existing inbound tunnel of the creator, or the
+                    // creator's router plus a local endpoint. Pointing them at our
+                    // own gateway framed the reply as a loop back into the tunnel
+                    // we were building, so a real hop had no reply address and
+                    // dropped the build: the live row timed out with every record
+                    // encrypted correctly.
+                    let reply = replyRoute ?? (gateway: localRouterHash, tunnelID: 0)
+                    flags |= I2PTunnelBuildRequestRecord.flagOutboundEndpoint
+                    nextHopHash = reply.gateway
+                    nextTunnelID = reply.tunnelID
                     isEnd = true
+                    nextIsOriginator = true
+                    // The payload's own route is a different address and rides a
+                    // build option, so it survives the reply re-pointing above.
+                    payloadDelivery = hops[0].routerHash
                 } else {
                     nextHopHash = localRouterHash
                     nextTunnelID = originatorEndpointID
@@ -496,30 +621,30 @@ final class I2PTunnelBuilder {
                 receiveTunnelID: receiveIDs[index],
                 nextHopHash: nextHopHash,
                 nextTunnelID: nextTunnelID,
-                layerKey: layerKeys[index],
-                ivKey: ivKeys[index],
-                replyKey: replyKeys[index],
-                replyIV: replyIVs[index],
                 isMessagePathEnd: isEnd,
                 nextHopIsOriginator: nextIsOriginator,
                 hasMoreRecords: !isLast,
-                padding: I2PCrypto.randomBytes(I2PTunnelBuildRequestRecord.plaintextLength - I2PTunnelBuildRequestRecord.headerLength)
+                flags: flags,
+                nextMessageID: messageID,
+                payloadDeliveryHash: payloadDelivery
             )
-            records.append(try I2PTunnelBuildCrypto.encryptRecord(
+            let encrypted = try I2PTunnelBuildCrypto.encryptRecordWithMaterial(
                 record.serialize(),
                 to: peer.encryptionPublicKey,
+                hopHash: peer.routerHash,
                 recordIndex: UInt8(index)
-            ))
+            )
+            records.append(encrypted.wire)
+            materials.append(encrypted.material)
         }
 
         let context = BuildContext(
             direction: direction,
             peerHashes: hops.map(\.routerHash),
             receiveIDs: receiveIDs,
-            layerKeys: layerKeys,
-            ivKeys: ivKeys,
-            replyKeys: replyKeys,
-            replyIVs: replyIVs,
+            layerKeys: materials.map(\.layerKey),
+            ivKeys: materials.map(\.ivKey),
+            replyMaterials: materials,
             originatorEndpointID: originatorEndpointID,
             sentAt: Date(),
             lifetime: lifetime
@@ -555,43 +680,57 @@ final class I2PTunnelBuilder {
         results[messageID] = nil
         return result
     }
-/// Decrypts every reply record with the originator-held reply keys, maps
-    /// per-hop accept/reject codes, and assembles the tunnel on success.
+    /// Peels the reply one hop layer at a time and maps per-hop accept/reject
+    /// codes. Every hop on the way back re-encrypts the later slots with its own
+    /// reply key, so the creator unwraps slot n+1... with hop n's key before
+    /// opening slot n.
     private func consume(_ reply: I2PTunnelBuildReply) {
         lock.lock()
-        guard let context = contexts[reply.messageID] else {
+        var matched: (id: UInt32, context: BuildContext)?
+        for (id, context) in contexts
+        where context.replyMaterials.count == reply.encryptedRecords.count {
+            let first = context.replyMaterials.first
+            let decodes = first.map { material in
+                (try? I2PTunnelBuildCrypto.decryptReplyRecord(
+                    reply.encryptedRecords[0],
+                    material: material,
+                    recordIndex: 0)) != nil
+            } ?? false
+            if decodes {
+                matched = (id, context)
+                break
+            }
+        }
+        guard let matched else {
             lock.unlock()
             return
         }
-        contexts[reply.messageID] = nil
+        contexts[matched.id] = nil
         lock.unlock()
 
-        var codesByTunnelID: [UInt32: UInt8] = [:]
-        for wire in reply.encryptedRecords {
-            for (index, replyKey) in context.replyKeys.enumerated() {
-                if let record = try? I2PTunnelBuildCrypto.decryptReplyRecord(
-                        wire,
-                        replyKey: replyKey,
-                        replyIV: context.replyIVs[index],
-                        messageID: reply.messageID) {
-                    codesByTunnelID[record.receiveTunnelID] = record.returnCode
-                    break
+        var records = reply.encryptedRecords
+        for (hopIndex, material) in matched.context.replyMaterials.enumerated() {
+            if hopIndex + 1 < records.count {
+                for slot in (hopIndex + 1)..<records.count {
+                    records[slot] = I2PTunnelBuildCrypto.reencryptReplyRecord(
+                        records[slot], material: material, recordIndex: UInt8(slot))
                 }
             }
+            do {
+                let record = try I2PTunnelBuildCrypto.decryptReplyRecord(
+                    records[hopIndex], material: material, recordIndex: UInt8(hopIndex))
+                if record.returnCode != I2PTunnelBuildReturnCode.accepted.rawValue {
+                    storeResult(matched.id, .failed(code: record.returnCode))
+                    return
+                }
+            } catch {
+                storeResult(matched.id, .failed(code: 255))
+                return
+            }
         }
-        let orderedCodes = context.receiveIDs.compactMap { codesByTunnelID[$0] }
-        guard orderedCodes.count == context.receiveIDs.count else {
-            storeResult(reply.messageID, .failed(code: 255))
-            return
-        }
-        if let bad = orderedCodes.first(where: { $0 != I2PTunnelBuildReturnCode.accepted.rawValue }) {
-            storeResult(reply.messageID, .failed(code: bad))
-            return
-        }
-
         let completedAt = Date()
-        let tunnel = makeTunnel(context, completedAt: completedAt)
-        storeResult(reply.messageID, .success(tunnel))
+        let tunnel = makeTunnel(matched.context, completedAt: completedAt)
+        storeResult(matched.id, .success(tunnel))
     }
 
     private func storeResult(_ messageID: UInt32, _ result: BuildResult) {

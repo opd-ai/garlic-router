@@ -113,19 +113,35 @@ struct I2PWellKnownDestination {
     /// SHA-256 of the raw destination bytes — the netdb key the LeaseSet is stored under.
     let netdbKey: Data
     let destinationRaw: Data
+    /// The signature type the host's own destination declares (nil when the shape
+    /// is not readable). Only a type this router implements can be verified.
+    let signatureTypeCode: UInt16?
+
+    /// Whether a LeaseSet published by this host can be verified here at all. A
+    /// long-lived identity that signs with a legacy type (a null-certificate
+    /// DSA-SHA1 destination, or RSA-2048) can never resolve under this router's
+    /// modern-only policy, so it must not spend the probe budget.
+    var signsWithImplementedType: Bool {
+        guard let signatureTypeCode else { return false }
+        return I2PSigType(rawValue: signatureTypeCode) != nil
+    }
 }
 
 /// Resolves well-known public I2P services by fetching the standard hosts.txt
 /// (destination base64 per entry) over HTTPS from the I2P source repository and
 /// computing each destination's netdb key. No synthetic destinations.
 enum I2PMainnetHosts {
-    /// Clearnet mirrors of the standard hosts.txt. The GitHub raw source is
-    /// canonical but rate-limited and intermittently non-200; the CDN mirrors
-    /// of the same repo path absorb those refusals.
+    /// Clearnet mirrors of the standard hosts.txt (Java I2P keeps the canonical
+    /// file at installer/resources/hosts.txt, not the repo root — the old paths
+    /// 404'd, which is what the live audit reported as "non-200"). The CDN and
+    /// GitLab mirrors of the same file absorb GitHub rate limits, and the I2P
+    /// Projekt copy is the same list served directly.
     static let sources = [
-        "https://raw.githubusercontent.com/i2p/i2p.i2p/master/hosts.txt",
-        "https://cdn.jsdelivr.net/gh/i2p/i2p.i2p@master/hosts.txt",
-        "https://cdn.statically.io/gh/i2p/i2p.i2p/master/hosts.txt",
+        "https://raw.githubusercontent.com/i2p/i2p.i2p/master/installer/resources/hosts.txt",
+        "https://cdn.jsdelivr.net/gh/i2p/i2p.i2p@master/installer/resources/hosts.txt",
+        "https://gitlab.com/i2p/i2p.i2p/-/raw/master/installer/resources/hosts.txt",
+        "https://cdn.statically.io/gh/i2p/i2p.i2p/master/installer/resources/hosts.txt",
+        "https://i2p-projekt.de/hosts.txt",
     ]
 
     /// Long-lived public services worth probing first (i2pwiki and friends).
@@ -136,39 +152,56 @@ enum I2PMainnetHosts {
 
     static func fetchWellKnownDestinations(limit: Int = 6) async throws -> [I2PWellKnownDestination] {
         var lastError: Error = I2PMainnetFailure(message: "no hosts.txt source reachable")
+        var refused: [String] = []
         for source in sources {
             do {
                 guard let url = URL(string: source) else { continue }
                 var request = URLRequest(url: url)
                 request.timeoutInterval = 20
-                request.setValue("I2P-Swift-Router/0.1", forHTTPHeaderField: "User-Agent")
+                // The mirrors serve a static file; a wget-style agent is the
+                // same accepted family the reseed path uses.
+                request.setValue("Wget/1.14 (linux-gnu)", forHTTPHeaderField: "User-Agent")
                 let (data, response) = try await URLSession.shared.data(for: request)
                 guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
-                    throw I2PMainnetFailure(message: "hosts.txt fetch returned a non-200 status")
+                    let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+                    refused.append("\(source) — hosts.txt fetch returned a non-200 status (HTTP \(status))")
+                    continue
                 }
                 let entries = parse(data)
                 guard !entries.isEmpty else {
                     throw I2PMainnetFailure(message: "hosts.txt contained no parseable destinations")
                 }
+                // Order the probe list by what this router can actually verify.
+                // Most *preferred* names are the network's oldest destinations,
+                // and an old identity keeps a legacy signing key (null-certificate
+                // DSA-SHA1, or RSA-2048), so preferring them spent the whole probe
+                // budget on guaranteed misses — 3 of 6, and 10 inbound stores
+                // rejected as unsupported, while modern hosts were never asked.
+                let verifiable = entries.filter(\.signsWithImplementedType)
+                let legacy = entries.filter { !$0.signsWithImplementedType }
                 var ordered: [I2PWellKnownDestination] = []
-                for name in preferredNames {
-                    if let entry = entries.first(where: { $0.name == name }), !ordered.contains(where: { $0.name == name }) {
+                for pool in [verifiable, legacy] where ordered.count < limit {
+                    for name in preferredNames {
+                        if let entry = pool.first(where: { $0.name == name }),
+                           !ordered.contains(where: { $0.name == name }) {
+                            ordered.append(entry)
+                        }
+                    }
+                    for entry in pool where !ordered.contains(where: { $0.name == entry.name }) {
+                        if ordered.count >= limit { break }
                         ordered.append(entry)
                     }
-                }
-                for entry in entries where !ordered.contains(where: { $0.name == entry.name }) {
-                    if ordered.count >= limit { break }
-                    ordered.append(entry)
                 }
                 guard !ordered.isEmpty else {
                     throw I2PMainnetFailure(message: "hosts.txt yielded no probe destinations")
                 }
                 return Array(ordered.prefix(limit))
             } catch {
+                refused.append("\(source) — \(String(describing: error))")
                 lastError = error
             }
         }
-        throw lastError
+        throw I2PMainnetFailure(message: "no hosts.txt source reachable (\(refused.joined(separator: "; "))); last: \(String(describing: lastError))")
     }
 
     static func parse(_ data: Data) -> [I2PWellKnownDestination] {
@@ -183,18 +216,19 @@ enum I2PMainnetHosts {
                   let destination = base64Decode(base64), destination.count >= 387 else { continue }
             out.append(I2PWellKnownDestination(name: name,
                                                netdbKey: I2PCrypto.sha256(destination),
-                                               destinationRaw: destination))
+                                               destinationRaw: destination,
+                                               signatureTypeCode: I2PKeysAndCert
+                                                .declaredSignatureTypeCode(in: destination)))
             if out.count >= 64 { break }
         }
         return out
     }
 
     static func base64Decode(_ text: String) -> Data? {
-        var sanitized = text
-            .replacingOccurrences(of: "-", with: "+")
-            .replacingOccurrences(of: "_", with: "/")
-        while sanitized.count % 4 != 0 { sanitized += "=" }
-        return Data(base64Encoded: sanitized)
+        // The I2P base64 alphabet is standard base64 with '-' for '+' and '~'
+        // for '/'. hosts.txt is written in it, so a decoder that only maps the
+        // URL-safe '_' back to '/' rejects every entry.
+        I2PCrypto.i2pBase64Decode(text)
     }
 }
 
@@ -286,14 +320,14 @@ final class I2PNTCP2TunnelBuildTransport: I2PTunnelBuildTransport {
     func sendBuild(_ message: I2PTunnelBuildMessage, to routerHash: Data) {
         let envelope = I2NPMessage(type: .tunnelBuild,
                                    messageID: message.messageID,
-                                   expiration: Date().addingTimeInterval(120),
+                                   expiration: Date().addingTimeInterval(60),
                                    payload: message.serialize())
         sendAfterDial(envelope.serialize(), to: routerHash)
     }
 
     func sendBuildReply(_ body: Data, to routerHash: Data) {
         let envelope = I2NPMessage(type: .tunnelBuildReply,
-                                   expiration: Date().addingTimeInterval(120),
+                                   expiration: Date().addingTimeInterval(60),
                                    payload: body)
         sendAfterDial(envelope.serialize(), to: routerHash)
     }
@@ -321,44 +355,88 @@ final class I2PNTCP2TunnelBuildTransport: I2PTunnelBuildTransport {
     }
 }
 
-/// Supplies real mainnet routers as tunnel-hop candidates: modern-identity
-/// routers already ingested and signature-verified by the netdb. Build
-/// records encrypt to each hop's X25519 identity key.
+/// Supplies real mainnet routers as tunnel-hop candidates: the signature-verified
+/// RouterInfos in the live netdb (not the floodfill set alone — hop selection
+/// draws on every known peer and prefers ordinary routers). Candidates are
+/// filtered and scored by I2PTunnelPeerSelector: freshness, a usable X25519
+/// identity, a reachable NTCP2/SSU2 address, and each peer's build profile.
+/// Build records encrypt to each hop's X25519 identity key.
 final class I2PMainnetTunnelPeerProvider: I2PTunnelPeerProvider {
-    private let netDB: I2PNetworkDatabase
-    private let lock = NSLock()
-    private var candidates: [I2PTunnelPeer] = []
+    /// Hop candidates the netdb supplies: enough for several concurrent pools
+    /// without turning the cache into a selection cost.
+    static let candidateLimit = 256
+    /// The candidate snapshot is refreshed on this cadence; the pool also asks
+    /// for a refresh whenever it runs short of hops.
+    static let candidateRefreshInterval: TimeInterval = 120
 
-    init(netDB: I2PNetworkDatabase) {
+    private let netDB: I2PNetworkDatabase
+    private let selector: I2PTunnelPeerSelector
+    private let lock = NSLock()
+    private var candidates: [(hash: Data, info: I2PRouterInfo)] = []
+    private var lastRefresh = Date.distantPast
+    private var refreshing = false
+
+    init(netDB: I2PNetworkDatabase, selector: I2PTunnelPeerSelector = I2PTunnelPeerSelector()) {
         self.netDB = netDB
+        self.selector = selector
     }
 
     /// Refreshes the hop candidates from the live netdb (cache-first RouterInfo
     /// reads; only modern identities survive the netdb's signature-verified
     /// ingest, so every candidate carries a usable X25519 encryption key).
-    func refreshCandidates(limit: Int = 8) async {
-        let probeKey = I2PCrypto.randomBytes(32)
-        let hashes = await netDB.selectFloodfills(for: probeKey, count: limit)
-        var peers: [I2PTunnelPeer] = []
-        for hash in hashes {
-            guard let info = await netDB.lookupRouterInfo(hash, timeoutPerRound: 1, maxRounds: 1) else {
-                continue
-            }
-            let key = info.identity.encryptionPublicKey
-            guard key.count == 32 else { continue }
-            peers.append(I2PTunnelPeer(routerHash: hash, encryptionPublicKey: key))
-        }
+    func refreshCandidates(limit: Int = I2PMainnetTunnelPeerProvider.candidateLimit) async {
         lock.lock()
-        candidates = peers
+        refreshing = true
+        lock.unlock()
+        let snapshot = await netDB.cachedRouterInfos(limit: limit)
+        lock.lock()
+        candidates = snapshot
+        lastRefresh = Date()
+        refreshing = false
         lock.unlock()
     }
 
     func peers(count: Int, excluding: Set<Data>) -> [I2PTunnelPeer] {
+        refreshIfStale()
+        lock.lock()
+        let snapshot = candidates
+        lock.unlock()
+        return selector.select(count: count, excluding: excluding, from: snapshot,
+                               localRouterHash: netDB.localRouterHash)
+    }
+
+    func refreshPeers() async -> Bool {
+        await refreshCandidates()
+        return !peers(count: 1, excluding: []).isEmpty
+    }
+
+    func recordBuildOutcome(_ outcome: I2PTunnelPeerBuildOutcome) {
+        selector.recordBuildOutcome(outcome)
+    }
+
+    /// Live candidate count, for diagnostics and the audit surfaces.
+    var candidateCount: Int {
         lock.lock()
         defer { lock.unlock() }
-        return candidates
-            .filter { !excluding.contains($0.routerHash) }
-            .prefix(count)
-            .map { $0 }
+        return candidates.count
+    }
+
+    /// Kicks off a background refresh when the candidate snapshot has aged out.
+    private func refreshIfStale() {
+        lock.lock()
+        let stale = Date().timeIntervalSince(lastRefresh) >= Self.candidateRefreshInterval
+        let busy = refreshing
+        if stale && !busy { refreshing = true }
+        lock.unlock()
+        guard stale && !busy else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            let snapshot = await netDB.cachedRouterInfos(limit: Self.candidateLimit)
+            lock.lock()
+            candidates = snapshot
+            lastRefresh = Date()
+            refreshing = false
+            lock.unlock()
+        }
     }
 }

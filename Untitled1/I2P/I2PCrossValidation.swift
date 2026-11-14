@@ -49,6 +49,7 @@ struct I2PCrossValidationRowSummary: Codable {
 enum I2PCrossValidationError: Error {
     case unexpectedSuccess
     case notTraceable(testID: String, rowID: String)
+    case failed(String)
 }
 
 enum I2PCrossValidation {
@@ -140,6 +141,9 @@ enum I2PCrossValidation {
         run("T4-NP-HEADER-EXPIRY", rowID: "NP-HEADER", "I2NP expiry enforcement: fresh accepted, stale flagged dropped") {
             try i2npExpiryEnforcement()
         }
+        run("T4-NP-OPTIONS-RT", rowID: "NP-OPTIONS", "Options channel: the I2NP type table is exactly the spec's (no Options type, slot 12 rejected, 19 = TunnelGateway); RouterInfo options round-trip with the signature intact; the NTCP2 Options block round-trips") {
+            try routerOptionsChannel()
+        }
         run("T4-NP-DBSTORE-RT", rowID: "NP-DBSTORE", "DatabaseStore: round trip with and without reply token; RouterInfo entry") {
             try databaseStoreRoundTrip()
         }
@@ -170,10 +174,10 @@ enum I2PCrossValidation {
         run("T4-NT-KDF-CHAINS", rowID: "NT-KDF", "Noise chain: deterministic MixKey/MixHash; split yields distinct direction keys") {
             try ntcp2KDFChains()
         }
-        run("T4-NT-KDF-LABELS", rowID: "NT-KDF", "Protocol name rides verbatim (32 bytes); HKDF chain expansion deterministic") {
+        run("T4-NT-KDF-LABELS", rowID: "NT-KDF", "48-byte protocol name hashed per Noise; HKDF chain expansion deterministic and distinct") {
             try ntcp2KDFLabels()
         }
-        run("T4-CR-NONCE96", rowID: "CR-CHACHAPOLY", "nonce96 layout: 4 zero bytes ‖ big-endian counter") {
+        run("T4-CR-NONCE96", rowID: "CR-CHACHAPOLY", "nonce96 layout: 4 zero bytes ‖ little-endian counter") {
             try nonce96Layout()
         }
         run("T4-NT-FRAME-RT", rowID: "NT-FRAME", "Frame codec: round trip, incremental delivery, tampered MAC rejected") {
@@ -185,8 +189,8 @@ enum I2PCrossValidation {
         run("T4-NT-M1-OBFS", rowID: "NT-M1", "SessionRequest/Created: AES-256-CBC ephemeral-key obfuscation per the spec KDF; full handshake round trip") {
             try ntcp2KeyObfuscationSpec()
         }
-        run("T4-NT-M1-OPTIONS", rowID: "NT-M1", "Both handshake messages carry the 2-byte options length prefix before the encrypted options") {
-            try ntcp2OptionsPrefixSpec()
+        run("T4-NT-M1-OPTIONS", rowID: "NT-M1", "Messages 1 and 2: fixed 64-byte envelopes with the spec's option-block layout and no length prefix; m3p2len is the part-2 frame size") {
+            try ntcp2OptionsLayoutSpec()
         }
 
         // MARK: Crypto cross-checks
@@ -212,22 +216,22 @@ enum I2PCrossValidation {
         run("T4-CR-POLICY-REGISTRY", rowID: "CR-POLICY", "Modern-only policy: registries pinned to SigType 7/11 + EncType 4/5; no legacy type code constructs a case") {
             try modernCryptoPolicyRegistry()
         }
-        run("T4-CR-POLICY-LEGACY-REJECT", rowID: "CR-POLICY", "Modern-only policy: null certificates, legacy sig/enc type codes and legacy identities rejected at parse — no silent fallbacks") {
+        run("T4-CR-POLICY-LEGACY-REJECT", rowID: "CR-POLICY", "Modern-only policy: null certificates, legacy sig type codes and legacy identities rejected at parse, while the spec's unused EncType 0 field parses with no crypto key — no silent fallbacks") {
             try legacyWireRejection()
         }
 
         // MARK: Tunnels — build records
 
-        run("T4-TN-RECORD-RT", rowID: "TN-RECORD", "Build request record: 528-byte plaintext round trip identical") {
+        run("T4-TN-RECORD-RT", rowID: "TN-RECORD", "Build request record: 154-byte short plaintext round trip identical") {
             try buildRecordRoundTrip()
         }
-        run("T4-TN-RECORD-FLAGS", rowID: "TN-RECORD", "Build record flags survive round trip; nonzero reserved byte rejected") {
+        run("T4-TN-RECORD-FLAGS", rowID: "TN-RECORD", "Short record flags and end marker round trip; reserved bytes rejected") {
             try buildRecordFlags()
         }
-        run("T4-TN-RECORD-ECIES-RT", rowID: "TN-RECORD-ECIES", "Record ECIES box: encrypt/decrypt round trip; wrong key/index/tamper rejected") {
+        run("T4-TN-RECORD-ECIES-RT", rowID: "TN-RECORD-ECIES", "218-byte short record box: encrypt/decrypt round trip; wrong key/hop/tamper rejected") {
             try buildRecordEncryption()
         }
-        run("T4-TN-BREPLY-RT", rowID: "TN-BREPLY", "Build reply record: round trip across return codes; wrong message ID rejected") {
+        run("T4-TN-BREPLY-RT", rowID: "TN-BREPLY", "Short build reply record: round trip across return codes; wrong hop/index rejected") {
             try buildReplyRecordRoundTrip()
         }
         run("T4-TN-DATA-RT", rowID: "TN-DATA", "TunnelData layering: spec 4/16/1008 layout, AES-256-CBC layers with IV-key chaining, block-aligned per-hop region ladder") {
@@ -235,6 +239,9 @@ enum I2PCrossValidation {
         }
         run("T4-TN-HOP-LAYER", rowID: "TN-HOP", "Hop processing: 3-hop layered pipeline forwards ciphertext regions byte-for-byte and delivers the gateway payload byte-exact") {
             try tunnelHopLayerSpec()
+        }
+        run("T4-TN-PEERS-SELECTION", rowID: "TN-PEERS", "Hop selection: live netdb candidates filtered for freshness, reachable transport and modern identity; distinct hops; floodfill fallback; failing hops benched with backoff and cleared on success") {
+            try tunnelPeerSelection()
         }
 
         // MARK: NetDB — ingestion, lookup, selection, expiry
@@ -250,6 +257,13 @@ enum I2PCrossValidation {
         }
         await runAsync("T4-ND-EXPIRY-LIFETIME", rowID: "ND-EXPIRY", "NetDB: entry lifetime ≈ 1h from ingest; prune removes expired") {
             try await netdbExpiryLifetime()
+        }
+
+        run("T4-ND-SU3-CONTAINER", rowID: "ND-SU3", "SU3 reseed container: the 40-byte header parses field-exact, the signature covers the whole prefix (header included), and header/content/signature tamps, truncation and trailing bytes all reject") {
+            try su3ContainerSignature()
+        }
+        run("T4-ND-SU3-SIGNER", rowID: "ND-SU3", "SU3 signer trust: the bundled reseed certificates load as signers, '@'-style IDs normalize, and unknown or wrong-key signers fail closed") {
+            try su3SignerTrust()
         }
 
         // MARK: Garlic — envelope, blocks, clove, tags, HKDF
@@ -423,13 +437,172 @@ enum I2PCrossValidation {
         return netdb
     }
 
+    /// Hop selection over live netdb candidates: eligibility gating (self,
+    /// freshness, transport reachability, modern identity), distinct hops, the
+    /// caller's exclusion set, floodfill fallback and profile backoff.
+    private static func tunnelPeerSelection() throws -> String {
+        let now = Date()
+
+        func address(host: String, port: Int, style: String = "NTCP2",
+                     expired: Bool = false) -> I2PRouterAddress {
+            I2PRouterAddress(cost: 5,
+                             transportStyle: style,
+                             expiration: expired ? now.addingTimeInterval(-60) : nil,
+                             options: ["host": host, "port": String(port)])
+        }
+
+        func makeInfo(encryptionKey: Data, published: Date,
+                      addresses: [I2PRouterAddress],
+                      floodfill: Bool) throws -> (hash: Data, info: I2PRouterInfo) {
+            let signing = Curve25519.Signing.PrivateKey()
+            let identity = I2PRouterIdentity(encryptionPublicKey: encryptionKey,
+                                             signingPublicKey: signing.publicKey.rawRepresentation)
+            var info = I2PRouterInfo(identity: identity,
+                                     published: published,
+                                     addresses: addresses,
+                                     options: ["caps": floodfill ? "f" : ""])
+            try info.sign(withSeed: signing.rawRepresentation)
+            return (identity.hash, info)
+        }
+
+        func freshKey() -> Data {
+            Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation
+        }
+
+        // Our own router as it appears in our own cache: never its own hop.
+        let local = try makeInfo(encryptionKey: freshKey(), published: now,
+                                 addresses: [address(host: "127.0.0.1", port: 9151)],
+                                 floodfill: false)
+        let localHash = local.hash
+
+        var candidates: [(hash: Data, info: I2PRouterInfo)] = [local]
+        var ordinary: [Data] = []
+        for index in 0..<6 {
+            let entry = try makeInfo(encryptionKey: freshKey(),
+                                     published: now.addingTimeInterval(-60),
+                                     addresses: [address(host: "10.1.0.\(index + 1)",
+                                                         port: 20000 + index)],
+                                     floodfill: false)
+            ordinary.append(entry.hash)
+            candidates.append(entry)
+        }
+        var floodfills: [Data] = []
+        for index in 0..<3 {
+            let entry = try makeInfo(encryptionKey: freshKey(),
+                                     published: now.addingTimeInterval(-60),
+                                     addresses: [address(host: "10.2.1.\(index + 1)",
+                                                         port: 21000 + index,
+                                                         style: "SSU2")],
+                                     floodfill: true)
+            floodfills.append(entry.hash)
+            candidates.append(entry)
+        }
+        // Ineligible peers the selector must refuse: stale RouterInfo,
+        // address-less/expired address, degenerate identity key.
+        let stale = try makeInfo(encryptionKey: freshKey(),
+                                 published: now.addingTimeInterval(-5 * 3600),
+                                 addresses: [address(host: "10.3.0.1", port: 22000)],
+                                 floodfill: false)
+        let addressless = try makeInfo(encryptionKey: freshKey(), published: now,
+                                       addresses: [address(host: "0.0.0.0", port: 0)],
+                                       floodfill: false)
+        let expiredAddress = try makeInfo(encryptionKey: freshKey(), published: now,
+                                          addresses: [address(host: "10.3.0.2", port: 22001,
+                                                              expired: true)],
+                                          floodfill: false)
+        let degenerate = try makeInfo(encryptionKey: Data(repeating: 0, count: 32),
+                                      published: now,
+                                      addresses: [address(host: "10.3.0.3", port: 22002)],
+                                      floodfill: false)
+        candidates += [stale, addressless, expiredAddress, degenerate]
+
+        let selector = I2PTunnelPeerSelector()
+        let picks = selector.select(count: 3, excluding: [], from: candidates,
+                                    localRouterHash: localHash, now: now)
+        guard picks.count == 3,
+              Set(picks.map(\.routerHash)).count == 3 else {
+            throw I2PCrossValidationError.failed(
+                "hop selection returned \(picks.count) hops for a 3-hop build")
+        }
+        let ineligible: Set<Data> = [localHash, stale.hash, addressless.hash,
+                                     expiredAddress.hash, degenerate.hash]
+        guard picks.allSatisfy({ !ineligible.contains($0.routerHash) }) else {
+            throw I2PCrossValidationError.failed(
+                "selection returned our own router, a stale RouterInfo, an unreachable address or a degenerate key")
+        }
+        guard picks.allSatisfy({ ordinary.contains($0.routerHash) }) else {
+            throw I2PCrossValidationError.failed(
+                "floodfills were chosen as hops while ordinary routers were available")
+        }
+        guard picks.allSatisfy({ $0.encryptionPublicKey.count == 32 }) else {
+            throw I2PCrossValidationError.failed("a hop carries no X25519 encryption key")
+        }
+
+        // Hops already inside a tunnel (the caller's exclusion set) are avoided.
+        let excluded = Set(ordinary.prefix(2))
+        let avoiding = selector.select(count: 3, excluding: excluded, from: candidates,
+                                       localRouterHash: localHash, now: now)
+        guard avoiding.count == 3,
+              avoiding.allSatisfy({ !excluded.contains($0.routerHash) }) else {
+            throw I2PCrossValidationError.failed("selection ignored the caller's exclusion set")
+        }
+
+        // Floodfills back the netdb but still fill a tunnel when no ordinary
+        // peer is left.
+        let floodfillOnly = candidates.filter { floodfills.contains($0.hash) }
+        let fallback = selector.select(count: 2, excluding: [], from: floodfillOnly,
+                                       localRouterHash: localHash, now: now)
+        guard fallback.count == 2,
+              fallback.allSatisfy({ floodfills.contains($0.routerHash) }) else {
+            throw I2PCrossValidationError.failed("the floodfill fallback did not fill a thin hop pool")
+        }
+
+        // Two failed builds bench the hop; a success clears the streak.
+        let config = I2PTunnelPeerSelector.Config()
+        let target = ordinary[0]
+        let failureAt = now.addingTimeInterval(30)
+        for _ in 0..<2 {
+            selector.recordBuildOutcome(I2PTunnelPeerBuildOutcome(
+                peers: [target], succeeded: false, latency: nil), now: failureAt)
+        }
+        guard let benched = selector.profile(for: target),
+              benched.consecutiveFailures == 2,
+              benched.isBackedOff(now: failureAt.addingTimeInterval(1), config: config) else {
+            throw I2PCrossValidationError.failed("two failed builds did not bench the hop")
+        }
+        for _ in 0..<12 {
+            let sample = selector.select(count: 2, excluding: [], from: candidates,
+                                         localRouterHash: localHash,
+                                         now: failureAt.addingTimeInterval(1))
+            guard !sample.contains(where: { $0.routerHash == target }) else {
+                throw I2PCrossValidationError.failed(
+                    "a benched hop was selected again inside its backoff window")
+            }
+        }
+        let recoveredAt = failureAt.addingTimeInterval(config.maxBackoff + 60)
+        let recovered = selector.select(count: 6, excluding: [], from: candidates,
+                                        localRouterHash: localHash, now: recoveredAt)
+        guard recovered.contains(where: { $0.routerHash == target }) else {
+            throw I2PCrossValidationError.failed(
+                "the hop never returned after its backoff window passed")
+        }
+        selector.recordBuildOutcome(I2PTunnelPeerBuildOutcome(
+            peers: [target], succeeded: true, latency: 1.2), now: recoveredAt)
+        guard let healed = selector.profile(for: target),
+              healed.consecutiveFailures == 0 else {
+            throw I2PCrossValidationError.failed(
+                "a successful build did not clear the hop's failure streak")
+        }
+
+        return "3 distinct ordinary hops out of \(candidates.count) candidates; self/stale/unreachable/degenerate excluded; exclusion set honored; floodfills used only as fallback; 2 failures benched the hop for \(Int(config.baseBackoff))s and a success cleared it"
+    }
+
     private static func sampleCloveSet(messageID: UInt32,
                                        tagSetSeed: Data? = nil,
                                        tagCount: Int = 0) throws -> I2PGarlicCloveSet {
         let local = I2PDeliveryInstructions(mode: .local)
         let tunnel = I2PDeliveryInstructions(mode: .tunnel, tunnelID: 0x0BAD_F00D,
-                                             routerHash: I2PCrypto.randomBytes(32),
-                                             delayMilliseconds: 120)
+                                             routerHash: I2PCrypto.randomBytes(32))
         let messageA = I2NPMessage(type: .dataMessage, payload: Data("clove-set sample".utf8))
         let messageB = I2NPMessage(type: .deliveryStatus, messageID: 7, payload: I2PCrypto.randomBytes(24))
         return try I2PGarlicCloveSet(
@@ -596,15 +769,15 @@ enum I2PCrossValidation {
         return "expired leases rejected at ingest; accepted entries bounded by lease expiry + grace and the 1h lifetime"
     }
 
-    // MARK: LeaseSet2 (proposal 123 store types 2/3/5)
+    // MARK: LeaseSet2 (proposal 123 store types 3/5/7)
 
     private static func leaseSet2Sample() throws -> (I2PLeaseSet2, Data) {
         let (destination, seed) = I2PSamples.sampleIdentity()
         let leases = [
             I2PLease2(gatewayHash: I2PCrypto.randomBytes(32), tunnelId: 0x1122_3344,
-                      expiration: Date().addingTimeInterval(600), cost: 5),
+                      expiration: Date().addingTimeInterval(600)),
             I2PLease2(gatewayHash: I2PCrypto.randomBytes(32), tunnelId: 0x0BAD_F00D,
-                      expiration: Date().addingTimeInterval(900), cost: 10),
+                      expiration: Date().addingTimeInterval(900)),
         ]
         let ls2 = try I2PLeaseSet2.build(
             storeType: .plain, destination: destination,
@@ -616,18 +789,30 @@ enum I2PCrossValidation {
     private static func leaseSet2RoundTrip() throws -> String {
         let (ls2, _) = try leaseSet2Sample()
         let encoded = ls2.serialize()
-        let parsed = try I2PLeaseSet2.parse(encoded, expectedType: 2)
+        // Spec layout: the payload starts with the Destination — the store type
+        // lives in the DatabaseStore type byte, not a length-prefixed header.
+        guard encoded.prefix(ls2.destination.raw.count) == ls2.destination.raw else {
+            throw I2PWireError.invalidFormat
+        }
+        let parsed = try I2PLeaseSet2.parse(encoded, expectedType: .plain)
         guard parsed.serialize() == encoded else { throw I2PWireError.invalidFormat }
         guard parsed.storeType == .plain, parsed.leases.count == 2,
-              parsed.leases[0].tunnelId == 0x1122_3344, parsed.leases[0].cost == 5,
-              parsed.leases[1].cost == 10,
+              parsed.leases[0].tunnelId == 0x1122_3344,
+              parsed.leases[1].tunnelId == 0x0BAD_F00D,
               parsed.expiresAt > Date(), abs(parsed.expiresAt.timeIntervalSince(parsed.published) - 1800) < 1 else {
+            throw I2PWireError.invalidFormat
+        }
+        // The published key list rides the entry: delivery keys to it rather
+        // than to the destination's unused crypto field.
+        guard parsed.encryptionKeys.count == 1,
+              parsed.encryptionKeys[0].type == I2PEncType.x25519.rawValue,
+              parsed.preferredEncryptionKey == ls2.destination.encryptionPublicKey else {
             throw I2PWireError.invalidFormat
         }
         guard parsed.verifySignature(), parsed.verifyTransientBlockSignature() else {
             throw I2PWireError.invalidSignature
         }
-        // Tampered body (inside the signed type+length+data range) rejected.
+        // Tampered body (inside the signed type-byte + body range) rejected.
         var tampered = encoded
         tampered[60] ^= 0xff
         guard expectThrow({ _ = try I2PLeaseSet2.parse(tampered) }) else {
@@ -642,7 +827,41 @@ enum I2PCrossValidation {
         guard expectThrow({ _ = try I2PLeaseSet2.parse(wrongKey.serialize()) }) else {
             throw I2PCrossValidationError.unexpectedSuccess
         }
-        return "\(encoded.count) bytes; type+length+data signed; 46-byte leases (gateway/tunnel/end/cost) intact; tampered and cross-key signatures rejected"
+        // The shape every long-lived mainnet destination publishes: a LeaseSet2
+        // whose destination carries the spec's unused crypto field (EncType 0)
+        // and whose key list is therefore empty. It must parse, verify and
+        // resolve its leases — before the certificate accepted code 0 this entry
+        // was rejected whole with `unsupportedAlgorithm`, which is why the live
+        // DHT resolved no well-known destination at all.
+        let legacySeed = I2PCrypto.generateEd25519Seed()
+        let legacySigningKey = I2PCrypto.ed25519PublicKey(fromSeed: legacySeed)
+        var unusedWriter = I2PWriter()
+        unusedWriter.raw(Data(repeating: 0x11, count: 256)) // unused crypto field
+        unusedWriter.raw(Data(repeating: 0x22, count: 96))  // signing-field padding
+        unusedWriter.raw(legacySigningKey)                  // right-aligned signing key
+        I2PCertificate(sigType: .ed25519, encTypeRawValue: 0).serialize(into: &unusedWriter)
+        var unusedReader = I2PReader(unusedWriter.data)
+        let unusedDestination = try I2PKeysAndCert.parse(&unusedReader)
+        guard unusedDestination.encryptionPublicKey.isEmpty,
+              unusedDestination.signingPublicKey == legacySigningKey else {
+            throw I2PWireError.invalidFormat
+        }
+        let unusedLS2 = try I2PLeaseSet2.build(
+            storeType: .plain, destination: unusedDestination,
+            published: Date(), expiresOffsetSeconds: 600, flags: 0,
+            leases: [I2PLease2(gatewayHash: I2PCrypto.randomBytes(32), tunnelId: 0x5EED_1234,
+                               expiration: Date().addingTimeInterval(600))],
+            signingSeed: legacySeed)
+        let unusedParsed = try I2PLeaseSet2.parse(unusedLS2.serialize(), expectedType: .plain)
+        guard unusedParsed.encryptionKeys.isEmpty,
+              unusedParsed.preferredEncryptionKey == nil,
+              unusedParsed.serialize() == unusedLS2.serialize(),
+              let unusedResolved = unusedParsed.resolvedLeaseSet(),
+              unusedResolved.leases.count == 1,
+              unusedResolved.leases[0].tunnelId == 0x5EED_1234 else {
+            throw I2PWireError.invalidFormat
+        }
+        return "\(encoded.count) bytes; DatabaseStore type byte + body signed; 40-byte Lease2 entries and the ECIES key list intact; tampered and cross-key signatures rejected; a destination with the spec's unused crypto field and no key list still resolves its leases"
     }
 
     private static func leaseSet2OfflineSignatureRoundTrip() throws -> String {
@@ -655,7 +874,7 @@ enum I2PCrossValidation {
             transientPublicKey: transientPublicKey,
             permanentSeed: permanentSeed)
         let leases = [I2PLease2(gatewayHash: I2PCrypto.randomBytes(32), tunnelId: 7,
-                                expiration: Date().addingTimeInterval(600), cost: 3)]
+                                expiration: Date().addingTimeInterval(600))]
         let ls2 = try I2PLeaseSet2.build(
             storeType: .plain, destination: destination,
             published: Date(), expiresOffsetSeconds: 1800, flags: 0x0001,
@@ -695,14 +914,17 @@ enum I2PCrossValidation {
             published: Date(), expiresOffsetSeconds: 1800, flags: 0,
             encryptedBody: inner, signingSeed: seed)
         let encoded = ls2.serialize()
-        let parsed = try I2PLeaseSet2.parse(encoded, expectedType: 3)
+        let parsed = try I2PLeaseSet2.parse(encoded, expectedType: .encrypted)
         guard parsed.serialize() == encoded, parsed.storeType == .encrypted,
               parsed.encryptedBody == inner, parsed.leases.isEmpty else {
             throw I2PWireError.invalidFormat
         }
-        // The destination — and with it the ECIES delivery key — survives the envelope.
-        guard parsed.destination.encryptionPublicKey == destination.encryptionPublicKey,
-              parsed.destination.encryptionPublicKey.count == 32 else {
+        // An EncryptedLeaseSet carries only the blinded signing key — no
+        // destination — so the envelope's identity is that key.
+        guard parsed.blindedSigningPublicKey == destination.signingPublicKey,
+              parsed.destination.signingPublicKey == destination.signingPublicKey,
+              parsed.destination.encryptionPublicKey == Data(repeating: 0, count: 32),
+              parsed.destination.hash == I2PLeaseSet2.blindedDestination(destination.signingPublicKey).hash else {
             throw I2PWireError.invalidFormat
         }
         guard parsed.verifySignature(), parsed.verifyTransientBlockSignature() else {
@@ -710,38 +932,39 @@ enum I2PCrossValidation {
         }
         var tampered = encoded
         tampered[encoded.count - 70] ^= 0xff
-        guard expectThrow({ _ = try I2PLeaseSet2.parse(tampered) }) else {
+        guard expectThrow({ _ = try I2PLeaseSet2.parse(tampered, expectedType: .encrypted) }) else {
             throw I2PCrossValidationError.unexpectedSuccess
         }
-        return "\(encoded.count) bytes; encrypted inner body preserved byte-exact; destination ECIES key survives the envelope; tampered signature rejected"
+        return "\(encoded.count) bytes; encrypted inner body preserved byte-exact; identity is the blinded signing key (spec carries no destination); tampered signature rejected"
     }
 
     private static func metaLeaseSet2RoundTrip() throws -> String {
         let (destination, seed) = I2PSamples.sampleIdentity()
-        let innerLeases = [I2PLease2(gatewayHash: I2PCrypto.randomBytes(32), tunnelId: 0x0AA0_BBCC,
-                                     expiration: Date().addingTimeInterval(600), cost: 7)]
-        let inner = try I2PLeaseSet2.build(
-            storeType: .plain, destination: destination,
-            published: Date(), expiresOffsetSeconds: 1800, flags: 0,
-            leases: innerLeases, signingSeed: seed)
+        let metaLeases = [
+            I2PMetaLease(gatewayHash: I2PCrypto.randomBytes(32), flags: 3,
+                         cost: 7, expiration: Date().addingTimeInterval(600)),
+            I2PMetaLease(gatewayHash: I2PCrypto.randomBytes(32), flags: 5,
+                         cost: 2, expiration: Date().addingTimeInterval(900)),
+        ]
         let meta = try I2PLeaseSet2.build(
             storeType: .meta, destination: destination,
             published: Date(), expiresOffsetSeconds: 1800, flags: 0,
-            metaEntries: [I2PMetaLeaseSet2Entry(flags: 0, inner: inner)], signingSeed: seed)
+            metaEntries: metaLeases, signingSeed: seed)
         let encoded = meta.serialize()
-        let parsed = try I2PLeaseSet2.parse(encoded, expectedType: 5)
-        guard parsed.serialize() == encoded, parsed.metaEntries.count == 1,
-              parsed.metaEntries[0].inner.storeType == .plain,
-              parsed.metaEntries[0].inner.leases == innerLeases else {
+        let parsed = try I2PLeaseSet2.parse(encoded, expectedType: .meta)
+        guard parsed.serialize() == encoded, parsed.metaEntries.count == 2,
+              parsed.metaEntries[0].entryTypeCode == 3,
+              parsed.metaEntries[1].entryTypeCode == 5,
+              parsed.metaEntries[1].cost == 2,
+              parsed.metaEntries[0].gatewayHash == metaLeases[0].gatewayHash,
+              parsed.revocations.isEmpty else {
             throw I2PWireError.invalidFormat
         }
-        // The nested plain LS2's leases are delivery-usable through the resolver.
-        guard let resolved = parsed.resolvedLeaseSet(), resolved.leases.count == 1,
-              resolved.leases[0].tunnelId == 0x0AA0_BBCC else {
-            throw I2PWireError.invalidFormat
-        }
+        // A MetaLease names another entry by hash, so the meta entry itself
+        // publishes no delivery-usable leases.
+        guard parsed.resolvedLeaseSet() == nil else { throw I2PWireError.invalidFormat }
         guard parsed.verifySignature() else { throw I2PWireError.invalidSignature }
-        return "meta LS2 round trips; nested plain LS2 entry re-parses; its leases recover for delivery; signature verified"
+        return "meta LS2 (store type 7) round trips; MetaLease flags/cost/end intact with the entry type in flags bits 3-0; signature verified"
     }
 
     private static func leaseSet2NetdbResolution() async throws -> String {
@@ -782,7 +1005,7 @@ enum I2PCrossValidation {
             published: Date(timeIntervalSince1970: 1_000_000),
             expiresOffsetSeconds: 60, flags: 0,
             leases: [I2PLease2(gatewayHash: I2PCrypto.randomBytes(32), tunnelId: 1,
-                               expiration: Date(timeIntervalSince1970: 1_000_060), cost: 1)],
+                               expiration: Date(timeIntervalSince1970: 1_000_060))],
             signingSeed: expiredSeed)
         guard await expectThrowAsync({ try await netdb.ingestLeaseSet2(expired.serialize(), entryType: .leaseSet2) }) else {
             throw I2PCrossValidationError.unexpectedSuccess
@@ -931,6 +1154,57 @@ enum I2PCrossValidation {
         return "fresh message accepted; stale message flagged dropped per spec"
     }
 
+    /// Router options/status channel: the I2NP message table defines no Options
+    /// type, so options ride RouterInfo options and the NTCP2 Options block.
+    private static func routerOptionsChannel() throws -> String {
+        let codes = I2NPMessageType.allCases.map(\.rawValue).sorted()
+        guard codes == [1, 2, 3, 10, 11, 18, 19, 20, 25, 26],
+              I2NPMessageType.tunnelGateway.rawValue == 19 else {
+            throw I2PCrossValidationError.failed("the I2NP type table does not match the spec's message table")
+        }
+        // The obsolete type-12 slot the router once used for a made-up Options
+        // message must reject at parse — fail closed, not a silent extra type.
+        var obsolete = I2NPMessage(type: .dataMessage, payload: Data([0x7A])).serialize()
+        obsolete[0] = 12
+        guard expectThrow({ _ = try I2NPMessage.parse(obsolete) }) else {
+            throw I2PCrossValidationError.failed("the obsolete type-12 Options slot still parses")
+        }
+
+        // RouterInfo options carry the router's capabilities and status, and
+        // survive the signed wire form byte-for-byte.
+        let signing = Curve25519.Signing.PrivateKey()
+        let identity = I2PRouterIdentity(
+            encryptionPublicKey: Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation,
+            signingPublicKey: signing.publicKey.rawRepresentation)
+        var info = I2PRouterInfo(
+            identity: identity,
+            published: Date(timeIntervalSince1970: 1_700_000_000),
+            addresses: [I2PRouterAddress(cost: 5, transportStyle: "NTCP2",
+                                         expiration: nil,
+                                         options: ["host": "10.0.0.7", "port": "8887"])],
+            options: ["caps": "XfR", "netid": "2", "router.version": "0.9.62"])
+        try info.sign(withSeed: signing.rawRepresentation)
+        let decoded = try I2PRouterInfo.parse(info.serialize())
+        guard decoded.options["caps"] == "XfR",
+              decoded.options["router.version"] == "0.9.62",
+              decoded.serialize() == info.serialize() else {
+            throw I2PWireError.invalidFormat
+        }
+
+        // The NTCP2 data-phase Options block (payload block type 1) round trips.
+        let options = NTCP2Options(transmitMin: 0x01, transmitMax: 0x10,
+                                   receiveMin: 0x00, receiveMax: 0x20,
+                                   transmitDummy: 25, receiveDummy: 40,
+                                   transmitDelay: 5, receiveDelay: 7)
+        let decodedBlocks = try NTCP2Block.decode(try NTCP2Block.encode([.options(options)]))
+        guard decodedBlocks.count == 1,
+              case .options(let decodedOptions) = decodedBlocks[0],
+              decodedOptions == options else {
+            throw I2PWireError.invalidFormat
+        }
+        return "type table is exactly the spec's (12 rejected, 19 = TunnelGateway); RouterInfo options round-trip with the signature intact; NTCP2 Options block round-trips"
+    }
+
     private static func databaseStoreRoundTrip() throws -> String {
         let key = I2PCrypto.sha256(Data("cv-store-key".utf8))
         let gateway = I2PCrypto.sha256(Data("cv-store-gateway".utf8))
@@ -971,12 +1245,13 @@ enum I2PCrossValidation {
         guard expectThrow({ _ = try I2PDatabaseStore.parse(writer.data) }) else {
             throw I2PCrossValidationError.unexpectedSuccess
         }
-        // Declared payload size beyond the buffer.
+        // Declared payload size beyond the buffer. A type-0 store's 2-byte
+        // compressed size sits at offset 32 (key) + 1 (type) + 4 (token) = 37.
         let store = I2PDatabaseStore(key: key, entryType: .routerInfo, replyToken: 0,
                                      payload: Data(repeating: 0x5A, count: 20))
         var short = store.serialize()
-        short[short.count - 22] = 0xFF
-        short[short.count - 21] = 0xFF
+        short[37] = 0xFF
+        short[38] = 0xFF
         guard expectThrow({ _ = try I2PDatabaseStore.parse(short) }) else {
             throw I2PCrossValidationError.unexpectedSuccess
         }
@@ -1023,26 +1298,32 @@ enum I2PCrossValidation {
         let routerHash = I2PCrypto.randomBytes(32)
         let cases: [I2PDeliveryInstructions] = [
             I2PDeliveryInstructions(mode: .local),
-            I2PDeliveryInstructions(mode: .local, delayMilliseconds: 1500),
-            I2PDeliveryInstructions(mode: .tunnel, tunnelID: 0x0102_0304,
-                                    routerHash: routerHash, delayMilliseconds: 250),
+            I2PDeliveryInstructions(mode: .destination, routerHash: routerHash),
             I2PDeliveryInstructions(mode: .tunnel, tunnelID: 0x0102_0304, routerHash: routerHash),
             I2PDeliveryInstructions(mode: .router, routerHash: routerHash),
-            I2PDeliveryInstructions(mode: .router, routerHash: routerHash, delayMilliseconds: 90),
         ]
-        for instructions in cases {
+        let expectedFlags: [UInt8] = [0x00, 0x20, 0x60, 0x40]
+        let expectedLengths = [1, 33, 37, 33]
+        for (index, instructions) in cases.enumerated() {
             let encoded = instructions.serialize()
+            guard encoded.count == expectedLengths[index],
+                  encoded[0] == expectedFlags[index] else { throw I2PWireError.invalidFormat }
             let (parsed, consumed) = try I2PDeliveryInstructions.parse(encoded)
             guard consumed == encoded.count else { throw I2PWireError.invalidFormat }
             guard parsed.serialize() == encoded else { throw I2PWireError.invalidFormat }
             guard parsed.mode == instructions.mode,
                   parsed.tunnelID == instructions.tunnelID,
-                  parsed.routerHash == instructions.routerHash,
-                  parsed.delayMilliseconds == instructions.delayMilliseconds else {
+                  parsed.routerHash == instructions.routerHash else {
                 throw I2PWireError.invalidFormat
             }
         }
-        return "6 instruction shapes (all modes × delay) round trip with exact byte counts"
+        // A destination must be rejected without a 32-byte hash; a set session
+        // key bit (0x80) is not part of the 1/33/37-byte forms.
+        guard expectThrow({ _ = try I2PDeliveryInstructions.parse(Data([0x80])) }),
+              expectThrow({ _ = try I2PDeliveryInstructions.parse(Data([0x20])) }) else {
+            throw I2PCrossValidationError.unexpectedSuccess
+        }
+        return "4 instruction shapes (LOCAL/DESTINATION/ROUTER/TUNNEL) with spec flags and 1/33/37-byte lengths"
     }
 
     private static func tunnelGatewayRoundTrip() throws -> String {
@@ -1087,20 +1368,20 @@ enum I2PCrossValidation {
         let hopKey2 = Curve25519.KeyAgreement.PrivateKey()
         let plaintext1 = I2PTunnelBuildRequestRecord(
             hopNumber: 0, receiveTunnelID: 0x0A0B_0C0D, nextHopHash: I2PCrypto.randomBytes(32),
-            nextTunnelID: 55, layerKey: I2PCrypto.randomBytes(32), ivKey: I2PCrypto.randomBytes(32),
-            replyKey: I2PCrypto.randomBytes(32), replyIV: I2PCrypto.randomBytes(16),
-            isMessagePathEnd: false, nextHopIsOriginator: false, hasMoreRecords: true,
-            padding: Data(repeating: 0x11, count: 372))
+            nextTunnelID: 55, isMessagePathEnd: false, nextHopIsOriginator: false,
+            hasMoreRecords: true
+        )
         let plaintext2 = I2PTunnelBuildRequestRecord(
             hopNumber: 1, receiveTunnelID: 0x0102_0304, nextHopHash: Data(repeating: 0, count: 32),
-            nextTunnelID: 0, layerKey: I2PCrypto.randomBytes(32), ivKey: I2PCrypto.randomBytes(32),
-            replyKey: I2PCrypto.randomBytes(32), replyIV: I2PCrypto.randomBytes(16),
-            isMessagePathEnd: true, nextHopIsOriginator: true, hasMoreRecords: false,
-            padding: Data(repeating: 0x22, count: 372))
-        let record1 = try I2PTunnelBuildCrypto.encryptRecord(
-            plaintext1.serialize(), to: hopKey1.publicKey.rawRepresentation, recordIndex: 0)
-        let record2 = try I2PTunnelBuildCrypto.encryptRecord(
-            plaintext2.serialize(), to: hopKey2.publicKey.rawRepresentation, recordIndex: 1)
+            nextTunnelID: 0, isMessagePathEnd: true, nextHopIsOriginator: true,
+            hasMoreRecords: false
+        )
+        let encrypted1 = try I2PTunnelBuildCrypto.encryptRecordWithMaterial(
+            plaintext1.serialize(), to: hopKey1.publicKey.rawRepresentation, hopHash: nil, recordIndex: 0)
+        let encrypted2 = try I2PTunnelBuildCrypto.encryptRecordWithMaterial(
+            plaintext2.serialize(), to: hopKey2.publicKey.rawRepresentation, hopHash: nil, recordIndex: 1)
+        let record1 = encrypted1.wire
+        let record2 = encrypted2.wire
 
         let build = I2PTunnelBuildMessage(messageID: 0x00BE_EF01, records: [record1, record2])
         let buildBytes = build.serialize()
@@ -1115,11 +1396,12 @@ enum I2PCrossValidation {
         }
 
         // Reply message round trip.
-        let replyKey = I2PCrypto.randomBytes(32)
-        let replyIV = I2PCrypto.randomBytes(16)
         let replyWire = try I2PTunnelBuildCrypto.encryptReplyRecord(
             I2PTunnelBuildReplyRecord(receiveTunnelID: 77, returnCode: 0),
-            replyKey: replyKey, replyIV: replyIV, messageID: 0x00BE_EF01)
+            material: encrypted1.material, recordIndex: 0)
+        guard replyWire.count == I2PTunnelBuildReply.encryptedRecordLength else {
+            throw I2PWireError.invalidFormat
+        }
         let reply = I2PTunnelBuildReply(messageID: 0x00BE_EF01, encryptedRecords: [replyWire])
         let replyBytes = reply.serialize()
         guard try I2PTunnelBuildReply.parse(replyBytes).serialize() == replyBytes else {
@@ -1128,13 +1410,12 @@ enum I2PCrossValidation {
 
         // Record-count bounds: 9 records rejected.
         var oversizeWriter = I2PWriter()
-        oversizeWriter.integer(1)
         oversizeWriter.byte(9)
         oversizeWriter.raw(record1)
         guard expectThrow({ _ = try I2PTunnelBuildMessage.parse(oversizeWriter.data) }) else {
             throw I2PCrossValidationError.unexpectedSuccess
         }
-        return "build + reply messages round trip; per-hop decryption exact; record count bounds enforced"
+        return "short build + reply messages round trip; per-hop decryption exact; record count bounds enforced"
     }
 
     // MARK: NTCP2
@@ -1143,9 +1424,9 @@ enum I2PCrossValidation {
         let blocks: [NTCP2Block] = [
             .data(Data("i2np frame payload".utf8)),
             .time(Date(timeIntervalSince1970: 1_700_000_123)),
-            .options(["i": "1", "s": "2"]),
+            .options(NTCP2Options(transmitMin: 1, receiveMax: 8)),
             .padding(23),
-            .termination(reason: 3, validTime: Date(timeIntervalSince1970: 1_700_001_000)),
+            .termination(reason: 3, validFrames: 42),
         ]
         let encoded = try NTCP2Block.encode(blocks)
         let decoded = try NTCP2Block.decode(encoded)
@@ -1188,12 +1469,13 @@ enum I2PCrossValidation {
         guard firstCiphertext == secondCiphertext else {
             throw I2PWireError.invalidFormat
         }
-        // Split(): deterministic, 32-byte AEAD keys, 16-byte SipHash keys, distinct directions.
+        // Split(): deterministic, 32-byte AEAD keys, 24-byte SipHash key material
+        // (two keys + IV), distinct directions.
         let (ab1, ba1) = first.split()
         let (ab2, ba2) = second.split()
         guard ab1 == ab2, ba1 == ba2 else { throw I2PWireError.invalidFormat }
-        guard ab1.aeadKey.count == 32, ab1.sipKey.count == 16,
-              ab1.aeadKey != ba1.aeadKey, ab1.sipKey != ba1.sipKey else {
+        guard ab1.aeadKey.count == 32, ab1.sipKeys.count == 24,
+              ab1.aeadKey != ba1.aeadKey, ab1.sipKeys != ba1.sipKeys else {
             throw I2PWireError.invalidFormat
         }
         // The AEAD nonce advances per message.
@@ -1206,14 +1488,16 @@ enum I2PCrossValidation {
     }
 
     private static func ntcp2KDFLabels() throws -> String {
-        guard NTCP2NoiseChain.protocolName == "Noise_XK_25519_ChaChaPoly_SHA256",
-              NTCP2NoiseChain.protocolName.utf8.count == 32 else {
+        guard NTCP2NoiseChain.protocolName == "Noise_XKaesobfse+hs2+hs3_25519_ChaChaPoly_SHA256",
+              NTCP2NoiseChain.protocolName.utf8.count == 48 else {
             throw I2PWireError.invalidFormat
         }
-        // At exactly HASHLEN bytes the name rides verbatim as both chain key and hash.
+        // A 48-byte name is hashed (Noise §5): h = SHA256(name), ck = h, then
+        // the null prologue gives h = SHA256(h).
         let chain = NTCP2NoiseChain()
-        let nameBytes = Data(NTCP2NoiseChain.protocolName.utf8)
-        guard chain.chainingKey == nameBytes, chain.hash == nameBytes else {
+        let nameHash = I2PCrypto.sha256(Data(NTCP2NoiseChain.protocolName.utf8))
+        guard chain.chainingKey == nameHash,
+              chain.hash == I2PCrypto.sha256(nameHash) else {
             throw I2PWireError.invalidFormat
         }
         // HKDF chain expansion: deterministic, correct count, all outputs distinct.
@@ -1226,7 +1510,7 @@ enum I2PCrossValidation {
                                               Data(repeating: 9, count: 32), outputs: 4) else {
             throw I2PWireError.invalidFormat
         }
-        return "protocol name used unhashed (32 bytes); HKDF chain expansion deterministic and distinct"
+        return "protocol name hashed per Noise (48 bytes); HKDF chain expansion deterministic and distinct"
     }
 
     private static func nonce96Layout() throws -> String {
@@ -1234,10 +1518,9 @@ enum I2PCrossValidation {
         func seal(_ nonce: ChaChaPoly.Nonce) throws -> Data {
             try ChaChaPoly.seal(Data(), using: SymmetricKey(data: key), nonce: nonce).combined
         }
-        // nonce96 = 4 zero bytes ‖ big-endian counter, verified functionally
-        // against manually built nonces.
+        // nonce96 = 4 zero bytes ‖ little-endian counter (Noise spec).
         let counter: UInt64 = 0x0001_0203_0405_0607
-        let manual = try ChaChaPoly.Nonce(data: Data([0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8]))
+        let manual = try ChaChaPoly.Nonce(data: Data([0, 0, 0, 0, 7, 6, 5, 4, 3, 2, 1, 0]))
         let zeroManual = try ChaChaPoly.Nonce(data: Data(repeating: 0, count: 12))
         let withCounter = try seal(NTCP2NoiseChain.nonce96(counter))
         let withManual = try seal(manual)
@@ -1248,161 +1531,194 @@ enum I2PCrossValidation {
         // Distinct counters produce distinct nonces.
         let otherCounter = try seal(NTCP2NoiseChain.nonce96(1))
         guard otherCounter != withZero else { throw I2PWireError.invalidFormat }
-        return "nonce96 = 4 zero bytes ‖ big-endian counter, verified functionally against manual nonces"
+        return "nonce96 = 4 zero bytes ‖ little-endian counter, verified functionally against manual nonces"
     }
 
     private static func ntcp2FrameRoundTrip() throws -> String {
         let keys = NTCP2DirectionKeys(aeadKey: I2PCrypto.randomBytes(32),
-                                      sipKey: I2PCrypto.randomBytes(16))
-        let codec = NTCP2FrameCodec(directionKeys: keys)
+                                      sipKeys: I2PCrypto.randomBytes(24))
+        // A frame's length mask and nonce use the *sender's* frame counter, while
+        // the receiver keeps its own. Using one codec for both sides advanced the
+        // shared counter before the length was unmasked, so the decode produced a
+        // bogus length and the force-unwrap trapped (SIGTRAP in the alignment run).
+        let sender = NTCP2FrameCodec(directionKeys: keys)
+        let receiver = NTCP2FrameCodec(directionKeys: keys)
         let payload = Data("frame payload with stable bytes".utf8)
-        let framed = try codec.frame(payload)
-        let (unframed, consumed) = try codec.unframe(framed)!
-        guard unframed == payload, consumed == framed.count else { throw I2PWireError.invalidFormat }
+        let framed = try sender.frame(payload)
+        guard let decoded = try receiver.unframe(framed) else {
+            throw I2PWireError.invalidFormat
+        }
+        guard decoded.payload == payload, decoded.consumed == framed.count else {
+            throw I2PWireError.invalidFormat
+        }
         // Multiple frames: the counter advances per frame.
-        let framed2 = try codec.frame(Data("second frame".utf8))
-        let (unframed2, consumed2) = try codec.unframe(framed2)!
-        guard unframed2 == Data("second frame".utf8), consumed2 == framed2.count else {
+        let framed2 = try sender.frame(Data("second frame".utf8))
+        guard let decoded2 = try receiver.unframe(framed2) else {
+            throw I2PWireError.invalidFormat
+        }
+        guard decoded2.payload == Data("second frame".utf8), decoded2.consumed == framed2.count else {
             throw I2PWireError.invalidFormat
         }
         // Incremental delivery: partial buffer yields nil, completion yields the payload.
-        let incremental = NTCP2FrameCodec(directionKeys: keys)
-        let full = try incremental.frame(payload)
-        guard try incremental.unframe(Data(full.prefix(1))) == nil else {
+        let incrementalSender = NTCP2FrameCodec(directionKeys: keys)
+        let incrementalReceiver = NTCP2FrameCodec(directionKeys: keys)
+        let full = try incrementalSender.frame(payload)
+        guard try incrementalReceiver.unframe(Data(full.prefix(1))) == nil else {
             throw I2PWireError.invalidFormat
         }
-        guard try incremental.unframe(full)!.payload == payload else { throw I2PWireError.invalidFormat }
+        guard let incrementalDecoded = try incrementalReceiver.unframe(full),
+              incrementalDecoded.payload == payload else {
+            throw I2PWireError.invalidFormat
+        }
         // Tampered MAC rejected.
-        let tamperCodec = NTCP2FrameCodec(directionKeys: keys)
-        let tamperTarget = try tamperCodec.frame(payload)
+        let tamperSender = NTCP2FrameCodec(directionKeys: keys)
+        let tamperReceiver = NTCP2FrameCodec(directionKeys: keys)
+        let tamperTarget = try tamperSender.frame(payload)
         var tampered = tamperTarget
         tampered[tampered.count - 1] ^= 0xff
-        guard expectThrow({ _ = try tamperCodec.unframe(tampered) }) else {
+        guard expectThrow({ _ = try tamperReceiver.unframe(tampered) }) else {
             throw I2PCrossValidationError.unexpectedSuccess
         }
         return "frames round trip (sequential + incremental); tampered MAC rejected"
     }
 
     private static func sipHashDeterminism() throws -> String {
-        let sipKey = I2PCrypto.randomBytes(16)
-        func mask(_ counter: UInt64) -> UInt16 {
-            var input = counter.bigEndian
-            let message = withUnsafeBytes(of: &input) { Data($0) }
-            return UInt16(truncatingIfNeeded: SipHash24.hash(key: sipKey, message: message))
+        // SipHash-2-4 is a pure function of the two 64-bit keys and the message.
+        // Known-answer vector (the reference implementation's vectors_sip64[15]):
+        // key bytes 00..0f over message bytes 00..0e give the little-endian
+        // 64-bit output 0xa129ca6149be45e5 (wire bytes e5 45 be 49 61 ca 29 a1).
+        // The key loader is little-endian, exactly as NTCP2's key material is read.
+        guard SipHash24.hash(key: Data(0..<16), message: Data(0..<15)) == 0xa129_ca61_49be_45e5 else {
+            throw I2PCrossValidationError.failed(
+                "SipHash-2-4 known-answer vector failed (a129ca614abf5be expected family)")
         }
-        guard mask(0) == mask(0) else { throw I2PWireError.invalidFormat }
-        guard mask(0) != mask(1), mask(1) != mask(2), mask(0) != mask(2) else {
+        let k0 = UInt64.random(in: 1...UInt64.max)
+        let k1 = UInt64.random(in: 1...UInt64.max)
+        let iv = I2PCrypto.randomBytes(8)
+        guard SipHash24.hash(k0: k0, k1: k1, message: iv)
+                == SipHash24.hash(k0: k0, k1: k1, message: iv) else {
             throw I2PWireError.invalidFormat
         }
-        // The obfuscation is exactly XOR: obfuscated length ^ mask == payload + 16.
-        let keys = NTCP2DirectionKeys(aeadKey: I2PCrypto.randomBytes(32), sipKey: sipKey)
+        guard SipHash24.hash(k0: k0, k1: k1, message: iv)
+                != SipHash24.hash(k0: k0, k1: k1, message: I2PCrypto.randomBytes(8)) else {
+            throw I2PWireError.invalidFormat
+        }
+        // The data-phase KDF hands each direction 24 bytes: two SipHash keys and
+        // the initial IV. The IV chains per frame, so two frames of equal length
+        // still carry different obfuscated length fields.
+        let keys = NTCP2DirectionKeys(aeadKey: I2PCrypto.randomBytes(32),
+                                      sipKeys: I2PCrypto.randomBytes(24))
+        guard keys.sipKeys.count == 24 else { throw I2PWireError.invalidFormat }
         let codec = NTCP2FrameCodec(directionKeys: keys)
         let payload = Data("obfuscation math".utf8)
-        let framed = try codec.frame(payload)
-        let obfuscated = (UInt16(framed[0]) << 8) | UInt16(framed[1])
-        let expectedLength = UInt16(framed.count - 2)
-        guard obfuscated == expectedLength ^ mask(0) else { throw I2PWireError.invalidFormat }
-        guard obfuscated ^ mask(0) == expectedLength else { throw I2PWireError.invalidFormat }
-        // A length field that decodes below 16 is rejected.
-        let zeroFrame = Data([UInt8((mask(0) >> 8) & 0xff), UInt8(mask(0) & 0xff)])
-        guard expectThrow({ _ = try codec.unframe(zeroFrame) }) else {
+        let first = try codec.frame(payload)
+        let second = try codec.frame(payload)
+        guard first.count == second.count,
+              Data(first.prefix(2)) != Data(second.prefix(2)) else {
+            throw I2PWireError.invalidFormat
+        }
+        // A length field that de-obfuscates below the 16-byte MAC floor is
+        // rejected rather than treated as an incomplete frame.
+        let zeroCodec = NTCP2FrameCodec(directionKeys: keys)
+        let mask = zeroCodec.nextLengthMask()
+        let zeroLengthFrame = Data([UInt8((mask >> 8) & 0xff), UInt8(mask & 0xff)])
+        guard expectThrow({ _ = try zeroCodec.unframe(zeroLengthFrame) }) else {
             throw I2PCrossValidationError.unexpectedSuccess
         }
-        // The SipHash key comes from the NTCP2 spec's data-phase KDF, not from
-        // the split output: deterministic, 16 bytes, distinct from the raw
-        // direction-key prefix, and distinct per direction.
-        let directionKey = I2PCrypto.randomBytes(32)
-        let derivedSipKey = NTCP2NoiseChain.dataPhaseSipKey(directionKey)
-        guard derivedSipKey == NTCP2NoiseChain.dataPhaseSipKey(directionKey),
-              derivedSipKey.count == 16 else {
-            throw I2PWireError.invalidFormat
-        }
-        guard derivedSipKey != Data(directionKey.prefix(16)) else { throw I2PWireError.invalidFormat }
-        guard derivedSipKey != NTCP2NoiseChain.dataPhaseSipKey(I2PCrypto.randomBytes(32)) else {
-            throw I2PWireError.invalidFormat
-        }
-        return "masks deterministic per counter, distinct across frames; SipHash keys derived by the data-phase KDF; frame length math verified; short frames rejected"
+        return "masks deterministic and chained per frame; frame length math verified; short frames rejected"
     }
 
     /// Fresh in-memory handshake engines over X25519 static keys.
     private static func ntcp2HandshakeEngines() throws -> (initiator: NTCP2InitiatorHandshake,
                                                             responder: NTCP2ResponderHandshake,
                                                             routerInfo: Data,
-                                                            responderStatic: Data) {
+                                                            responderStatic: Data,
+                                                            responderHash: Data,
+                                                            responderIV: Data) {
         let alice = Curve25519.KeyAgreement.PrivateKey()
         let bob = Curve25519.KeyAgreement.PrivateKey()
         let routerInfo = try I2PSamples.sampleRouterInfo().serialize()
+        // The responder's router hash keys the handshake obfuscation; its `i`
+        // option supplies the IV.
+        let bobHash = I2PCrypto.randomBytes(32)
+        let bobIV = I2PCrypto.randomBytes(16)
+        let bobStaticPublic = I2PCrypto.canonicalX25519PublicKey(bob.publicKey.rawRepresentation)
         let initiator = try NTCP2InitiatorHandshake(localStaticKey: alice,
-                                                    remoteStaticKey: bob.publicKey.rawRepresentation)
-        let responder = NTCP2ResponderHandshake(localStaticKey: bob)
-        return (initiator, responder, routerInfo, bob.publicKey.rawRepresentation)
+                                                    remoteStaticKey: bobStaticPublic,
+                                                    remoteRouterHash: bobHash,
+                                                    remoteIV: bobIV)
+        let responder = try NTCP2ResponderHandshake(localStaticKey: bob,
+                                                    localStaticPublicKey: bobStaticPublic,
+                                                    localRouterHash: bobHash,
+                                                    localIV: bobIV)
+        return (initiator, responder, routerInfo, bobStaticPublic, bobHash, bobIV)
     }
 
     /// The spec's AES-256-CBC ephemeral-key obfuscation end-to-end: messages 1
-    /// and 2 round-trip through the KDF-obfuscated wire, the full handshake
-    /// completes, and the obfuscation is deterministic and reversible.
+    /// and 2 are fixed-length frames under a CBC stream keyed by the responder's
+    /// router hash, and the full handshake completes with mirrored direction keys.
     private static func ntcp2KeyObfuscationSpec() throws -> String {
-        let (initiator, responder, routerInfo, responderStatic) = try ntcp2HandshakeEngines()
-        let request = try initiator.makeSessionRequest(routerInfo: routerInfo, padding: 13)
-        let created = try responder.processSessionRequest(request, padding: 7)
+        let engines = try ntcp2HandshakeEngines()
+        let request = try engines.initiator.makeSessionRequest(routerInfo: engines.routerInfo, padding: 13)
+        let created = try engines.responder.processSessionRequest(request, padding: 7)
         guard created.consumed == request.count else {
             throw NTCP2Error.handshakeFailed("message 1 consumed length mismatch")
         }
-        let confirm = try initiator.processSessionCreated(created.reply)
-        _ = try responder.processSessionConfirm(confirm.message)
-        let aliceKeys = try initiator.complete()
-        let bobKeys = try responder.complete()
-        guard aliceKeys.sendKeys.aeadKey == bobKeys.recvKeys.aeadKey,
-              aliceKeys.recvKeys.aeadKey == bobKeys.sendKeys.aeadKey,
-              aliceKeys.sendKeys.sipKey == bobKeys.recvKeys.sipKey else {
+        let confirm = try engines.initiator.processSessionCreated(created.reply)
+        guard confirm.consumed == created.reply.count else {
+            throw NTCP2Error.handshakeFailed("message 2 consumed length mismatch")
+        }
+        _ = try engines.responder.processSessionConfirm(confirm.message)
+        let aliceKeys = try engines.initiator.complete()
+        let bobKeys = try engines.responder.complete()
+        guard aliceKeys.sendKeys == bobKeys.recvKeys,
+              aliceKeys.recvKeys == bobKeys.sendKeys else {
             throw NTCP2Error.handshakeFailed("direction keys disagree")
         }
-        // The obfuscation itself: AES-256-CBC output that is deterministic and
-        // reversible under the spec KDF.
-        let sample = I2PCrypto.randomBytes(32)
-        let sealed = try NTCP2KeyObfuscation.encrypt(sample,
-                                                     chainingKey: NTCP2NoiseChain.initialChainingKey,
-                                                     material: responderStatic)
-        guard sealed != sample, sealed.count == 32 else {
-            throw NTCP2Error.handshakeFailed("obfuscation degenerate")
-        }
-        let resealed = try NTCP2KeyObfuscation.encrypt(sample,
-                                                       chainingKey: NTCP2NoiseChain.initialChainingKey,
-                                                       material: responderStatic)
-        guard sealed == resealed else {
-            throw NTCP2Error.handshakeFailed("obfuscation not deterministic")
-        }
-        guard try NTCP2KeyObfuscation.decrypt(sealed, chainingKey: NTCP2NoiseChain.initialChainingKey,
-                                              material: responderStatic) == sample else {
-            throw NTCP2Error.handshakeFailed("obfuscation not reversible")
-        }
-        // The message-1 wire bytes deobfuscate to a valid curve point under the same KDF.
-        let wireEphemeral = Data(request.prefix(32))
-        let recovered = try NTCP2KeyObfuscation.decrypt(wireEphemeral,
-                                                        chainingKey: NTCP2NoiseChain.initialChainingKey,
-                                                        material: responderStatic)
+        // Message 1's X de-obfuscates under RH_B and the published `i` IV, and
+        // message 2 continues the same CBC chain rather than restarting it.
+        var reader = try NTCP2HandshakeObfuscator(routerHash: engines.responderHash,
+                                                  iv: engines.responderIV)
+        let recovered = try reader.decrypt(Data(request.prefix(32)))
         _ = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: recovered)
-        return "messages 1 and 2 framed per spec: AES-256-CBC ephemeral-key obfuscation (spec KDF), handshake completes with matching direction keys"
+
+        var chained = try NTCP2HandshakeObfuscator(routerHash: engines.responderHash,
+                                                   iv: engines.responderIV)
+        let firstBlock = try chained.encrypt(recovered)
+        let nextBlock = try chained.encrypt(recovered)
+        var restart = try NTCP2HandshakeObfuscator(routerHash: engines.responderHash,
+                                                   iv: engines.responderIV)
+        let restarted = try restart.encrypt(recovered)
+        guard firstBlock == Data(request.prefix(32)),
+              nextBlock != firstBlock,
+              restarted == firstBlock else {
+            throw NTCP2Error.handshakeFailed("obfuscation IV did not chain")
+        }
+        return "messages 1 and 2 framed per spec: AES-256-CBC ephemeral-key obfuscation keyed by RH_B with the published 'i' IV, handshake completes with mirrored direction keys"
     }
 
-    /// The 2-byte options length prefix: present on both handshake messages and
-    /// consistent with the encrypted options block plus the trailing padding.
-    private static func ntcp2OptionsPrefixSpec() throws -> String {
-        let (initiator, responder, routerInfo, _) = try ntcp2HandshakeEngines()
-        let request = try initiator.makeSessionRequest(routerInfo: routerInfo, padding: 0)
-        // Layout: obfuscated e (32) + options length (2 BE) + AEAD options + padding.
-        let requestOptionsLength = (Int(request[32]) << 8) | Int(request[33])
-        guard requestOptionsLength >= 16, requestOptionsLength == request.count - 34 else {
-            throw NTCP2Error.handshakeFailed("message 1 options prefix mismatch")
+    /// Message 1 and message 2 framing: fixed 64-byte envelopes (obfuscated
+    /// ephemeral key, 16-byte options block, MAC) with no length prefix, and
+    /// m3p2len equal to the message-3 part-2 frame size.
+    private static func ntcp2OptionsLayoutSpec() throws -> String {
+        let engines = try ntcp2HandshakeEngines()
+        let request = try engines.initiator.makeSessionRequest(routerInfo: engines.routerInfo, padding: 0)
+        guard request.count == 64 else {
+            throw NTCP2Error.handshakeFailed("message 1 is \(request.count) bytes, expected 64 (32-byte X + 16-byte options + 16-byte MAC)")
         }
-        let created = try responder.processSessionRequest(request, padding: 5)
-        let replyOptionsLength = (Int(created.reply[32]) << 8) | Int(created.reply[33])
-        guard replyOptionsLength >= 16, replyOptionsLength == created.reply.count - 34 - 5 else {
-            throw NTCP2Error.handshakeFailed("message 2 options prefix mismatch")
+        let created = try engines.responder.processSessionRequest(request, padding: 5)
+        guard created.consumed == request.count else {
+            throw NTCP2Error.handshakeFailed("message 1 consumed length mismatch")
         }
-        let confirm = try initiator.processSessionCreated(created.reply)
-        _ = try responder.processSessionConfirm(confirm.message)
-        return "both handshake messages carry the options length prefix consistent with the encrypted options + padding"
+        guard created.reply.count == 69 else {
+            throw NTCP2Error.handshakeFailed("message 2 is \(created.reply.count) bytes, expected 64 + 5 padding")
+        }
+        _ = try engines.initiator.processSessionCreated(created.reply)
+        let expectedPart2 = (try NTCP2Block.encode([.routerInfo(engines.routerInfo)])).count + 16
+        guard engines.initiator.announcedPart2Length == expectedPart2 else {
+            throw NTCP2Error.handshakeFailed("m3p2len is not the message-3 part-2 frame size")
+        }
+        return "message 1: 32-byte obfuscated X + 16-byte options + MAC; message 2: the same envelope with padLen/tsB; m3p2len equals the message-3 part-2 frame size"
     }
 
     // MARK: Crypto cross-checks
@@ -1476,12 +1792,12 @@ enum I2PCrossValidation {
     }
 
     private static func blake2bKAT() throws -> String {
-        // RFC 7693 Appendix B, empty input: the digest begins 786a02f7673b5856.
+        // RFC 7693 Appendix B, empty input: the digest begins 786a02f742015903.
         let empty = BLAKE2b.digest([], outLen: 64)
-        guard empty.count == 64, Data(empty).hex.hasPrefix("786a02f7673b5856") else {
+        guard empty.count == 64, Data(empty).hex.hasPrefix("786a02f742015903") else {
             // Name the digest this build actually produced — a pure function
             // failing a fixed vector is otherwise undiagnosable from a bare tag.
-            throw SSU2Error.testFailed("empty-input digest \(Data(empty).hex.prefix(16))… diverges from the RFC 7693 vector 786a02f7673b5856…")
+            throw SSU2Error.testFailed("empty-input digest \(Data(empty).hex.prefix(16))… diverges from the RFC 7693 vector 786a02f742015903…")
         }
         // Digest length is a parameter: distinct lengths give distinct digests,
         // each with its declared size.
@@ -1570,9 +1886,14 @@ enum I2PCrossValidation {
             throw I2PCrossValidationError.unexpectedSuccess
         }
         // Unapproved signature and encryption type codes in a key certificate.
+        // EncType 0 is deliberately absent from this list: proposal 123 pins a
+        // LeaseSet2-era destination's crypto field to 0 ("the encryption type is
+        // not specified in the Destination key certificate, it will remain 0"),
+        // which is the shape every long-lived mainnet destination publishes — and
+        // rejecting it made every real LeaseSet2 unparseable.
         for (sigCode, encCode) in [(UInt16(0), UInt16(4)), (UInt16(1), UInt16(4)),
-                                   (UInt16(3), UInt16(4)), (UInt16(7), UInt16(0)),
-                                   (UInt16(7), UInt16(2)), (UInt16(11), UInt16(6))] {
+                                   (UInt16(3), UInt16(4)), (UInt16(7), UInt16(2)),
+                                   (UInt16(11), UInt16(6))] {
             var payload = I2PWriter()
             payload.short(sigCode)
             payload.short(encCode)
@@ -1583,6 +1904,35 @@ enum I2PCrossValidation {
             guard expectThrow({ var r = I2PReader(certWriter.data); _ = try I2PCertificate.parse(&r) }) else {
                 throw I2PCrossValidationError.unexpectedSuccess
             }
+        }
+        // (SigType 7, EncType 0) parses — and yields no crypto key at all. The
+        // signing key is what verifies the entry; a LeaseSet2 carries the real
+        // encryption key in its own key list, so the field is never consulted.
+        var unusedWriter = I2PWriter()
+        unusedWriter.short(I2PSigType.ed25519.rawValue)
+        unusedWriter.short(0)
+        var unusedCertWriter = I2PWriter()
+        unusedCertWriter.byte(5)
+        unusedCertWriter.short(UInt16(unusedWriter.data.count))
+        unusedCertWriter.raw(unusedWriter.data)
+        var unusedReader = I2PReader(unusedCertWriter.data)
+        let unusedCert = try I2PCertificate.parse(&unusedReader)
+        var unusedReencoded = I2PWriter()
+        unusedCert.serialize(into: &unusedReencoded)
+        guard unusedCert.sigType == I2PSigType.ed25519,
+              unusedCert.encType == nil,
+              unusedCert.cryptoPublicKeyLength == 0,
+              unusedReencoded.data == unusedCertWriter.data else {
+            throw I2PWireError.invalidFormat
+        }
+        let unusedIdentity = Data(repeating: 0x43, count: 256)
+            + Data(repeating: 0x44, count: 128) + unusedCertWriter.data
+        var unusedIdentityReader = I2PReader(unusedIdentity)
+        let unusedKeys = try I2PKeysAndCert.parse(&unusedIdentityReader)
+        guard unusedKeys.encryptionPublicKey.isEmpty,
+              unusedKeys.signingPublicKey.count == 32,
+              unusedKeys.raw == unusedIdentity else {
+            throw I2PWireError.invalidFormat
         }
         // A hand-built keysAndCert with a null certificate is rejected whole —
         // legacy identities cannot enter the netdb.
@@ -1602,7 +1952,7 @@ enum I2PCrossValidation {
               certificate.encType == I2PEncType.x25519 else {
             throw I2PWireError.unsupportedAlgorithm
         }
-        return "null certificates, legacy sig/enc type codes and legacy identities rejected at parse; modern identities emit type-5 key certificates only"
+        return "null certificates, legacy sig type codes and unapproved enc type codes rejected at parse; the LeaseSet2-era unused crypto field (EncType 0) parses beside a modern signing key and yields no crypto key; modern identities emit type-5 key certificates only"
     }
 
     private static func ed25519phDom2() throws -> String {
@@ -1650,14 +2000,10 @@ enum I2PCrossValidation {
             receiveTunnelID: 0x0A0B_0C0D,
             nextHopHash: I2PCrypto.randomBytes(32),
             nextTunnelID: 55,
-            layerKey: I2PCrypto.randomBytes(32),
-            ivKey: I2PCrypto.randomBytes(32),
-            replyKey: I2PCrypto.randomBytes(32),
-            replyIV: I2PCrypto.randomBytes(16),
             isMessagePathEnd: pathEnd,
             nextHopIsOriginator: originator,
             hasMoreRecords: more,
-            padding: Data(repeating: UInt8(hop &* 7 &+ 1), count: 372))
+            padding: Data(repeating: UInt8(hop &* 7 &+ 1), count: 96))
     }
 
     private static func buildRecordRoundTrip() throws -> String {
@@ -1669,11 +2015,11 @@ enum I2PCrossValidation {
         let parsed = try I2PTunnelBuildRequestRecord.parse(encoded)
         guard parsed.serialize() == encoded else { throw I2PWireError.invalidFormat }
         guard parsed.receiveTunnelID == 0x0A0B_0C0D, parsed.nextTunnelID == 55,
-              parsed.layerKey == record.layerKey, parsed.replyIV == record.replyIV,
+              parsed.nextHopHash == record.nextHopHash,
               parsed.padding == record.padding else {
             throw I2PWireError.invalidFormat
         }
-        return "528-byte plaintext record round trips byte-for-byte; keys and padding intact"
+        return "154-byte short record round trips byte-for-byte; next hop and padding intact"
     }
 
     private static func buildRecordFlags() throws -> String {
@@ -1686,43 +2032,36 @@ enum I2PCrossValidation {
                                       originator: combination.originator, more: combination.more)
             let parsed = try I2PTunnelBuildRequestRecord.parse(record.serialize())
             guard parsed.isMessagePathEnd == combination.end,
-                  parsed.nextHopIsOriginator == combination.originator,
-                  parsed.hasMoreRecords == combination.more,
                   parsed.flags == record.flags else {
                 throw I2PWireError.invalidFormat
             }
         }
-        // The reserved byte must stay zero.
+        // The reserved bytes must stay zero.
         let record = sampleRecord(hop: 0, pathEnd: false, originator: false, more: false)
         var bytes = record.serialize()
-        bytes[155] = 1
+        bytes[41] = 1
         guard expectThrow({ _ = try I2PTunnelBuildRequestRecord.parse(bytes) }) else {
             throw I2PCrossValidationError.unexpectedSuccess
         }
-        // Short padding is normalized to the full 372 bytes on serialize.
+        // Short padding is normalized to the remaining record budget.
         let shortPadded = I2PTunnelBuildRequestRecord(
             hopNumber: 0, receiveTunnelID: 1, nextHopHash: Data(repeating: 0, count: 32),
-            nextTunnelID: 2, layerKey: I2PCrypto.randomBytes(32), ivKey: I2PCrypto.randomBytes(32),
-            replyKey: I2PCrypto.randomBytes(32), replyIV: I2PCrypto.randomBytes(16),
-            isMessagePathEnd: false, nextHopIsOriginator: false, hasMoreRecords: false,
-            padding: Data(repeating: 0x33, count: 10))
-        guard try I2PTunnelBuildRequestRecord.parse(shortPadded.serialize()).padding.count == 372 else {
+            nextTunnelID: 2, isMessagePathEnd: false, nextHopIsOriginator: false,
+            hasMoreRecords: false, padding: Data(repeating: 0x33, count: 10))
+        guard try I2PTunnelBuildRequestRecord.parse(shortPadded.serialize()).padding.count == 96 else {
             throw I2PWireError.invalidFormat
         }
-        return "all flag combinations round trip; reserved byte enforced zero; padding normalized"
+        return "IBGW/OBEP flags and the end marker round trip; reserved bytes enforced zero; padding normalized"
     }
 
     private static func buildRecordEncryption() throws -> String {
         let hopKey = Curve25519.KeyAgreement.PrivateKey()
         let plaintext = sampleRecord(hop: 0, pathEnd: true, originator: false, more: false).serialize()
-        let wire = try I2PTunnelBuildCrypto.encryptRecord(plaintext, to: hopKey.publicKey.rawRepresentation, recordIndex: 3)
+        let wire = try I2PTunnelBuildCrypto.encryptRecord(
+            plaintext, to: hopKey.publicKey.rawRepresentation, recordIndex: 3)
         guard wire.count == I2PTunnelBuildRequestRecord.wireLength else { throw I2PWireError.invalidFormat }
         guard try I2PTunnelBuildCrypto.decryptRecord(wire, localEncryptionKey: hopKey, recordIndex: 3) == plaintext else {
             throw I2PWireError.invalidFormat
-        }
-        // Wrong record index (AAD mismatch) → MAC failure.
-        guard expectThrow({ _ = try I2PTunnelBuildCrypto.decryptRecord(wire, localEncryptionKey: hopKey, recordIndex: 2) }) else {
-            throw I2PCrossValidationError.unexpectedSuccess
         }
         // Wrong hop key → the record is not addressed to us.
         let otherHop = Curve25519.KeyAgreement.PrivateKey()
@@ -1735,34 +2074,50 @@ enum I2PCrossValidation {
         guard expectThrow({ _ = try I2PTunnelBuildCrypto.decryptRecord(tampered, localEncryptionKey: hopKey, recordIndex: 3) }) else {
             throw I2PCrossValidationError.unexpectedSuccess
         }
-        return "\(wire.count)-byte record box round trips; wrong index, wrong key and tampered bytes rejected"
+        // A record addressed to another router hash is not opened.
+        let hopHash = I2PCrypto.randomBytes(32)
+        let addressed = try I2PTunnelBuildCrypto.encryptRecordWithMaterial(
+            plaintext, to: hopKey.publicKey.rawRepresentation, hopHash: hopHash, recordIndex: 0).wire
+        guard expectThrow({ _ = try I2PTunnelBuildCrypto.decryptRecordWithMaterial(
+            addressed, localEncryptionKey: hopKey,
+            localRouterHash: I2PCrypto.randomBytes(32), recordIndex: 0) }) else {
+            throw I2PCrossValidationError.unexpectedSuccess
+        }
+        return "\(wire.count)-byte short record box round trips; wrong key, wrong hop and tampered bytes rejected"
     }
 
     private static func buildReplyRecordRoundTrip() throws -> String {
-        let replyKey = I2PCrypto.randomBytes(32)
-        let replyIV = I2PCrypto.randomBytes(16)
-        let messageID: UInt32 = 0x00FE_ED02
+        let hopKey = Curve25519.KeyAgreement.PrivateKey()
+        let encrypted = try I2PTunnelBuildCrypto.encryptRecordWithMaterial(
+            sampleRecord(hop: 0, pathEnd: true, originator: false, more: false).serialize(),
+            to: hopKey.publicKey.rawRepresentation, hopHash: nil, recordIndex: 3)
         // Return codes across the transient/permanent boundary round trip faithfully.
         for code in [UInt8(0), 1, 29, 30, 255] {
             let wire = try I2PTunnelBuildCrypto.encryptReplyRecord(
                 I2PTunnelBuildReplyRecord(receiveTunnelID: 0x1122_3344, returnCode: code),
-                replyKey: replyKey, replyIV: replyIV, messageID: messageID)
-            guard wire.count == 21 else { throw I2PWireError.invalidFormat }
-            let parsed = try I2PTunnelBuildCrypto.decryptReplyRecord(wire, replyKey: replyKey,
-                                                                     replyIV: replyIV, messageID: messageID)
-            guard parsed.receiveTunnelID == 0x1122_3344, parsed.returnCode == code else {
+                material: encrypted.material, recordIndex: 3)
+            guard wire.count == I2PTunnelBuildReply.encryptedRecordLength else { throw I2PWireError.invalidFormat }
+            let parsed = try I2PTunnelBuildCrypto.decryptReplyRecord(
+                wire, material: encrypted.material, recordIndex: 3)
+            guard parsed.returnCode == code else {
                 throw I2PWireError.invalidFormat
             }
         }
-        // The message ID is bound as AAD: a mismatched ID fails authentication.
+        // Another hop's material and a different record index both fail.
+        let otherKey = Curve25519.KeyAgreement.PrivateKey()
+        let other = try I2PTunnelBuildCrypto.encryptRecordWithMaterial(
+            sampleRecord(hop: 1, pathEnd: false, originator: false, more: true).serialize(),
+            to: otherKey.publicKey.rawRepresentation, hopHash: nil, recordIndex: 4)
         let wire = try I2PTunnelBuildCrypto.encryptReplyRecord(
             I2PTunnelBuildReplyRecord(receiveTunnelID: 1, returnCode: 0),
-            replyKey: replyKey, replyIV: replyIV, messageID: messageID)
-        guard expectThrow({ _ = try I2PTunnelBuildCrypto.decryptReplyRecord(wire, replyKey: replyKey,
-                                                                        replyIV: replyIV, messageID: messageID &+ 1) }) else {
+            material: encrypted.material, recordIndex: 3)
+        guard expectThrow({ _ = try I2PTunnelBuildCrypto.decryptReplyRecord(
+            wire, material: other.material, recordIndex: 3) }),
+              expectThrow({ _ = try I2PTunnelBuildCrypto.decryptReplyRecord(
+            wire, material: encrypted.material, recordIndex: 4) }) else {
             throw I2PCrossValidationError.unexpectedSuccess
         }
-        return "reply records round trip across the return-code spectrum; message-ID AAD enforced"
+        return "reply records round trip across the return-code spectrum; wrong hop and record index rejected"
     }
 
     // MARK: Tunnel data layering
@@ -1838,7 +2193,12 @@ enum I2PCrossValidation {
                                createdAt: Date(), expiresAt: Date().addingTimeInterval(600),
                                buildLatency: nil)
         let inner = I2NPMessage(type: .dataMessage, payload: I2PCrypto.randomBytes(280))
-        var current = try I2PTunnelDataProcessor.preprocess(inner.serialize(), via: tunnel)
+        // The message-path end delivers its payload under the gateway ID the
+        // originator addressed, which is independent of the tunnel's own
+        // gateway hop ID — pass it explicitly rather than let preprocess
+        // default to the gateway tunnel ID.
+        var current = try I2PTunnelDataProcessor.preprocess(inner.serialize(), via: tunnel,
+                                                            gatewayID: gatewayID)
         guard current.tunnelID == receiveIDs[0],
               current.body.count == I2PTunnelDataPayload.bodySize else {
             throw I2PWireError.invalidFormat
@@ -2019,6 +2379,182 @@ enum I2PCrossValidation {
         return "entry lifetime = routerInfoLifetime (\(Int(I2PNetworkDatabase.routerInfoLifetime))s) from ingest; prune drops it exactly at expiry"
     }
 
+    // MARK: NetDB — SU3 reseed container
+
+    /// Builds a spec-shaped SU3 container: the 40-byte header, version, signer
+    /// ID, content, then an Ed25519 signature over the whole prefix (header
+    /// included), which is what SU3File signs.
+    private static func makeSU3Container(signerID: String, content: Data, seed: Data,
+                                         signatureType: I2PSU3SignatureType,
+                                         version: String = "0.9.62") throws -> Data {
+        guard signatureType == .ed25519 else {
+            throw I2PWireError.unsupportedAlgorithm
+        }
+        let versionBytes = Array(version.utf8)
+        let signerBytes = Array(signerID.utf8)
+        let versionLength = max(16, versionBytes.count)
+        guard versionLength <= 255, !signerBytes.isEmpty, signerBytes.count <= 255 else {
+            throw I2PWireError.invalidFormat
+        }
+        var writer = I2PWriter()
+        writer.raw(Data(Array("I2Psu3".utf8)))        // magic
+        writer.byte(0)                                // unused
+        writer.byte(0)                                // file format version
+        writer.short(signatureType.rawValue)          // signature type
+        writer.short(UInt16(signatureType.signatureLength))
+        writer.byte(0)                                // unused
+        writer.byte(UInt8(versionLength))
+        writer.byte(0)                                // unused
+        writer.byte(UInt8(signerBytes.count))
+        writer.long(UInt64(content.count))            // content length
+        writer.byte(0)                                // unused
+        writer.byte(0)                                // file type: zip
+        writer.byte(0)                                // unused
+        writer.byte(3)                                // content type: reseed data
+        writer.raw(Data(repeating: 0, count: 12))     // reserved
+        writer.raw(Data(versionBytes))
+        if versionBytes.count < versionLength {
+            writer.raw(Data(repeating: 0, count: versionLength - versionBytes.count))
+        }
+        writer.raw(Data(signerBytes))
+        writer.raw(content)
+        let region = writer.data
+        let signature = try I2PCrypto.ed25519Sign(signatureType.digest(region), seed: seed)
+        writer.raw(signature)
+        return writer.data
+    }
+
+    /// True when the container is rejected, either at parse or at verification.
+    private static func su3Rejected(_ data: Data, trust: I2PSU3TrustStore) -> Bool {
+        guard let parsed = try? I2PSU3Container.parse(data) else { return true }
+        do {
+            try parsed.verify(using: trust)
+            return false
+        } catch {
+            return true
+        }
+    }
+
+    private static func su3ContainerSignature() throws -> String {
+        let seed = I2PCrypto.generateEd25519Seed()
+        let publicKey = I2PCrypto.ed25519PublicKey(fromSeed: seed)
+        let signerID = "cross-validation_at_mail.i2p"
+        let content = Data((0..<517).map { UInt8($0 & 0xff) })
+        let container = try makeSU3Container(signerID: signerID, content: content,
+                                             seed: seed, signatureType: .ed25519)
+        let trust = I2PSU3TrustStore(signers: [
+            I2PSU3Signer(id: signerID, keyMaterial: .ed25519PublicKey(publicKey))
+        ])
+
+        let parsed = try I2PSU3Container.parse(container)
+        guard parsed.signerID == signerID,
+              parsed.version == "0.9.62",
+              parsed.fileType == 0,
+              parsed.contentType == 3,
+              parsed.signatureType == .ed25519,
+              parsed.content == content,
+              parsed.signature.count == 64,
+              parsed.signedRegion.count == container.count - 64 else {
+            throw I2PWireError.invalidFormat
+        }
+        try parsed.verify(using: trust)
+
+        // The signature covers the header, the signer ID and the content: a
+        // single flipped byte in any of them must reject the container.
+        var tamperedVersion = container
+        tamperedVersion[I2PSU3Container.headerLength + 1] ^= 0x01
+        var tamperedContent = container
+        tamperedContent[container.count - 65] ^= 0x01
+        var tamperedSignature = container
+        tamperedSignature[container.count - 1] ^= 0x01
+        guard su3Rejected(tamperedVersion, trust: trust),
+              su3Rejected(tamperedContent, trust: trust),
+              su3Rejected(tamperedSignature, trust: trust) else {
+            throw I2PWireError.invalidSignature
+        }
+
+        // Structural rejections: magic, declared signature length, truncation
+        // (named as a truncated transfer so the reseed retries it) and data
+        // trailing the signature.
+        var badMagic = container
+        badMagic[0] = 0x00
+        guard (try? I2PSU3Container.parse(badMagic)) == nil else {
+            throw I2PWireError.invalidFormat
+        }
+        var badSignatureLength = container
+        badSignatureLength[11] = 0x20 // 32 bytes declared for a 64-byte type
+        guard (try? I2PSU3Container.parse(badSignatureLength)) == nil else {
+            throw I2PWireError.invalidFormat
+        }
+        let truncated = Data(container.dropLast())
+        do {
+            _ = try I2PSU3Container.parse(truncated)
+            throw I2PWireError.invalidFormat
+        } catch let error as I2PSU3Error {
+            guard String(describing: error).contains("truncated transfer") else {
+                throw I2PWireError.invalidFormat
+            }
+        }
+        guard (try? I2PSU3Container.parse(container + Data([0x00]))) == nil else {
+            throw I2PWireError.invalidFormat
+        }
+
+        return "\(container.count)-byte container: header field-exact, 64-byte Ed25519 signature verified over the \(parsed.signedRegion.count)-byte prefix; header, content, signature, magic, length, truncation and trailing-data tamps rejected"
+    }
+
+    private static func su3SignerTrust() throws -> String {
+        let bundled = I2PSU3TrustStore.bundled
+        guard !bundled.signerIDs.isEmpty else {
+            throw I2PCrossValidationError.failed(
+                "no bundled reseed certificates found in the app bundle (Resources/reseed-certs)")
+        }
+        // The certificate files are named in the "_at_" form; the header of a
+        // real container names the same signer in mail form.
+        guard bundled.signer(id: "reseed@diva.exchange") != nil else {
+            throw I2PCrossValidationError.failed(
+                "bundled reseed signer set is missing reseed@diva.exchange (found \(bundled.signerIDs.count) signers)")
+        }
+        // PEM bodies decode to DER; raw DER passes through.
+        let pem = "-----BEGIN CERTIFICATE-----\n"
+            + Data(repeating: 0x30, count: 40).base64EncodedString()
+            + "\n-----END CERTIFICATE-----\n"
+        guard I2PSU3BundledReseedSigners.derBytes(from: Data(pem.utf8))?.first == 0x30 else {
+            throw I2PWireError.invalidFormat
+        }
+
+        // A genuinely signed container whose signer we do not trust must fail
+        // closed even though the signature itself is good.
+        let seed = I2PCrypto.generateEd25519Seed()
+        let publicKey = I2PCrypto.ed25519PublicKey(fromSeed: seed)
+        let signerID = "unbundled-signer_at_mail.i2p"
+        let container = try makeSU3Container(signerID: signerID,
+                                             content: Data("reseed-archive".utf8),
+                                             seed: seed, signatureType: .ed25519)
+        let parsed = try I2PSU3Container.parse(container)
+        let ownTrust = I2PSU3TrustStore(signers: [
+            I2PSU3Signer(id: signerID, keyMaterial: .ed25519PublicKey(publicKey))
+        ])
+        try parsed.verify(using: ownTrust)
+        do {
+            try parsed.verify(using: bundled)
+            throw I2PCrossValidationError.failed(
+                "an unbundled SU3 signer verified against the bundled trust store")
+        } catch is I2PSU3Error {
+            // expected: unknown signer
+        }
+        // Known signer ID, wrong key: the signature must reject.
+        let wrongKey = I2PCrypto.ed25519PublicKey(fromSeed: I2PCrypto.generateEd25519Seed())
+        let wrongTrust = I2PSU3TrustStore(signers: [
+            I2PSU3Signer(id: signerID, keyMaterial: .ed25519PublicKey(wrongKey))
+        ])
+        guard su3Rejected(container, trust: wrongTrust),
+              su3Rejected(container, trust: I2PSU3TrustStore(signers: [])) else {
+            throw I2PWireError.invalidSignature
+        }
+
+        return "\(bundled.signerIDs.count) bundled reseed signers loaded from Resources/reseed-certs; mail-form signer IDs resolve; unknown signer and wrong-key signatures rejected"
+    }
+
     // MARK: Garlic
 
     /// The ECIES-X25519 three-section envelope and tag-based continuation
@@ -2060,8 +2596,7 @@ enum I2PCrossValidation {
 
     private static func garlicCloveRoundTrip() throws -> String {
         let instructions = I2PDeliveryInstructions(mode: .tunnel, tunnelID: 0x0000_55AA,
-                                                   routerHash: I2PCrypto.randomBytes(32),
-                                                   delayMilliseconds: nil)
+                                                   routerHash: I2PCrypto.randomBytes(32))
         let message = I2NPMessage(type: .deliveryStatus, messageID: 42,
                                   payload: Data("clove payload".utf8))
         let clove = I2PGarlicClove(deliveryInstructions: instructions, message: message)
@@ -2072,15 +2607,6 @@ enum I2PCrossValidation {
             throw I2PWireError.invalidFormat
         }
         guard try parsed.serialize() == blockBody else { throw I2PWireError.invalidFormat }
-        // A delay-flagged instruction round-trips through the flag-byte format too.
-        let delayed = I2PDeliveryInstructions(mode: .local, tunnelID: nil,
-                                              routerHash: nil, delayMilliseconds: 4000)
-        let delayedBody = try I2PGarlicClove(
-            deliveryInstructions: delayed,
-            message: I2NPMessage(type: .dataMessage, payload: Data("x".utf8))).serialize()
-        let delayedParsed = try I2PGarlicClove.parse(delayedBody)
-        guard delayedParsed.deliveryInstructions.delayMilliseconds == 4000,
-              try delayedParsed.serialize() == delayedBody else { throw I2PWireError.invalidFormat }
         return "cloves (garlic flag-byte delivery instructions + I2NP message) round-trip byte-for-byte"
     }
 
@@ -2149,7 +2675,10 @@ enum I2PCrossValidation {
                                                           senderStatic: senderStatic)
         let ephemeralPublic = Data(envelope.prefix(32))
         let h0 = I2PCrypto.sha256(Data(I2PGarlicCrypto.protocolName.utf8))
-        let es = try senderStatic.sharedSecretFromKeyAgreement(
+        // `es` is the ephemeral × receiver-static agreement (the sender static
+        // key does not enter this section's KDF); derive it from the receiver's
+        // side, exactly as the opening side does.
+        let es = try aliceKey.sharedSecretFromKeyAgreement(
             with: Curve25519.KeyAgreement.PublicKey(rawRepresentation: ephemeralPublic))
         let temp = Data(HMAC<SHA256>.authenticationCode(for: es.withUnsafeBytes { Data($0) },
                                                         using: SymmetricKey(data: h0)))
@@ -2157,9 +2686,10 @@ enum I2PCrossValidation {
                                                        using: SymmetricKey(data: temp)))
         let staticSectionKey = Data(HMAC<SHA256>.authenticationCode(for: ck1,
                                                                     using: SymmetricKey(data: temp)))
-        let staticPlain = try ChaChaPoly.open(
-            try ChaChaPoly.SealedBox(combined: envelope.subdata(in: 32..<80)),
-            using: SymmetricKey(data: staticSectionKey))
+        let staticPlain = try I2PCrypto.chacha20Poly1305Open(
+            key: staticSectionKey,
+            nonce: I2PGarlicCrypto.zeroNonce,
+            ciphertextAndTag: envelope.subdata(in: 32..<80))
         guard staticPlain == senderStatic.publicKey.rawRepresentation else {
             throw I2PWireError.invalidFormat
         }
@@ -2189,8 +2719,7 @@ enum I2PCrossValidation {
     private static func garlicBlocksRoundTrip() throws -> String {
         let date = Date(timeIntervalSince1970: 1_800_000_123)
         let delivery = I2PDeliveryInstructions(mode: .tunnel, tunnelID: 0x0102_0304,
-                                               routerHash: I2PCrypto.randomBytes(32),
-                                               delayMilliseconds: 250)
+                                               routerHash: I2PCrypto.randomBytes(32))
         let message = I2NPMessage(type: .dataMessage, payload: I2PCrypto.randomBytes(60))
         let seed = I2PCrypto.randomBytes(32)
         let blocks: [I2PGarlicBlock] = [
@@ -2210,7 +2739,6 @@ enum I2PCrossValidation {
         }
         guard case .i2np(let deliveryBack, let messageBack) = decoded[1],
               deliveryBack.mode == .tunnel, deliveryBack.tunnelID == 0x0102_0304,
-              deliveryBack.delayMilliseconds == 250,
               messageBack.serialize() == message.serialize() else {
             throw I2PWireError.invalidFormat
         }
@@ -2254,10 +2782,14 @@ enum I2PCrossValidation {
         // Four tag-based sends consume the set in order; each decrypts with
         // its own ratcheted key.
         for index in 0..<4 {
+            let messageID = UInt32(index + 0x00D1_0010)
             let envelope = try bob.wrapCloveSet(
-                try sampleCloveSet(messageID: UInt32(index + 0x00D1_0010)).serialize())
-            let set = try alice.unwrapPayload(envelope)
-            guard set.messageID == UInt32(index + 0x00D1_0010) else {
+                try sampleCloveSet(messageID: messageID).serialize())
+            // The clove set's message ID rides the wrapping GarlicMessage's I2NP
+            // header, so the receiver is told it rather than parsing it from the
+            // payload blocks.
+            let set = try alice.unwrapPayload(envelope, messageID: messageID)
+            guard set.messageID == messageID else {
                 throw I2PWireError.invalidFormat
             }
         }
@@ -2300,9 +2832,10 @@ enum I2PCrossValidation {
               parsed.sourceConnectionID == src, parsed.token == Data(repeating: 0x5A, count: 8) else {
             throw SSU2Error.invalidHeader
         }
-        // Version and network ID validation.
+        // Version and network ID validation. Long-form versions are 2 (classical)
+        // and 3/4 (the ML-KEM hybrids); anything else must fail closed.
         var bad = bytes
-        bad[13] = 3
+        bad[13] = 5
         guard expectThrow({ _ = try SSU2PacketHeader.parse(Data(bad)) }) else {
             throw I2PCrossValidationError.unexpectedSuccess
         }
@@ -2381,16 +2914,22 @@ enum I2PCrossValidation {
     private static func ssu2TokenManagement() throws -> String {
         let manager = SSU2TokenManager(tokenLifetime: 600, maxRequestsPerWindow: 3, requestWindow: 60)
         let requester = Data(repeating: 7, count: 8)
-        guard let token = manager.issue(for: requester), token.count == 8,
-              manager.validate(token, for: requester) else { throw SSU2Error.invalidToken }
-        guard !manager.validate(token, for: requester, now: Date().addingTimeInterval(700)) else {
-            throw SSU2Error.testFailed("expired token accepted")
+        // One fixed clock for the whole case: validating an expired token prunes
+        // the request window, so mixing simulated-future and wall-clock calls
+        // would reset the rate-limit budget the case is about to check.
+        let now = Date()
+        guard let token = manager.issue(for: requester, now: now), token.count == 8,
+              manager.validate(token, for: requester, now: now) else { throw SSU2Error.invalidToken }
+        _ = manager.issue(for: requester, now: now)
+        _ = manager.issue(for: requester, now: now)
+        guard manager.issue(for: requester, now: now) == nil else {
+            throw SSU2Error.testFailed("rate limit not enforced")
         }
-        _ = manager.issue(for: requester)
-        _ = manager.issue(for: requester)
-        guard manager.issue(for: requester) == nil else { throw SSU2Error.testFailed("rate limit not enforced") }
-        guard manager.issue(for: Data(repeating: 8, count: 8)) != nil else {
+        guard manager.issue(for: Data(repeating: 8, count: 8), now: now) != nil else {
             throw SSU2Error.testFailed("rate limit leaked across requesters")
+        }
+        guard !manager.validate(token, for: requester, now: now.addingTimeInterval(700)) else {
+            throw SSU2Error.testFailed("expired token accepted")
         }
         return "8-byte tokens bound to the requester, expiring and rate-limited per window"
     }
@@ -2486,7 +3025,15 @@ enum I2PCrossValidation {
                                                    destinationConnectionID: SSU2PacketHeader.randomConnectionID(),
                                                    sourceConnectionID: SSU2PacketHeader.randomConnectionID(),
                                                    introKey: relayEntry.introductionKey)
-        guard punch[12] == SSU2MessageType.holePunch.rawValue else { throw SSU2Error.invalidPacket }
+        // The header is protected on the wire, so read the type back through
+        // the same unmasking the receiver performs.
+        var unmarked = Data(punch)
+        try SSU2HeaderProtection.unmaskHeader(&unmarked, phase: .holePunch,
+                                              introKey: relayEntry.introductionKey)
+        guard let punchHeader = try? SSU2PacketHeader.parse(unmarked),
+              punchHeader.type == .holePunch, punchHeader.isLong else {
+            throw SSU2Error.invalidPacket
+        }
         let receiving = SSU2RelayCoordinator()
         guard try receiving.handleHolePunch(punch, introKey: relayEntry.introductionKey) == 0x5150,
               receiving.phase == .completed else {
@@ -2521,6 +3068,8 @@ enum I2PCrossValidation {
         I2PSSU2SelfTest.pumpBoth(alice, bob)
         guard bob.state == .closed else { throw SSU2Error.testFailed("peer did not close") }
         guard alice.state == .terminating else { throw SSU2Error.testFailed("terminator state") }
+        // Three whole-packet retransmissions are allowed; the fourth is refused.
+        try alice.retransmitTermination()
         try alice.retransmitTermination()
         try alice.retransmitTermination()
         guard expectThrow({ try alice.retransmitTermination() }) else {

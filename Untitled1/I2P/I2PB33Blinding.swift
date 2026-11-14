@@ -25,8 +25,9 @@
 //
 //  Encrypted body (the type-3 payload's opaque body) — authentication section
 //  then encrypted data section:
-//    authType (1: 0 none / 1 DH client auth / 3 PSK client auth)
+//    authType (1: 0 none / 1 DH client auth / 3 PSK client auth / 2 mixed)
 //    if != 0: sectionSalt (32) + clientCount (1) + per client:
+//        clientKind (1: 1 DH / 3 PSK)
 //        clientID (8)  = SHA256(authKey)[0..<8]
 //        clientDataLength (2 BE) + clientData:
 //            type 1: authEphemeralPublicKey (32) + ChaChaPoly box of the PSK
@@ -129,10 +130,10 @@ enum I2PB33Blinding {
         let blindedScalar = Data(Ed25519Scalar.limbsToBytes(
             Ed25519Scalar.reduceModL(Ed25519Scalar.mulWide(alphaLimbs, kLimbs))))
 
-        // Envelope destination: blinded signing key + the real ECIES key for keying.
-        let envelopeDestination = I2PKeysAndCert(
-            encryptionPublicKey: encryptionPublicKey,
-            signingPublicKey: blindedPublicKey)
+        // Envelope identity: an EncryptedLeaseSet carries only the blinded
+        // signing key (no destination), so the blinded netdb key is derived from
+        // that key alone — the same canonical destination the parser rebuilds.
+        let envelopeDestination = I2PLeaseSet2.blindedDestination(blindedPublicKey)
         return BlindedKey(
             blindedPublicKey: blindedPublicKey,
             blindedSigningScalar: blindedScalar,
@@ -243,21 +244,27 @@ enum I2PB33Blinding {
             throw I2PWireError.invalidFormat
         }
         var w = I2PWriter()
-        let sectionSalt = I2PCrypto.randomBytes(32)
+        // An unauthenticated publication uses the all-zero section salt: the
+        // reader cannot learn a random salt it never receives, and the body key
+        // is already keyed by a fresh ephemeral DH (the truth table's rule).
+        var sectionSalt = Data(repeating: 0, count: 32)
         if authClients.isEmpty {
             w.byte(0)
         } else {
+            sectionSalt = I2PCrypto.randomBytes(32)
             let kinds = Set(authClients.map(\.kind))
-            guard kinds.count == 1, let kind = kinds.first else {
-                throw I2PWireError.invalidFormat // one auth scheme per publication
-            }
-            w.byte(kind.rawValue)
+            // Section marker: 1 = every client authorized by DH, 3 = every client
+            // by PSK, 2 = mixed. Each client entry carries its own kind byte so a
+            // mixed publication resolves for both credential holders.
+            let marker: UInt8 = kinds.count == 1 ? (kinds.first?.rawValue ?? 0) : 2
+            w.byte(marker)
             w.hash(sectionSalt)
             w.byte(UInt8(authClients.count))
             for client in authClients {
                 guard client.psk.count == 32 else { throw I2PWireError.invalidFormat }
+                w.byte(client.kind.rawValue)
                 let authKey: Data
-                switch kind {
+                switch client.kind {
                 case .dh:
                     guard client.clientPublicKey.count == 32 else { throw I2PWireError.invalidFormat }
                     let ephemeral = I2PCrypto.generateX25519KeyPair()
@@ -265,7 +272,8 @@ enum I2PB33Blinding {
                         inputKeyMaterial: try I2PCrypto.x25519SharedSecret(
                             privateKey: ephemeral.privateKey, peerPublicKey: client.clientPublicKey),
                         salt: sectionSalt, info: els2AuthInfo, outputLength: 32)
-                    w.hash(clientID(authKey: authKey))
+                    // The client ID is the 8-byte auth-key digest, not a 32-byte hash.
+                    w.raw(clientID(authKey: authKey))
                     var clientData = ephemeral.publicKey
                     clientData.append(try I2PCrypto.chacha20Poly1305Seal(
                         key: authKey, nonce: zeroNonce, plaintext: client.psk, aad: aadZero))
@@ -275,7 +283,7 @@ enum I2PB33Blinding {
                     authKey = I2PCrypto.hkdfSHA256(
                         inputKeyMaterial: client.psk, salt: sectionSalt,
                         info: els2AuthInfo, outputLength: 32)
-                    w.hash(clientID(authKey: authKey))
+                    w.raw(clientID(authKey: authKey))
                     w.short(0) // authorization rides the clientID match
                 }
             }
@@ -308,17 +316,22 @@ enum I2PB33Blinding {
         let authType = try r.byte()
         var sectionSalt = Data(repeating: 0, count: 32)
         if authType != 0 {
+            // 1/3 = one scheme for every client, 2 = mixed per-client kinds.
+            guard authType == 1 || authType == 2 || authType == 3 else {
+                throw I2PWireError.unsupportedAlgorithm
+            }
             sectionSalt = try r.hash()
             let clientCount = Int(try r.byte())
             guard clientCount >= 1, clientCount <= 16 else { throw I2PWireError.invalidFormat }
             var authorized = false
             for _ in 0..<clientCount {
+                let entryKind = try r.byte()
                 let entryClientID = try r.raw(8)
                 let clientDataLength = Int(try r.short())
                 let clientData = try r.raw(clientDataLength)
                 guard !authorized else { continue }
-                switch authType {
-                case 1:
+                switch entryKind {
+                case I2PELS2AuthClient.Kind.dh.rawValue:
                     guard clientData.count >= 32 + 16 else { throw I2PWireError.invalidFormat }
                     let authEphemeral = Data(clientData.prefix(32))
                     let box = Data(clientData.dropFirst(32))
@@ -335,7 +348,7 @@ enum I2PB33Blinding {
                         authorized = true
                         break
                     }
-                case 3:
+                case I2PELS2AuthClient.Kind.psk.rawValue:
                     for psk in credentials.clientPSKs {
                         let authKey = I2PCrypto.hkdfSHA256(
                             inputKeyMaterial: psk, salt: sectionSalt,
@@ -403,8 +416,7 @@ enum I2PB33Blinding {
             noncePrefix: I2PCrypto.randomBytes(32)) else {
             throw I2PWireError.invalidFormat
         }
-        envelope.signature = signature
-        envelope.raw = envelope.raw.dropLast(64) + signature
+        envelope.replaceSignature(signature)
         return envelope
     }
 }
@@ -420,7 +432,7 @@ extension I2PLeaseSet2 {
             throw I2PWireError.invalidFormat
         }
         let innerPayload = try I2PB33Blinding.openEncryptedBody(encryptedBody, credentials: credentials)
-        return try I2PLeaseSet2.parse(innerPayload, expectedType: I2PLeaseSet2Type.plain.rawValue)
+        return try I2PLeaseSet2.parse(innerPayload, expectedType: .plain)
     }
 }
 
@@ -514,7 +526,7 @@ enum I2PB33BlindingSelfTest {
             let envelope = try I2PB33Blinding.buildEncryptedLeaseSet2(
                 inner: inner, credentials: credentials)
             let reparsed = try I2PLeaseSet2.parse(envelope.serialize(),
-                                                  expectedType: I2PLeaseSet2Type.encrypted.rawValue)
+                                                  expectedType: .encrypted)
             // The envelope lives under the blinded netdb key and is signed by
             // the blinded private key.
             let blinded = try I2PB33Blinding.blind(
@@ -550,11 +562,15 @@ enum I2PB33BlindingSelfTest {
                 expiresOffsetSeconds: reparsed.expiresOffsetSeconds,
                 flags: reparsed.flags,
                 offlineSignature: reparsed.offlineSignature,
-                leases: [],
+                options: reparsed.options,
+                leases: reparsed.leases,
+                encryptionKeys: reparsed.encryptionKeys,
                 encryptedBody: tamperedBody,
-                metaEntries: [],
+                blindedSigningPublicKey: reparsed.blindedSigningPublicKey,
+                metaEntries: reparsed.metaEntries,
+                revocations: reparsed.revocations,
                 signature: reparsed.signature,
-                raw: Data())
+                raw: reparsed.raw)
             guard (try? tamperedEnvelope.resolveEncryptedBody(credentials: credentials)) == nil else {
                 throw I2PWireError.invalidSignature
             }
@@ -578,7 +594,7 @@ enum I2PB33BlindingSelfTest {
                     I2PELS2AuthClient(kind: .psk, clientPublicKey: Data(), psk: psk),
                 ])
             let reparsed = try I2PLeaseSet2.parse(envelope.serialize(),
-                                                  expectedType: I2PLeaseSet2Type.encrypted.rawValue)
+                                                  expectedType: .encrypted)
             // The DH client resolves with its ECIES private key.
             var dhCredentials = credentials
             dhCredentials.clientECIESPrivateKeys = [dhClient.privateKey]
@@ -689,10 +705,10 @@ enum I2PB33BlindingSelfTest {
             leases: [
                 I2PLease2(gatewayHash: I2PCrypto.sha256(Data("b33-gateway-1".utf8)),
                           tunnelId: 0x1122_3344,
-                          expiration: Date().addingTimeInterval(600), cost: 3),
+                          expiration: Date().addingTimeInterval(600)),
                 I2PLease2(gatewayHash: I2PCrypto.sha256(Data("b33-gateway-2".utf8)),
                           tunnelId: 0x5566_7788,
-                          expiration: Date().addingTimeInterval(700), cost: 5),
+                          expiration: Date().addingTimeInterval(700)),
             ],
             signingSeed: seed)
     }

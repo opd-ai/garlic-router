@@ -66,9 +66,19 @@ enum I2PNTCP2SelfTest {
     ) {
         let aliceStatic = Curve25519.KeyAgreement.PrivateKey()
         let bobStatic = Curve25519.KeyAgreement.PrivateKey()
+        // The responder's router hash keys the AES-CBC obfuscation and its
+        // published `i` option supplies the IV.
+        let bobHash = I2PCrypto.randomBytes(32)
+        let bobIV = I2PCrypto.randomBytes(16)
+        let bobStaticPublic = I2PCrypto.canonicalX25519PublicKey(bobStatic.publicKey.rawRepresentation)
         let initiator = try NTCP2InitiatorHandshake(localStaticKey: aliceStatic,
-                                                    remoteStaticKey: bobStatic.publicKey.rawRepresentation)
-        let responder = NTCP2ResponderHandshake(localStaticKey: bobStatic)
+                                                    remoteStaticKey: bobStaticPublic,
+                                                    remoteRouterHash: bobHash,
+                                                    remoteIV: bobIV)
+        let responder = try NTCP2ResponderHandshake(localStaticKey: bobStatic,
+                                                    localStaticPublicKey: bobStaticPublic,
+                                                    localRouterHash: bobHash,
+                                                    localIV: bobIV)
         let request = try initiator.makeSessionRequest(routerInfo: riA.serialize(), padding: 13)
         let created = try responder.processSessionRequest(request, padding: 7)
         guard created.consumed == request.count else {
@@ -93,7 +103,7 @@ enum I2PNTCP2SelfTest {
         let bobKeys = try responder.complete()
         guard aliceKeys.sendKeys.aeadKey == bobKeys.recvKeys.aeadKey,
               aliceKeys.recvKeys.aeadKey == bobKeys.sendKeys.aeadKey,
-              aliceKeys.sendKeys.sipKey == bobKeys.recvKeys.sipKey else {
+              aliceKeys.sendKeys.sipKeys == bobKeys.recvKeys.sipKeys else {
             throw NTCP2Error.handshakeFailed("direction keys disagree")
         }
         guard responder.remoteRouterInfo == riA.serialize() else {
@@ -113,11 +123,15 @@ enum I2PNTCP2SelfTest {
         var rx = NTCP2FrameCodec(directionKeys: bobKeys.recvKeys)
 
         let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
+        let options = NTCP2Options(transmitMin: 0x01, transmitMax: 0x10,
+                                   receiveMin: 0x00, receiveMax: 0x20,
+                                   transmitDummy: 25, receiveDummy: 40,
+                                   transmitDelay: 5, receiveDelay: 7)
         let blocks: [NTCP2Block] = [
             .data(Data("i2np payload".utf8)),
-            .options(["ntcp2": "1"]),
+            .options(options),
             .time(timestamp),
-            .termination(reason: 0, validTime: Date(timeIntervalSince1970: 1_700_000_100)),
+            .termination(reason: 0, validFrames: 3),
         ]
         var wire = Data()
         wire += try tx.frame(NTCP2Block.aligned(try NTCP2Block.encode(blocks)))
@@ -135,9 +149,9 @@ enum I2PNTCP2SelfTest {
         }
         guard decodedSets.count == 3 else { throw NTCP2Error.invalidFrame }
         guard case .data(let first) = decodedSets[0][0], first == Data("i2np payload".utf8),
-              case .options(let mapping) = decodedSets[0][1], mapping["ntcp2"] == "1",
-              case .time(let time) = decodedSets[0][2], abs(time.timeIntervalSince(timestamp)) < 0.01,
-              case .termination(let reason, _) = decodedSets[0][3], reason == 0,
+              case .options(let decodedOptions) = decodedSets[0][1], decodedOptions == options,
+              case .time(let time) = decodedSets[0][2], abs(time.timeIntervalSince(timestamp)) < 1,
+              case .termination(let reason, let frames) = decodedSets[0][3], reason == 0, frames == 3,
               case .data(let second) = decodedSets[1][0], second == Data(repeating: 0xAB, count: 200) else {
             throw NTCP2Error.invalidBlock
         }
@@ -207,7 +221,10 @@ enum I2PNTCP2SelfTest {
             throw NTCP2Error.handshakeFailed("listener port unavailable")
         }
 
-        transportB.connect(host: "127.0.0.1", port: port, remoteStaticKey: staticKeyA.publicKey.rawRepresentation)
+        transportB.connect(host: "127.0.0.1", port: port,
+                           remoteRouterHash: riA.identity.hash,
+                           remoteStaticKey: staticKeyA.publicKey.rawRepresentation,
+                           remoteIV: ivA)
 
         try await waitUntil({ collectorB.establishedCount >= 1 && collectorA.establishedCount >= 1 },
                             timeout: 10, "handshake")
@@ -221,7 +238,10 @@ enum I2PNTCP2SelfTest {
 
         // Second concurrent peer session against the same listener.
         let riC = try makeSignedRouterInfo()
-        transportB.connect(host: "127.0.0.1", port: port, remoteStaticKey: staticKeyA.publicKey.rawRepresentation)
+        transportB.connect(host: "127.0.0.1", port: port,
+                           remoteRouterHash: riA.identity.hash,
+                           remoteStaticKey: staticKeyA.publicKey.rawRepresentation,
+                           remoteIV: ivA)
         _ = riC
         try await waitUntil({ transportA.sessionCount() >= 2 }, timeout: 10, "second session")
 

@@ -56,6 +56,10 @@ struct ContentView: View {
                 .tabItem {
                     Label("Alignment", systemImage: "checkmark.seal")
                 }
+            StrategyView()
+                .tabItem {
+                    Label("Roadmap", systemImage: "map")
+                }
         }
         .tint(accent)
         .preferredColorScheme(.dark)

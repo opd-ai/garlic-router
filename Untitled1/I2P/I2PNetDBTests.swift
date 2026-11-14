@@ -9,6 +9,13 @@
 import Foundation
 
 enum I2PNetDBSelfTest {
+    /// Named failure so a self-test row reports which assertion broke instead
+    /// of a bare `invalidFormat`.
+    private struct Failure: Error, CustomStringConvertible {
+        let description: String
+        init(_ description: String) { self.description = description }
+    }
+
     static func runAll() async -> [I2PSelfTestResult] {
         var results: [I2PSelfTestResult] = []
         func run(_ name: String, _ body: () async throws -> String) async {
@@ -21,6 +28,8 @@ enum I2PNetDBSelfTest {
         }
 
         await run("NetDB store→lookup across floodfills") { try await testStoreLookup() }
+        await run("NetDB lookup not blocked by an unreachable floodfill") { try await testUnreachableFloodfillLookup() }
+        await run("NetDB lookup reaches a live floodfill beyond the closest set") { try await testReachableBeyondClosest() }
         await run("NetDB floodfill replication gossip") { try await testReplicationGossip() }
         await run("NetDB accepts verified entries only") { try await testRejectsUnverified() }
         await run("NetDB expiration & pruning") { try await testExpiration() }
@@ -30,6 +39,40 @@ enum I2PNetDBSelfTest {
     }
 
     // MARK: Test harness
+
+    /// A loopback transport that only delivers to an allowed set of peers; sends
+    /// to every other hash are dropped, modeling floodfills we cannot reach.
+    private final class SelectiveTransport: I2PNetDBTransport {
+        private unowned let hub: I2PNetDBLoopbackHub
+        private let allowed: Set<Data>
+        init(hub: I2PNetDBLoopbackHub, allowed: Set<Data>) {
+            self.hub = hub
+            self.allowed = allowed
+        }
+        func send(to routerHash: Data, message: I2PNetDBMessage) async throws {
+            guard allowed.contains(routerHash) else { return }
+            hub.deliver(to: routerHash, message: message)
+        }
+    }
+
+    /// A loopback transport where sends to one peer hang, modeling a floodfill
+    /// with no session whose demand-dial never completes. Sends to any other
+    /// peer are delivered normally.
+    private final class HangingTransport: I2PNetDBTransport {
+        private unowned let hub: I2PNetDBLoopbackHub
+        private let hangOn: Data
+        init(hub: I2PNetDBLoopbackHub, hangOn: Data) {
+            self.hub = hub
+            self.hangOn = hangOn
+        }
+        func send(to routerHash: Data, message: I2PNetDBMessage) async throws {
+            if routerHash == hangOn {
+                try? await Task.sleep(for: .seconds(30))
+                return
+            }
+            hub.deliver(to: routerHash, message: message)
+        }
+    }
 
     private struct Mesh {
         let hub: I2PNetDBLoopbackHub
@@ -77,6 +120,9 @@ enum I2PNetDBSelfTest {
             encryptionPublicKey: x25519.publicKey,
             signingPublicKey: I2PCrypto.ed25519PublicKey(fromSeed: seed)
         )
+        // Both leases share the lifetime the caller asks for: the entry's
+        // validity is the latest lease + grace, so a longer second lease would
+        // silently stretch the expected window.
         var leaseSet = I2PLeaseSet(
             destination: destination,
             published: Date(),
@@ -89,7 +135,7 @@ enum I2PNetDBSelfTest {
                 I2PLease(
                     gatewayHash: I2PCrypto.sha256(I2PCrypto.randomBytes(8)),
                     tunnelId: UInt32.random(in: 1...UInt32.max),
-                    expiration: Date().addingTimeInterval(leaseLifetime + 60)
+                    expiration: Date().addingTimeInterval(leaseLifetime)
                 )
             ]
         )
@@ -99,15 +145,20 @@ enum I2PNetDBSelfTest {
 
     /// Builds `nodeCount` NetDB instances on a loopback bus. The first `floodfillCount`
     /// routers are floodfills: they mark themselves locally and hold every router's
-    /// RouterInfo (simulating prior replication).
+    /// RouterInfo (simulating prior replication). Each node's local hash is its own
+    /// RouterInfo identity hash, so netdb targets learned from the entries are
+    /// routable on the loopback bus (a router is addressed by its identity).
     private static func makeMesh(nodeCount: Int, floodfillCount: Int) async throws -> Mesh {
         precondition(floodfillCount <= nodeCount)
         let hub = I2PNetDBLoopbackHub()
+        var infos: [I2PRouterInfo] = []
+        for index in 0..<nodeCount {
+            infos.append(try makeRouterInfo(caps: index < floodfillCount ? "ff" : nil).info)
+        }
         var nodes: [I2PNetworkDatabase] = []
         var hashes: [Data] = []
-        var infos: [I2PRouterInfo] = []
-        for _ in 0..<nodeCount {
-            let hash = I2PCrypto.randomBytes(32)
+        for index in 0..<nodeCount {
+            let hash = infos[index].identity.hash
             let storage = try I2PNetDBStorage(directory: makeTempDirectory())
             let db = I2PNetworkDatabase(
                 localRouterHash: hash,
@@ -117,13 +168,9 @@ enum I2PNetDBSelfTest {
             nodes.append(db)
             hashes.append(hash)
         }
-        for index in 0..<nodeCount {
-            let (info, _) = try makeRouterInfo(caps: index < floodfillCount ? "ff" : nil)
-            infos.append(info)
-            if index < floodfillCount {
-                await nodes[index].configureLocalFloodfill(true)
-                _ = await nodes[index].publish(routerInfo: info) // local store; no floodfill targets yet
-            }
+        for index in 0..<floodfillCount {
+            await nodes[index].configureLocalFloodfill(true)
+            _ = await nodes[index].publish(routerInfo: infos[index]) // local store; no floodfill targets yet
         }
         for floodfill in 0..<floodfillCount {
             for info in infos {
@@ -137,6 +184,116 @@ enum I2PNetDBSelfTest {
     }
 
     // MARK: Tests
+
+    /// The mainnet shape: the floodfills closest to a key are peers this router
+    /// cannot reach, and the one floodfill it *does* hold a session with is far
+    /// down the XOR order. The lookup must query the reachable peer anyway — the
+    /// reachable set is drawn from every known floodfill, not only the nearest
+    /// handful — or it can never be answered.
+    private static func testReachableBeyondClosest() async throws -> String {
+        let hub = I2PNetDBLoopbackHub()
+        let (targetInfo, _) = try makeRouterInfo()
+        let key = targetInfo.identity.hash
+        let localHash = I2PCrypto.randomBytes(32)
+        var decoys: [Data] = []
+        while decoys.count < 30 {
+            let candidate = I2PCrypto.randomBytes(32)
+            if !decoys.contains(candidate) { decoys.append(candidate) }
+        }
+        // Make sure the reachable holder is outside the closest 12 peers, which
+        // is the window a distance-limited reachable search would have looked in.
+        var holderInfo = try makeRouterInfo(caps: "ff").info
+        var rank = 0
+        for _ in 0..<20 {
+            let ordered = (decoys + [holderInfo.identity.hash])
+                .sorted { I2PNetworkDatabase.isCloser($0, than: $1, to: key) }
+            if let index = ordered.firstIndex(of: holderInfo.identity.hash) {
+                rank = index
+                if index >= 12 { break }
+            }
+            holderInfo = try makeRouterInfo(caps: "ff").info
+        }
+        guard rank >= 12 else {
+            throw Failure("could not place the reachable floodfill outside the closest 12 (rank \(rank))")
+        }
+        let holderHash = holderInfo.identity.hash
+
+        let local = I2PNetworkDatabase(
+            localRouterHash: localHash,
+            transport: SelectiveTransport(hub: hub, allowed: [holderHash]),
+            storage: try I2PNetDBStorage(directory: makeTempDirectory()))
+        let holder = I2PNetworkDatabase(
+            localRouterHash: holderHash,
+            transport: I2PNetDBLoopbackTransport(hub: hub),
+            storage: try I2PNetDBStorage(directory: makeTempDirectory()))
+        hub.add(local, at: localHash)
+        hub.add(holder, at: holderHash)
+        await holder.configureLocalFloodfill(true)
+        try await holder.ingestRouterInfo(targetInfo.serialize())
+        for peer in decoys { await local.registerFloodfill(peer) }
+        await local.registerFloodfill(holderHash)
+        await local.installReachabilityProbe { $0 == holderHash }
+
+        let started = Date()
+        let found = await local.lookup(key, timeoutPerRound: 1, maxRounds: 2)
+        let elapsed = Date().timeIntervalSince(started)
+        guard let found, found.raw == targetInfo.serialize() else {
+            throw Failure("lookup ignored the only reachable floodfill (XOR rank \(rank) of \(decoys.count + 1)) and returned nothing")
+        }
+        guard elapsed < 3 else {
+            throw Failure("lookup took \(String(format: "%.1f", elapsed))s instead of asking the reachable peer at once")
+        }
+        return String(format: "entry fetched in %.2fs from the reachable floodfill at XOR rank %d", elapsed, rank)
+    }
+    /// The DHT row's other real-world failure: a lookup's closest floodfill has
+    /// no session and its demand-dial hangs. The query must still go out to the
+    /// other candidates — sends are dispatched concurrently, so one dead peer
+    /// cannot hold the round hostage until its timeout.
+    private static func testUnreachableFloodfillLookup() async throws -> String {
+        let hub = I2PNetDBLoopbackHub()
+        let (targetInfo, _) = try makeRouterInfo()
+        let key = targetInfo.identity.hash
+        // A known floodfill one bit away from the key: XOR distance 1, so it is
+        // always the first candidate the lookup picks, and no node is behind it.
+        var dead = key
+        dead[key.count - 1] ^= 0x01
+
+        let localHash = I2PCrypto.randomBytes(32)
+        let holderInfo = try makeRouterInfo(caps: "ff").info
+        let otherInfo = try makeRouterInfo(caps: "ff").info
+        let local = I2PNetworkDatabase(
+            localRouterHash: localHash,
+            transport: HangingTransport(hub: hub, hangOn: dead),
+            storage: try I2PNetDBStorage(directory: makeTempDirectory()))
+        let holder = I2PNetworkDatabase(
+            localRouterHash: holderInfo.identity.hash,
+            transport: I2PNetDBLoopbackTransport(hub: hub),
+            storage: try I2PNetDBStorage(directory: makeTempDirectory()))
+        let other = I2PNetworkDatabase(
+            localRouterHash: otherInfo.identity.hash,
+            transport: I2PNetDBLoopbackTransport(hub: hub),
+            storage: try I2PNetDBStorage(directory: makeTempDirectory()))
+        hub.add(local, at: localHash)
+        hub.add(holder, at: holderInfo.identity.hash)
+        hub.add(other, at: otherInfo.identity.hash)
+        await holder.configureLocalFloodfill(true)
+        await other.configureLocalFloodfill(true)
+        try await holder.ingestRouterInfo(targetInfo.serialize())
+        for floodfill in [dead, holderInfo.identity.hash, otherInfo.identity.hash] {
+            await local.registerFloodfill(floodfill)
+        }
+
+        let started = Date()
+        let found = await local.lookup(key, timeoutPerRound: 2, maxRounds: 2)
+        let elapsed = Date().timeIntervalSince(started)
+        guard let found, found.raw == targetInfo.serialize() else {
+            throw Failure("lookup did not return the entry while the closest floodfill's send hung (\(String(format: "%.1f", elapsed))s)")
+        }
+        guard elapsed < 5 else {
+            throw Failure("lookup took \(String(format: "%.1f", elapsed))s — the dead floodfill serialized the round")
+        }
+        return String(format: "entry fetched in %.2fs with the closest floodfill unreachable", elapsed)
+    }
 
     private static func testStoreLookup() async throws -> String {
         let mesh = try await makeMesh(nodeCount: 6, floodfillCount: 3)
@@ -170,8 +327,16 @@ enum I2PNetDBSelfTest {
         guard acks >= 1 else { throw I2PWireError.invalidSignature }
         try await Task.sleep(for: .milliseconds(800))
         let key = info.identity.hash
-        for floodfill in mesh.nodes.prefix(7) {
-            guard await floodfill.hasEntry(key) else { throw I2PWireError.invalidFormat }
+        for (index, floodfill) in mesh.nodes.prefix(7).enumerated() {
+            guard await floodfill.hasEntry(key) else {
+                let ordered = mesh.hashes.prefix(7).sorted { I2PNetworkDatabase.isCloser($0, than: $1, to: key) }
+                let orderIndexes = ordered.compactMap { h in mesh.hashes.prefix(7).firstIndex(of: h) }
+                var states: [String] = []
+                for (i, node) in mesh.nodes.prefix(7).enumerated() {
+                    states.append("\(i):\(await node.hasEntry(key) ? "yes" : "no")")
+                }
+                throw Failure("floodfill \(index) of 7 missing the entry after gossip (\(acks) direct acks; distance order \(orderIndexes); holds \(states.joined(separator: " ")); ids \(mesh.hashes.prefix(7).map { String($0.hex.prefix(6)) }))")
+            }
         }
         return "\(acks) direct acks · all 7 floodfills hold the entry after gossip"
     }
@@ -206,10 +371,10 @@ enum I2PNetDBSelfTest {
 
         let now = Date()
         let leaseExpiry = await mesh.nodes[1].entryExpiration(leaseSetKey)
-        guard let leaseExpiry else { throw I2PWireError.invalidFormat }
+        guard let leaseExpiry else { throw Failure("lease set published but holds no expiry") }
         guard leaseExpiry <= now.addingTimeInterval(900 + 600 + 5) &&
               leaseExpiry >= now.addingTimeInterval(895) else {
-            throw I2PWireError.invalidFormat // ~25 min: 15-min lease + 10-min grace
+            throw Failure(String(format: "lease expiry %.0fs is outside the 15m-lease + 10m-grace window", leaseExpiry.timeIntervalSince(now)))
         }
 
         let (info, _) = try makeRouterInfo()
@@ -217,12 +382,14 @@ enum I2PNetDBSelfTest {
         _ = await mesh.nodes[1].publish(routerInfo: info)
         let routerExpiry = await mesh.nodes[1].entryExpiration(routerKey)
         guard let routerExpiry, abs(routerExpiry.timeIntervalSince(now) - 3600) < 5 else {
-            throw I2PWireError.invalidFormat // RouterInfo ~1h
+            throw Failure("RouterInfo expiry is not ~1h")
         }
 
         let pruned = await mesh.nodes[1].pruneExpired(now: now.addingTimeInterval(3600 + 10))
-        guard pruned >= 2 else { throw I2PWireError.invalidFormat }
-        guard !(await mesh.nodes[1].hasEntry(leaseSetKey)) else { throw I2PWireError.invalidFormat }
+        guard pruned >= 2 else { throw Failure("pruned only \(pruned) of the 2 expired entries") }
+        guard !(await mesh.nodes[1].hasEntry(leaseSetKey)) else {
+            throw Failure("pruned lease set still resident")
+        }
         return "LeaseSet ~25 min (15m lease + 10m grace) · RouterInfo ~1h · pruned \(pruned)"
     }
 
@@ -238,7 +405,8 @@ enum I2PNetDBSelfTest {
         try await node1.ingestRouterInfo(info.serialize())
         let leaseSet = try makeLeaseSet()
         try await node1.ingestLeaseSet(leaseSet.serialize())
-        guard await node1.entryCount() == 2 else { throw I2PWireError.invalidFormat }
+        let liveCount = await node1.entryCount()
+        guard liveCount == 2 else { throw Failure("node1 holds \(liveCount) entries after two verified ingests") }
 
         // A fresh router instance on the same directory restores the verified entries.
         let storage2 = try I2PNetDBStorage(directory: directory)
@@ -247,9 +415,18 @@ enum I2PNetDBSelfTest {
             transport: I2PNetDBLoopbackTransport(hub: I2PNetDBLoopbackHub()),
             storage: storage2
         )
-        guard await node2.entryCount() == 2 else { throw I2PWireError.invalidFormat }
-        guard await node2.hasEntry(info.identity.hash) else { throw I2PWireError.invalidFormat }
-        guard await node2.hasEntry(leaseSet.destination.hash) else { throw I2PWireError.invalidFormat }
+        // The restore runs asynchronously on the actor after init.
+        var restoredCount = await node2.entryCount()
+        let deadline = Date().addingTimeInterval(5)
+        while restoredCount < 2, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(50))
+            restoredCount = await node2.entryCount()
+        }
+        guard restoredCount == 2 else {
+            throw Failure("fresh instance restored \(restoredCount) of 2 persisted entries (files: \(storage2.loadAll().count))")
+        }
+        guard await node2.hasEntry(info.identity.hash) else { throw Failure("restored set is missing the RouterInfo") }
+        guard await node2.hasEntry(leaseSet.destination.hash) else { throw Failure("restored set is missing the LeaseSet") }
         return "2 signature-verified entries restored from disk"
     }
 

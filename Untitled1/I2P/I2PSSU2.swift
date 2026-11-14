@@ -190,6 +190,8 @@ final class SSU2InitiatorHandshake {
     private let ephemeral = Curve25519.KeyAgreement.PrivateKey()
     private var aliceHeader: Data?
     private var localConnectionID: Data?
+    /// The responder's RouterInfo, recovered from the SessionCreated payload.
+    private(set) var remoteRouterInfoData: Data?
 
     /// The responder's demultiplex connection ID, derived from its static key
     /// so inbound handshake packets land without prior state.
@@ -340,7 +342,18 @@ final class SSU2InitiatorHandshake {
         }
         let se = try localStaticKey.sharedSecretFromKeyAgreement(with: bobEphemeral)
         chain.mixKey(se.withUnsafeBytes { Data($0) })
-        _ = try chain.decrypt(masked.subdata(in: 112..<masked.count))
+        let payloadBytes = Array(try chain.decrypt(masked.subdata(in: 112..<masked.count)))
+        // The responder's payload carries timestamp (4) + "SSU2" (4) and, when
+        // present, its RouterInfo as [length (2 BE)][RouterInfo].
+        if payloadBytes.count > 8 {
+            let body = Data(payloadBytes.dropFirst(8))
+            if body.count >= 2 {
+                let length = (Int(body[body.startIndex]) << 8) | Int(body[body.index(after: body.startIndex)])
+                if length > 0, body.count >= 2 + length {
+                    remoteRouterInfoData = body.subdata(in: 2..<(2 + length))
+                }
+            }
+        }
         if let encapsulation = pendingEncapsulation {
             // Dual-leg binding: mix the ML-KEM encapsulation output into the
             // session KDF before the split, so the split rides both legs.
@@ -387,15 +400,21 @@ final class SSU2ResponderHandshake {
     private let introKey: Data
     private let localConnectionID: Data
     private let tokenManager: SSU2TokenManager
+    /// Our serialized RouterInfo, carried to the initiator in the SessionCreated
+    /// payload (the initiator's own RI rides the SessionConfirmed), so both
+    /// parties learn each other's identity during the handshake.
+    private let localRouterInfoData: Data
 
     init(localStaticKey: Curve25519.KeyAgreement.PrivateKey, localConnectionID: Data,
          introKey: Data, tokenManager: SSU2TokenManager,
-         localMLKEMSecretKey: I2PMLKEMSecretKey? = nil) {
+         localMLKEMSecretKey: I2PMLKEMSecretKey? = nil,
+         localRouterInfoData: Data = Data()) {
         self.localStaticKey = localStaticKey
         self.localConnectionID = localConnectionID
         self.introKey = introKey
         self.tokenManager = tokenManager
         self.localMLKEMSecretKey = localMLKEMSecretKey
+        self.localRouterInfoData = localRouterInfoData
     }
 
     /// Retry (type 9) carrying a fresh token in the header token field.
@@ -527,6 +546,14 @@ final class SSU2ResponderHandshake {
         chain.mixKey(se.withUnsafeBytes { Data($0) })
         var payload = ssu2Timestamp(Date())
         payload.append(contentsOf: Data("SSU2".utf8))
+        // Our RouterInfo follows the timestamp/version header as a 2-byte
+        // length-prefixed section, so the initiator learns who it is talking to
+        // in the same handshake (its own RI arrives in the SessionConfirmed).
+        if !localRouterInfoData.isEmpty, localRouterInfoData.count <= 0xFFFF {
+            payload.append(UInt8((localRouterInfoData.count >> 8) & 0xff))
+            payload.append(UInt8(localRouterInfoData.count & 0xff))
+            payload.append(localRouterInfoData)
+        }
         packet.append(try chain.encrypt(payload))
         if let encapsulation = acceptedEncapsulation {
             // The initiator mixes at the same chain point after decrypting this
@@ -1030,12 +1057,17 @@ final class SSU2Session {
             token = nil
         }
         if let token {
-            state = .initial
-            try enqueue(engine.makeSessionRequest(localConnectionID: localConnectionID, token: token))
+            let request = try engine.makeSessionRequest(localConnectionID: localConnectionID, token: token)
+            // Advance the state before the datagram is flushed: a peer wired
+            // directly to the outbound handler (loopback) answers inside the
+            // flush, so setting `.requested` afterwards overwrote the
+            // `.established` state the nested handshake had just reached.
             state = .requested
+            try enqueue(request)
         } else {
-            try enqueue(engine.makeTokenRequest(localConnectionID: localConnectionID))
+            let request = try engine.makeTokenRequest(localConnectionID: localConnectionID)
             state = .initial
+            try enqueue(request)
         }
     }
 
@@ -1115,14 +1147,19 @@ final class SSU2Session {
                 if let remoteStaticKey {
                     tokenCache.store(token: token, for: remoteStaticKey)
                 }
-                if engine.pqLeg != nil {
-                    // A Retry while a hybrid offer is outstanding is the
-                    // responder's no-PQ signal: the handshake falls back to
-                    // the classical long-header variant.
+                if engine.pqLeg != nil, engine.stage == .awaitingCreated {
+                    // A Retry while a hybrid SessionRequest is outstanding is
+                    // the responder's no-PQ signal: the handshake falls back to
+                    // the classical long-header variant. A Retry that answers a
+                    // TokenRequest (stage .awaitingRetryOrCreated) carries no
+                    // such meaning and must leave the offer intact.
                     engine.downgradeToClassical()
                 }
-                try enqueue(try engine.makeSessionRequest(localConnectionID: localConnectionID, token: token))
+                let request = try engine.makeSessionRequest(localConnectionID: localConnectionID, token: token)
+                // Set the state before flushing (see startHandshake): the peer's
+                // answer can arrive synchronously inside the enqueue.
                 state = .requested
+                try enqueue(request)
                 return
             }
             throw SSU2Error.invalidPacket
@@ -1146,7 +1183,8 @@ final class SSU2Session {
                 responder = SSU2ResponderHandshake(localStaticKey: localStaticKey,
                                                    localConnectionID: localConnectionID,
                                                    introKey: introKey, tokenManager: tokenManager,
-                                                   localMLKEMSecretKey: localMLKEMSecretKey)
+                                                   localMLKEMSecretKey: localMLKEMSecretKey,
+                                                   localRouterInfoData: localRouterInfoData)
             }
             switch header.type {
             case .tokenRequest:
@@ -1175,8 +1213,10 @@ final class SSU2Session {
                 sendHeaderKey = keys.send.headerKey
                 recvHeaderKey = keys.recv.headerKey
                 confirmedReassembler = SSU2ConfirmedReassembler()
-                try enqueue(created)
+                // State first for the same re-entrancy reason: the initiator's
+                // SessionConfirmed can be processed inside the flush below.
                 state = .created
+                try enqueue(created)
             case .peerTest, .holePunch, .retry, .sessionCreated, .sessionConfirmed, .data:
                 throw SSU2Error.invalidPacket
             }
@@ -1230,10 +1270,14 @@ final class SSU2Session {
         recvCipher = SSU2DataCipher(key: keys.recv.aeadKey)
         sendHeaderKey = keys.send.headerKey
         recvHeaderKey = keys.recv.headerKey
-        sendSessionConfirmed()
         establishedAt = Date()
         state = .established
-        delegate?.session(self, didEstablish: nil)
+        // The responder's RouterInfo arrived in the SessionCreated payload.
+        if let data = engine.remoteRouterInfoData {
+            remoteRouterInfo = try? I2PRouterInfo.parse(data)
+        }
+        sendSessionConfirmed()
+        delegate?.session(self, didEstablish: remoteRouterInfo)
     }
 
     private func sendSessionConfirmed() {
@@ -1415,7 +1459,15 @@ final class SSU2Session {
             return
         }
         state = .terminating
-        let payload = try SSU2Block.encode([.termination(reason: reason, detail: detail)])
+        var payload = try SSU2Block.encode([.termination(reason: reason, detail: detail)])
+        // The data phase's minimum authenticated message is 40 bytes (16-byte
+        // header + 8-byte payload + 16-byte tag). A short termination block
+        // ("bye" → 7 bytes) falls under it, so pad it out with an empty padding
+        // block rather than failing the close of an otherwise healthy session.
+        let minimumPayload = SSU2DataCipher.minimumMessageLength - SSU2PacketHeader.shortLength - 16
+        if payload.count < minimumPayload {
+            payload.append(try SSU2Block.encode([.padding(0)]))
+        }
         let pn = nextOutboundPacketNumber()
         let header = SSU2PacketHeader(shortDestinationConnectionID: remote, packetNumber: pn, type: .data)
         var packet = try cipher.seal(payload, header: header.serialize(), packetNumber: pn)
@@ -1849,9 +1901,15 @@ enum I2PSSU2SelfTest {
             guard !manager.validate(Data(repeating: 1, count: 8), for: requester) else {
                 throw SSU2Error.testFailed("unknown token accepted")
             }
-            // Expiry.
-            guard !manager.validate(token, for: requester,
-                                    now: Date().addingTimeInterval(700)) else {
+            // Expiry, checked without time-travelling the manager: validating at
+            // now+700 s also ages out the 60 s rate-limit window, so the rate
+            // assertions below need a window that has not been fast-forwarded.
+            let expiryManager = SSU2TokenManager(tokenLifetime: 600, maxRequestsPerWindow: 3, requestWindow: 60)
+            guard let expiring = expiryManager.issue(for: requester) else {
+                throw SSU2Error.testFailed("issue failed")
+            }
+            guard !expiryManager.validate(expiring, for: requester,
+                                          now: Date().addingTimeInterval(700)) else {
                 throw SSU2Error.testFailed("expired token accepted")
             }
             // Rate limiting: the window already holds one request; two more pass, the fourth fails.
@@ -1894,9 +1952,12 @@ enum I2PSSU2SelfTest {
             let bobFast = SSU2Session(role: .responder, localStaticKey: bobKey,
                                       remoteStaticKey: nil, remoteIntroKey: introKey,
                                       localRouterInfo: bobRI, tokenManager: manager)
-            var firstAlicePacketType: UInt8?
+            var firstAlicePacketType: SSU2MessageType?
             aliceFast.outboundHandler = { datagram, _ in
-                if firstAlicePacketType == nil { firstAlicePacketType = datagram[12] }
+                if firstAlicePacketType == nil {
+                    firstAlicePacketType = Self.phaseType(datagram, phase: .sessionRequest,
+                                                          introKey: introKey)
+                }
                 bobFast.handleDatagram(datagram, from: aliceLoopbackEndpoint)
             }
             bobFast.outboundHandler = { datagram, _ in
@@ -1909,7 +1970,7 @@ enum I2PSSU2SelfTest {
             guard aliceFast.isEstablished, bobFast.isEstablished else {
                 throw SSU2Error.testFailed("fast path did not complete")
             }
-            guard firstAlicePacketType == SSU2MessageType.sessionRequest.rawValue else {
+            guard firstAlicePacketType == SSU2MessageType.sessionRequest else {
                 throw SSU2Error.testFailed("fast path used a token request")
             }
 
@@ -1925,7 +1986,9 @@ enum I2PSSU2SelfTest {
                 bobRetry.handleDatagram(datagram, from: aliceLoopbackEndpoint)
             }
             bobRetry.outboundHandler = { datagram, _ in
-                if datagram[12] == SSU2MessageType.retry.rawValue { sawRetry = true }
+                if Self.phaseType(datagram, phase: .retry, introKey: introKey) == .retry {
+                    sawRetry = true
+                }
                 aliceRetry.handleDatagram(datagram, from: bobLoopbackEndpoint)
             }
             try aliceRetry.startHandshake(useCachedToken: false, forceInvalidToken: true)
@@ -2094,7 +2157,14 @@ enum I2PSSU2SelfTest {
                                                        destinationConnectionID: SSU2PacketHeader.randomConnectionID(),
                                                        sourceConnectionID: SSU2PacketHeader.randomConnectionID(),
                                                        introKey: relayEntry.introductionKey)
-            guard punch[12] == SSU2MessageType.holePunch.rawValue else { throw SSU2Error.invalidPacket }
+            // The datagram leaves masked: the type byte is only readable after
+            // the hole-punch phase unmask (a masked byte 12 is random).
+            var unmaskedPunch = Data(punch)
+            try SSU2HeaderProtection.unmaskHeader(&unmaskedPunch, phase: .holePunch,
+                                                  introKey: relayEntry.introductionKey)
+            guard try SSU2PacketHeader.parse(unmaskedPunch).type == .holePunch else {
+                throw SSU2Error.invalidPacket
+            }
             let receiving = SSU2RelayCoordinator()
             let receivedNonce = try receiving.handleHolePunch(punch, introKey: relayEntry.introductionKey)
             guard receivedNonce == 0x5150 else { throw SSU2Error.testFailed("hole punch nonce lost") }
@@ -2132,6 +2202,7 @@ enum I2PSSU2SelfTest {
             guard bob.state == .closed else { throw SSU2Error.testFailed("peer did not close") }
             guard alice.state == .terminating else { throw SSU2Error.testFailed("terminator state") }
             // Terminal packet retransmission is bounded.
+            try alice.retransmitTermination()
             try alice.retransmitTermination()
             try alice.retransmitTermination()
             do {
@@ -2186,7 +2257,10 @@ enum I2PSSU2SelfTest {
             // Dual-leg binding: only peers that completed BOTH legs derive the
             // same split keys — the end-to-end data phase under those keys proves it.
             var received: [Data] = []
-            bob.delegate = LoopbackDelegate(onData: { received.append($0) })
+            // The session holds its delegate weakly: keep the stub alive here.
+            let bobDelegate = LoopbackDelegate(onData: { received.append($0) })
+            bob.delegate = bobDelegate
+            defer { withExtendedLifetime(bobDelegate) {} }
             let message = I2NPMessage(type: .dataMessage, payload: Data("pq hybrid 512 e2e".utf8)).serialize()
             try alice.sendData(message)
             pumpBoth(alice, bob)
@@ -2204,7 +2278,9 @@ enum I2PSSU2SelfTest {
                 throw SSU2Error.testFailed("hybrid leg not negotiated to ML-KEM-768")
             }
             var received: [Data] = []
-            bob.delegate = LoopbackDelegate(onData: { received.append($0) })
+            let bobDelegate = LoopbackDelegate(onData: { received.append($0) })
+            bob.delegate = bobDelegate
+            defer { withExtendedLifetime(bobDelegate) {} }
             let message = I2NPMessage(type: .dataMessage, payload: Data("pq hybrid 768 e2e".utf8)).serialize()
             try alice.sendData(message)
             pumpBoth(alice, bob)
@@ -2231,11 +2307,18 @@ enum I2PSSU2SelfTest {
             var offeredVersion: UInt8?
             var sawRetry = false
             alice.outboundHandler = { datagram, _ in
-                if offeredVersion == nil { offeredVersion = datagram[13] }
+                if offeredVersion == nil {
+                    var unmasked = Data(datagram)
+                    try? SSU2HeaderProtection.unmaskHeader(&unmasked, phase: .sessionRequest,
+                                                           introKey: bobIntroKey)
+                    offeredVersion = (try? SSU2PacketHeader.parse(unmasked))?.version
+                }
                 bob.handleDatagram(datagram, from: aliceLoopbackEndpoint)
             }
             bob.outboundHandler = { datagram, _ in
-                if datagram[12] == SSU2MessageType.retry.rawValue { sawRetry = true }
+                if Self.phaseType(datagram, phase: .retry, introKey: bobIntroKey) == .retry {
+                    sawRetry = true
+                }
                 alice.handleDatagram(datagram, from: bobLoopbackEndpoint)
             }
             try alice.startHandshake(useCachedToken: true, forceInvalidToken: true)
@@ -2329,6 +2412,17 @@ enum I2PSSU2SelfTest {
 
     // MARK: Loopback helpers
 
+    /// The message type of a datagram under a given header-protection phase.
+    /// Wire packets carry masked headers, so tests must unmask before reading
+    /// the type or version byte (a masked byte is random).
+    static func phaseType(_ datagram: Data, phase: SSU2HeaderPhase,
+                          introKey: Data, sessionKey: Data? = nil) -> SSU2MessageType? {
+        var unmasked = Data(datagram)
+        try? SSU2HeaderProtection.unmaskHeader(&unmasked, phase: phase,
+                                               introKey: introKey, sessionKey: sessionKey)
+        return (try? SSU2PacketHeader.parse(unmasked))?.type
+    }
+
     private final class LoopbackDelegate: SSU2SessionDelegate {
         private let onData: ((Data) -> Void)?
         private let onEstablish: (() -> Void)?
@@ -2363,7 +2457,11 @@ enum I2PSSU2SelfTest {
                               localRouterInfo: bobRI, mlKemSecretKey: bobMLKEMSecret)
         alice.outboundHandler = { datagram, _ in bob.handleDatagram(datagram, from: aliceLoopbackEndpoint) }
         bob.outboundHandler = { datagram, _ in alice.handleDatagram(datagram, from: bobLoopbackEndpoint) }
-        try alice.startHandshake(useCachedToken: true, forceInvalidToken: true)
+        // Token-request path: the Retry answers a TokenRequest, not a refused
+        // hybrid offer, so the PQ leg stays offered on the SessionRequest that
+        // follows. (Forcing an invalid SessionRequest token instead would be a
+        // legitimate no-PQ signal and downgrade the handshake.)
+        try alice.startHandshake(useCachedToken: false)
         pumpBoth(alice, bob)
         guard alice.isEstablished, bob.isEstablished else {
             throw SSU2Error.testFailed("loopback handshake failed")

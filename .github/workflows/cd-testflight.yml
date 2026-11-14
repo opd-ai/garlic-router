@@ -1,0 +1,254 @@
+name: CD - TestFlight
+
+# Archives a signed build and uploads it to TestFlight. Runs when a version tag
+# is pushed (v1.2.3) and can also be started by hand from the Actions tab.
+#
+# Signing: a distribution certificate and a provisioning profile are installed
+# into a throwaway keychain, xcodebuild archives with manual signing and exports
+# a signed IPA. Upload uses Xcode's own altool with an App Store Connect API key
+# (no Apple ID password anywhere). Everything secret is removed in the final
+# step, which runs even when an earlier step fails.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      build_number:
+        description: Build number to stamp on the build (defaults to the run number)
+        required: false
+        type: string
+
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PROJECT: Untitled1.xcodeproj
+  SCHEME: Untitled1
+  XCODE_VERSION: ${{ vars.XCODE_VERSION || '27.1' }}
+  APP_BUNDLE_ID: ${{ vars.APP_BUNDLE_ID || 'com.organizationName.Untitled1' }}
+  KEYCHAIN_NAME: app-signing.keychain-db
+  PROFILE_INSTALL_NAME: ci-app.mobileprovision
+
+jobs:
+  testflight:
+    name: Archive, sign and upload to TestFlight
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select Xcode ${{ env.XCODE_VERSION }}
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: ${{ env.XCODE_VERSION }}
+
+      - name: Verify signing secrets are configured
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          PROVISIONING_PROFILE_BASE64: ${{ secrets.PROVISIONING_PROFILE_BASE64 }}
+          PROVISIONING_PROFILE_SPECIFIER: ${{ secrets.PROVISIONING_PROFILE_SPECIFIER }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPSTORE_API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          APPSTORE_API_ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
+          APPSTORE_API_PRIVATE_KEY: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in \
+            BUILD_CERTIFICATE_BASE64 \
+            P12_PASSWORD \
+            KEYCHAIN_PASSWORD \
+            PROVISIONING_PROFILE_BASE64 \
+            PROVISIONING_PROFILE_SPECIFIER \
+            APPLE_TEAM_ID \
+            APPSTORE_API_KEY_ID \
+            APPSTORE_API_ISSUER_ID \
+            APPSTORE_API_PRIVATE_KEY
+          do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Missing secret: $name (see docs/CI-CD.md)"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::Signing secrets are incomplete; nothing was archived or uploaded."
+            exit 1
+          fi
+
+      - name: Import the distribution certificate into a temporary keychain
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/$KEYCHAIN_NAME"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          printf '%s' "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" \
+            -P "$P12_PASSWORD" \
+            -A -t cert -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+
+          # Put the temporary keychain first in the user search list so codesign
+          # finds the distribution identity before anything preinstalled.
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+
+          # Apple's WWDR intermediate is required to build the certificate chain.
+          # Runner images normally ship it; fetch it if it is missing.
+          if ! security find-certificate -c "Apple Worldwide Developer Relations Certification Authority" >/dev/null 2>&1; then
+            curl -sSfL https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer \
+              -o "$RUNNER_TEMP/AppleWWDRCAG3.cer"
+            security import "$RUNNER_TEMP/AppleWWDRCAG3.cer" -k "$KEYCHAIN_PATH" -A
+          fi
+
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+      - name: Install the provisioning profile
+        env:
+          PROVISIONING_PROFILE_BASE64: ${{ secrets.PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+          PP_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$PP_DIR"
+          printf '%s' "$PROVISIONING_PROFILE_BASE64" | base64 --decode -o "$RUNNER_TEMP/profile.mobileprovision"
+          cp "$RUNNER_TEMP/profile.mobileprovision" "$PP_DIR/$PROFILE_INSTALL_NAME"
+
+      - name: Resolve package dependencies
+        run: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies -project "$PROJECT" -scheme "$SCHEME"
+
+      - name: Work out the version and build number
+        env:
+          BUILD_NUMBER_INPUT: ${{ inputs.build_number }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="1.0.0"
+          fi
+          BUILD_NUMBER="${BUILD_NUMBER_INPUT:-${GITHUB_RUN_NUMBER}}"
+          echo "Archiving $SCHEME $VERSION ($BUILD_NUMBER)"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+
+      - name: Archive the app
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          PROVISIONING_PROFILE_SPECIFIER: ${{ secrets.PROVISIONING_PROFILE_SPECIFIER }}
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            MARKETING_VERSION="$VERSION" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            PRODUCT_BUNDLE_IDENTIFIER="$APP_BUNDLE_ID" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROVISIONING_PROFILE_SPECIFIER" \
+            -quiet
+
+      - name: Export a signed IPA
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          PROVISIONING_PROFILE_SPECIFIER: ${{ secrets.PROVISIONING_PROFILE_SPECIFIER }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>destination</key>
+            <string>export</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>teamID</key>
+            <string>${APPLE_TEAM_ID}</string>
+            <key>stripSwiftSymbols</key>
+            <true/>
+            <key>uploadSymbols</key>
+            <true/>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>${APP_BUNDLE_ID}</key>
+              <string>${PROVISIONING_PROFILE_SPECIFIER}</string>
+            </dict>
+          </dict>
+          </plist>
+          PLIST
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -quiet
+          IPA_PATH="$(find "$RUNNER_TEMP/export" -maxdepth 1 -name '*.ipa' | head -n 1)"
+          if [ -z "$IPA_PATH" ]; then
+            echo "::error::No IPA was produced by the export step"
+            exit 1
+          fi
+          echo "IPA_PATH=$IPA_PATH" >> "$GITHUB_ENV"
+          echo "Exported $(basename "$IPA_PATH")"
+
+      - name: Upload to TestFlight
+        env:
+          APPSTORE_API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          APPSTORE_API_ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
+          APPSTORE_API_PRIVATE_KEY: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          KEY_DIR="$HOME/.appstoreconnect/private_keys"
+          mkdir -p "$KEY_DIR"
+          KEY_PATH="$KEY_DIR/AuthKey_${APPSTORE_API_KEY_ID}.p8"
+          printf '%s\n' "$APPSTORE_API_PRIVATE_KEY" > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+
+          xcrun altool --upload-app \
+            --type ios \
+            --file "$IPA_PATH" \
+            --apiKey "$APPSTORE_API_KEY_ID" \
+            --apiIssuer "$APPSTORE_API_ISSUER_ID" \
+            --output-format json
+
+      - name: Remove the temporary keychain and key material
+        if: always()
+        env:
+          APPSTORE_API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+        run: |
+          set -uo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/$KEYCHAIN_NAME"
+          security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/cert.p12" \
+                "$RUNNER_TEMP/profile.mobileprovision" \
+                "$RUNNER_TEMP/AppleWWDRCAG3.cer" \
+                "$RUNNER_TEMP/ExportOptions.plist" \
+                "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_INSTALL_NAME" \
+                "$HOME/.appstoreconnect/private_keys/AuthKey_${APPSTORE_API_KEY_ID}.p8"
+          rm -rf "$RUNNER_TEMP/App.xcarchive" "$RUNNER_TEMP/export"
+          echo "Signing material removed."

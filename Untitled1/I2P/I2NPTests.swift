@@ -8,6 +8,11 @@ import CryptoKit
 
 private enum I2NPTestTimeout: Error { case timedOut }
 
+private struct I2NPTestFailure: Error, CustomStringConvertible {
+    let description: String
+    init(_ description: String) { self.description = description }
+}
+
 private func i2npTestWaitUntil(timeout: TimeInterval = 15, _ condition: @escaping () -> Bool) async throws {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
@@ -85,11 +90,12 @@ enum I2NPSelfTest {
             payload: Data(repeating: 0xAB, count: 40)
         )
         let sent = Date()
-        let message = I2NPMessage(type: .databaseStore, messageID: 0xC0FFEE01, expiration: sent, payload: store.serialize())
-        guard I2NPMessage.headerLength == 17 else { throw I2NPError.invalidPayload }
+        let expiry = sent.addingTimeInterval(60)
+        let message = I2NPMessage(type: .databaseStore, messageID: 0xC0FFEE01, expiration: expiry, payload: store.serialize())
+        guard I2NPMessage.headerLength == 16 else { throw I2NPError.invalidPayload }
         let parsed = try I2NPMessage.parse(message.serialize())
         guard parsed.type == .databaseStore, parsed.messageID == 0xC0FFEE01,
-              abs(parsed.expiration.timeIntervalSince(sent)) < 0.002 else {
+              abs(parsed.expiration.timeIntervalSince(expiry)) < 0.002 else {
             throw I2NPError.invalidPayload
         }
         // Header peek: type byte, big-endian size and expiry before the payload.
@@ -105,7 +111,7 @@ enum I2NPSelfTest {
         // An expired message is flagged on receipt.
         let stale = I2NPMessage(type: .databaseStore, expiration: Date().addingTimeInterval(-5))
         guard stale.isExpired() else { throw I2NPError.invalidPayload }
-        return "\(message.serialize().count)-byte envelope, 17-byte header, store payload intact"
+        return "\(message.serialize().count)-byte envelope, 16-byte header, store payload intact"
     }
 private static func typedPayloadTest() async throws -> String {
         // DeliveryStatus
@@ -116,12 +122,13 @@ private static func typedPayloadTest() async throws -> String {
               id == 0x5150, abs(stamp.timeIntervalSince1970 - 1_700_000_500) < 1 else {
             throw I2NPError.invalidPayload
         }
-        // Options (mapping) + DataMessage + Garlic (opaque clove set bytes)
-        let options = I2NPMessage(type: .options, payload: {
-            var w = I2PWriter(); w.mapping(["router.version": "0.9.62", "caps": "XOf"]); return w.data
-        }())
-        guard case .options(let mapping) = try I2NPMessage.parse(options.serialize()).parseBody(),
-              mapping["caps"] == "XOf" else { throw I2NPError.invalidPayload }
+        // There is no I2NP Options message: the spec's type table has none, so
+        // the obsolete type-12 slot must not parse. DataMessage + Garlic follow.
+        var obsolete = I2NPMessage(type: .dataMessage, payload: Data([0x7A])).serialize()
+        obsolete[0] = 12
+        guard (try? I2NPMessage.parse(obsolete)) == nil else {
+            throw I2NPError.unsupportedType
+        }
         let blob = I2PCrypto.randomBytes(64)
         let dataMessage = I2NPMessage(type: .dataMessage, payload: blob)
         guard case .dataMessage(let payload) = try I2NPMessage.parse(dataMessage.serialize()).parseBody(),
@@ -159,27 +166,31 @@ private static func typedPayloadTest() async throws -> String {
               parsedPayload.iv == iv, parsedPayload.body == body,
               try I2PTunnelLayerCipher.unwrap(body: parsedPayload.body, layerKey: layerKey,
                                               ivField: parsedPayload.iv, ivKey: ivKey) == content else {
-            throw I2NPError.invalidPayload
+            throw I2NPTestFailure("tunnelData payload round trip (wire \(wire.count))")
         }
         // TunnelBuild / TunnelBuildReply carriers
         let hopKey = Curve25519.KeyAgreement.PrivateKey()
         let record = I2PTunnelBuildRequestRecord(
             hopNumber: 0, receiveTunnelID: 9, nextHopHash: I2PCrypto.randomBytes(32),
-            nextTunnelID: 0, layerKey: I2PCrypto.randomBytes(32), ivKey: I2PCrypto.randomBytes(32),
-            replyKey: I2PCrypto.randomBytes(32), replyIV: I2PCrypto.randomBytes(16),
-            isMessagePathEnd: true, nextHopIsOriginator: false, hasMoreRecords: false,
-            padding: I2PCrypto.randomBytes(372)
+            nextTunnelID: 0, isMessagePathEnd: true, nextHopIsOriginator: false,
+            hasMoreRecords: false
         )
-        let buildWire = try I2PTunnelBuildCrypto.encryptRecord(record.serialize(),
-                                                               to: hopKey.publicKey.rawRepresentation,
-                                                               recordIndex: 0)
-        let buildMessage = I2PTunnelBuildMessage(messageID: 77, records: [buildWire])
+        let build = try I2PTunnelBuildCrypto.encryptRecordWithMaterial(
+            record.serialize(),
+            to: hopKey.publicKey.rawRepresentation,
+            hopHash: nil,
+            recordIndex: 0
+        )
+        let buildMessage = I2PTunnelBuildMessage(messageID: 77, records: [build.wire])
         guard case .tunnelBuild(let parsedBuild) = try I2NPMessage.parse({
             let m = I2NPMessage(type: .tunnelBuild, payload: buildMessage.serialize()); return m
-        }().serialize()).parseBody(), parsedBuild.messageID == 77 else { throw I2NPError.invalidPayload }
+        }().serialize()).parseBody(), parsedBuild.records.count == 1 else {
+            throw I2NPTestFailure("tunnelBuild carrier (wire record \(build.wire.count) bytes)")
+        }
         let replyRecord = try I2PTunnelBuildCrypto.encryptReplyRecord(
             I2PTunnelBuildReplyRecord(receiveTunnelID: 9, returnCode: 0),
-            replyKey: I2PCrypto.randomBytes(32), replyIV: I2PCrypto.randomBytes(16), messageID: 77
+            material: build.material,
+            recordIndex: 0
         )
         let replyMessage = I2PTunnelBuildReply(messageID: 77, encryptedRecords: [replyRecord])
         let replyEnvelope = I2NPMessage(type: .tunnelBuildReply, payload: replyMessage.serialize())
@@ -191,25 +202,31 @@ private static func typedPayloadTest() async throws -> String {
     private static func deliveryInstructionsTest() async throws -> String {
         let local = I2PDeliveryInstructions(mode: .local)
         let (parsedLocal, localConsumed) = try I2PDeliveryInstructions.parse(local.serialize())
-        guard parsedLocal.mode == .local, localConsumed == 2 else { throw I2NPError.invalidPayload }
+        guard parsedLocal.mode == .local, localConsumed == 1 else { throw I2NPError.invalidPayload }
         let gateway = I2PCrypto.randomBytes(32)
         let tunnel = I2PDeliveryInstructions(mode: .tunnel, tunnelID: 0xDEADBEEF,
-                                             routerHash: gateway, delayMilliseconds: 250)
+                                             routerHash: gateway)
         let (parsedTunnel, tunnelConsumed) = try I2PDeliveryInstructions.parse(tunnel.serialize())
         guard parsedTunnel.mode == .tunnel, parsedTunnel.tunnelID == 0xDEADBEEF,
-              parsedTunnel.routerHash == gateway,
-              parsedTunnel.delayMilliseconds == 250, tunnelConsumed == 42 else {
+              parsedTunnel.routerHash == gateway, tunnelConsumed == 37 else {
             throw I2NPError.invalidPayload
         }
+        let destinationHash = I2PCrypto.randomBytes(32)
+        let destination = I2PDeliveryInstructions(mode: .destination, routerHash: destinationHash)
+        let (parsedDestination, destinationConsumed) = try I2PDeliveryInstructions.parse(destination.serialize())
+        guard parsedDestination.mode == .destination,
+              parsedDestination.routerHash == destinationHash,
+              destinationConsumed == 33 else { throw I2NPError.invalidPayload }
         let router = I2PDeliveryInstructions(mode: .router, routerHash: I2PCrypto.randomBytes(32))
         let (parsedRouter, routerConsumed) = try I2PDeliveryInstructions.parse(router.serialize())
         guard parsedRouter.mode == .router, parsedRouter.routerHash == router.routerHash,
-              routerConsumed == 35 else { throw I2NPError.invalidPayload }
-        // Local instructions with a delay flag still round-trip.
-        let delayed = I2PDeliveryInstructions(mode: .local, delayMilliseconds: 1_000)
-        let (parsedDelayed, _) = try I2PDeliveryInstructions.parse(delayed.serialize())
-        guard parsedDelayed.delayMilliseconds == 1_000 else { throw I2NPError.invalidPayload }
-        return "local (2 B), tunnel (42 B: tunnel ID + gateway), router (35 B) instructions verified"
+              routerConsumed == 33 else { throw I2NPError.invalidPayload }
+        // The flag byte is the spec's: type in bits 6-5, no delay/session key.
+        guard local.serialize()[0] == 0x00, destination.serialize()[0] == 0x20,
+              router.serialize()[0] == 0x40, tunnel.serialize()[0] == 0x60 else {
+            throw I2NPError.invalidPayload
+        }
+        return "local (1 B), destination/router (33 B), tunnel (37 B, hash before ID) instructions verified"
     }
 private struct I2NPTestNode {
     let routerHash: Data
@@ -272,10 +289,10 @@ private static func outboundPipelineTest() async throws -> String {
     guard let received = box.firstGateway(), received.messageID == inner.messageID,
           received.type == .dataMessage,
           received.payload == inner.payload else {
-        throw I2NPError.invalidPayload
+        throw I2NPTestFailure("outbound gateway message mismatch (count \(box.gatewayCount), type \(String(describing: box.firstGateway()?.type)))")
     }
     guard box.gatewaySources.first == hop2.routerHash else {
-        throw I2NPError.invalidPayload
+        throw I2NPTestFailure("outbound gateway source is not the last hop")
     }
     return "2-hop outbound pipeline: originator → hop1 → hop2 → gateway delivery"
 }
@@ -310,10 +327,10 @@ private static func inboundPipelineTest() async throws -> String {
     try await i2npTestWaitUntil { box.gatewayCount == 1 }
     guard let received = box.firstGateway(), received.messageID == inner.messageID,
           received.payload == inner.payload else {
-        throw I2NPError.invalidPayload
+        throw I2NPTestFailure("inbound gateway message mismatch (count \(box.gatewayCount))")
     }
     guard box.gatewaySources.first == nearest.routerHash else {
-        throw I2NPError.invalidPayload
+        throw I2NPTestFailure("inbound gateway source is not the nearest hop")
     }
     return "inbound pipeline: gateway → nearest hop → originator endpoint delivery"
 }
@@ -330,13 +347,11 @@ private static func expiryTest() async throws -> String {
     await node.router.handleIncoming(stale, from: I2PCrypto.randomBytes(32))
     try await Task.sleep(for: .milliseconds(150))
     guard box.bodyCount == 0 else { throw I2NPError.invalidPayload }
-    // Fresh delivery status and options messages reach the registered consumers.
+    // A fresh delivery status reaches the registered consumer.
     let fresh = I2NPMessage(type: .deliveryStatus, payload: { var w = I2PWriter(); w.integer(2); w.long(0); return w.data }())
-    let opts = I2NPMessage(type: .options, payload: { var w = I2PWriter(); w.mapping(["caps": "Xf"]); return w.data }())
     await node.router.handleIncoming(fresh, from: I2PCrypto.randomBytes(32))
-    await node.router.handleIncoming(opts, from: I2PCrypto.randomBytes(32))
-    try await i2npTestWaitUntil { box.bodyCount == 2 }
-    guard box.bodyKinds == [.deliveryStatus, .options] else { throw I2NPError.invalidPayload }
+    try await i2npTestWaitUntil { box.bodyCount == 1 }
+    guard box.bodyKinds == [.deliveryStatus] else { throw I2NPError.invalidPayload }
 
     // A tunnel hop whose participation state expired no longer decrypts data.
     let tunnelKeys = (layerKey: I2PCrypto.randomBytes(32), ivKey: I2PCrypto.randomBytes(16))

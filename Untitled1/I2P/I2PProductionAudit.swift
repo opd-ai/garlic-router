@@ -123,11 +123,26 @@ enum I2PProductionAudit {
         // static-key transport and RouterInfo transport all verified end-to-end.
         let initiatorStatic = Curve25519.KeyAgreement.PrivateKey()
         let responderStatic = Curve25519.KeyAgreement.PrivateKey()
+        // The responder's router hash keys the AES-CBC handshake obfuscation and
+        // its published `i` option supplies the IV. This is a protocol-unit
+        // probe, so fresh values stand in for a live RouterInfo.
+        let responderHash = I2PCrypto.randomBytes(32)
+        let responderIV = I2PCrypto.randomBytes(16)
+        // Peers publish the RFC 7748 canonical encoding of their static key
+        // (top bit of the last byte cleared); the same bytes must seed the
+        // handshake on both sides.
+        let responderStaticPublic = I2PCrypto.canonicalX25519PublicKey(
+            responderStatic.publicKey.rawRepresentation)
         let initiator = try NTCP2InitiatorHandshake(
             localStaticKey: initiatorStatic,
-            remoteStaticKey: responderStatic.publicKey.rawRepresentation
+            remoteStaticKey: responderStaticPublic,
+            remoteRouterHash: responderHash,
+            remoteIV: responderIV
         )
-        let responder = NTCP2ResponderHandshake(localStaticKey: responderStatic)
+        let responder = try NTCP2ResponderHandshake(localStaticKey: responderStatic,
+                                                    localStaticPublicKey: responderStaticPublic,
+                                                    localRouterHash: responderHash,
+                                                    localIV: responderIV)
         // This is a protocol-unit probe. Do not access I2PRouterAppContext.shared:
         // constructing the live router also creates Keychain-backed identity,
         // NetDB storage, transport and tunnel services, which makes an isolated
@@ -135,27 +150,30 @@ enum I2PProductionAudit {
         let routerInfo = try I2PSamples.sampleRouterInfo().serialize()
 
         let request = try initiator.makeSessionRequest(routerInfo: routerInfo, padding: 16)
-        // The announced m3p2len is a wire contract: exactly RouterInfo + tag.
-        guard initiator.announcedPart2Length == routerInfo.count + 16 else {
-            throw I2PMainnetFailure(message: "SessionRequest announced m3p2len \(initiator.announcedPart2Length), expected RouterInfo + 16-byte tag (\(routerInfo.count + 16)) — m3p2len wrong")
+        // Message 3 part 2 is the RouterInfo block — 3-byte block header, the
+        // 1-byte flags field, the RouterInfo — plus the 16-byte tag. m3p2len
+        // must state that exact frame size.
+        let part2FrameLength = 3 + 1 + routerInfo.count + 16
+        guard initiator.announcedPart2Length == part2FrameLength else {
+            throw I2PMainnetFailure(message: "SessionRequest announced m3p2len \(initiator.announcedPart2Length), expected \(part2FrameLength) (RouterInfo block frame) — m3p2len wrong")
         }
-        guard request.count == 82 else {
-            throw I2PMainnetFailure(message: "SessionRequest is \(request.count) bytes, expected 66-byte fixed envelope + 16-byte padding")
+        guard request.count == 80 else {
+            throw I2PMainnetFailure(message: "SessionRequest is \(request.count) bytes, expected the 64-byte fixed envelope + 16-byte padding")
         }
         let (reply, requestConsumed) = try responder.processSessionRequest(request, padding: 16)
         guard requestConsumed == request.count else {
             throw I2PMainnetFailure(message: "responder consumed \(requestConsumed) of \(request.count) SessionRequest bytes — m3p2len/frame mismatch")
         }
-        guard reply.count == 82 else {
-            throw I2PMainnetFailure(message: "SessionCreated is \(reply.count) bytes, expected 66-byte fixed envelope + 16-byte padding")
+        guard reply.count == 80 else {
+            throw I2PMainnetFailure(message: "SessionCreated is \(reply.count) bytes, expected the 64-byte fixed envelope + 16-byte padding")
         }
 
         let (confirm, createdConsumed) = try initiator.processSessionCreated(reply)
         guard createdConsumed == reply.count else {
             throw I2PMainnetFailure(message: "initiator consumed \(createdConsumed) of \(reply.count) SessionCreated bytes")
         }
-        guard confirm.count == routerInfo.count + 16 + 48 else {
-            throw I2PMainnetFailure(message: "message 3 is \(confirm.count) bytes, expected 48 + (RouterInfo + 16 tag) — m3p2len wrong")
+        guard confirm.count == part2FrameLength + 48 else {
+            throw I2PMainnetFailure(message: "message 3 is \(confirm.count) bytes, expected 48 + \(part2FrameLength) — m3p2len wrong")
         }
 
         let confirmConsumed = try responder.processSessionConfirm(confirm)
@@ -172,7 +190,7 @@ enum I2PProductionAudit {
         guard responder.remoteRouterInfo == routerInfo else {
             throw I2PMainnetFailure(message: "RouterInfo delivered through message 3 part 2 did not round-trip intact")
         }
-        guard responder.remoteStaticKey == initiatorStatic.publicKey.rawRepresentation else {
+        guard responder.remoteStaticKey == I2PCrypto.canonicalX25519PublicKey(initiatorStatic.publicKey.rawRepresentation) else {
             throw I2PMainnetFailure(message: "initiator static key transported in SessionConfirm part 1 did not round-trip")
         }
         guard initiator.stage == .established, responder.stage == .established else {
@@ -373,8 +391,7 @@ enum I2PProductionAudit {
         let leases = [I2PLease2(
             gatewayHash: I2PCrypto.randomBytes(32),
             tunnelId: 7,
-            expiration: Date().addingTimeInterval(600),
-            cost: 5
+            expiration: Date().addingTimeInterval(600)
         )]
         let leaseSet = try I2PLeaseSet2.build(
             storeType: .plain,
@@ -404,8 +421,7 @@ enum I2PProductionAudit {
             leases: [I2PLease2(
                 gatewayHash: I2PCrypto.randomBytes(32),
                 tunnelId: 1,
-                expiration: Date(timeIntervalSince1970: 1_000_060),
-                cost: 1
+                expiration: Date(timeIntervalSince1970: 1_000_060)
             )],
             signingSeed: seed
         )

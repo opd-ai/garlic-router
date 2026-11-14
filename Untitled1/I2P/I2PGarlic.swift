@@ -14,12 +14,10 @@ enum I2PGarlicError: Error {
 
 // MARK: - Delivery instructions
 
-/// Garlic clove delivery instructions inside an I2NP payload block: the
-/// spec's garlic flag-byte format. Flag bits: 0x80 = tunnel delivery
-/// (followed by the tunnel ID (4 BE) and the router hash (32)), 0x40 =
-/// router delivery (followed by the router hash (32)), 0x00 = local
-/// delivery; bit 0x02 = delay included (followed by the delay in
-/// milliseconds (4 BE)).
+/// Garlic clove delivery instructions inside an I2NP payload block. The clove
+/// form is the I2NP flag-byte format and delegates to `I2PDeliveryInstructions`
+/// so both paths share one encoding: local 0x00, destination 0x20, router 0x40,
+/// tunnel 0x60, with the "to" hash before the tunnel ID.
 struct I2PGarlicDeliveryInstructions {
     let deliveryInstructions: I2PDeliveryInstructions
 
@@ -28,70 +26,12 @@ struct I2PGarlicDeliveryInstructions {
     }
 
     func serialize() -> Data {
-        var flag: UInt8 = 0
-        if deliveryInstructions.delayMilliseconds != nil { flag |= 0x02 }
-        switch deliveryInstructions.mode {
-        case .local: break
-        case .tunnel: flag |= 0x80
-        case .router: flag |= 0x40
-        }
-        var w = I2PWriter()
-        w.byte(flag)
-        if flag & 0x80 != 0 {
-            w.integer(deliveryInstructions.tunnelID ?? 0)
-            w.hash(deliveryInstructions.routerHash ?? Data(repeating: 0, count: 32))
-        } else if flag & 0x40 != 0 {
-            w.hash(deliveryInstructions.routerHash ?? Data(repeating: 0, count: 32))
-        }
-        if flag & 0x02 != 0 {
-            w.integer(UInt32(deliveryInstructions.delayMilliseconds ?? 0))
-        }
-        return w.data
+        deliveryInstructions.serialize()
     }
 
     /// Returns the instructions and how many bytes of `body` they consumed.
     static func parse(_ body: Data) throws -> (instructions: I2PDeliveryInstructions, consumed: Int) {
-        let bytes = Array(body)
-        guard !bytes.isEmpty else { throw I2PGarlicError.invalidPayload }
-        let flag = bytes[0]
-        var offset = 1
-        var tunnelID: UInt32?
-        var routerHash: Data?
-        var delay: UInt32?
-        if flag & 0x80 != 0 {
-            guard bytes.count >= offset + 36 else { throw I2PGarlicError.invalidPayload }
-            tunnelID = (UInt32(bytes[offset]) << 24) | (UInt32(bytes[offset + 1]) << 16)
-                | (UInt32(bytes[offset + 2]) << 8) | UInt32(bytes[offset + 3])
-            offset += 4
-            routerHash = Data(bytes[offset..<(offset + 32)])
-            offset += 32
-        } else if flag & 0x40 != 0 {
-            guard bytes.count >= offset + 32 else { throw I2PGarlicError.invalidPayload }
-            routerHash = Data(bytes[offset..<(offset + 32)])
-            offset += 32
-        }
-        if flag & 0x02 != 0 {
-            guard bytes.count >= offset + 4 else { throw I2PGarlicError.invalidPayload }
-            let high = UInt32(bytes[offset])
-            let midHigh = UInt32(bytes[offset + 1])
-            let midLow = UInt32(bytes[offset + 2])
-            let low = UInt32(bytes[offset + 3])
-            delay = high << 24 | midHigh << 16 | midLow << 8 | low
-            offset += 4
-        }
-        if flag & 0x80 != 0 {
-            return (I2PDeliveryInstructions(mode: .tunnel, tunnelID: tunnelID,
-                                            routerHash: routerHash, delayMilliseconds: delay),
-                    offset)
-        }
-        if flag & 0x40 != 0 {
-            return (I2PDeliveryInstructions(mode: .router, tunnelID: nil,
-                                            routerHash: routerHash, delayMilliseconds: delay),
-                    offset)
-        }
-        return (I2PDeliveryInstructions(mode: .local, tunnelID: nil,
-                                        routerHash: nil, delayMilliseconds: delay),
-                offset)
+        try I2PDeliveryInstructions.parse(body)
     }
 }
 
@@ -158,9 +98,14 @@ enum I2PGarlicBlock {
         var r = I2PReader(data)
         var blocks: [I2PGarlicBlock] = []
         while r.remaining > 0 {
+            // A payload section may be aligned with trailing zero padding, which
+            // is not a block: stop rather than misread it as a zero-length
+            // DateTime block (which would reject an otherwise valid envelope).
+            if r.bytes[r.offset...].allSatisfy({ $0 == 0 }) { break }
             let type = try r.byte()
             let length = Int(try r.short())
             let body = try r.raw(length)
+
             switch type {
             case I2PGarlicBlockType.dateTime.rawValue:
                 guard body.count == 4 else { throw I2PGarlicError.invalidPayload }
@@ -320,6 +265,11 @@ enum I2PGarlicCrypto {
         I2PCrypto.sha256(data)
     }
 
+    /// The 12-byte all-zero nonce: every section of the envelope is sealed under
+    /// a freshly derived single-use key, so the nonce carries no reuse risk and
+    /// rides implicitly (it is part of the section key's context, not the wire).
+    static let zeroNonce = Data(repeating: 0, count: 12)
+
     // New-session KDF (Noise-faithful):
     //   h0 = ck0 = SHA-256(protocolName)
     //   ephemeral section rides cleartext; MixHash: h1 = SHA-256(h0 ‖ e)
@@ -330,9 +280,11 @@ enum I2PGarlicCrypto {
     //   ck2 = HMAC(temp2, 0x01); payload key = HMAC(temp2, ck2 ‖ h2)
 
     /// The new-session envelope: [ephemeral (32)][static section (48)][payload section].
-    /// Static section: ChaChaPoly(k_static, nonce 0, sender static public key ‖ zero pad
-    /// to a 48-byte section with the 16-byte tag inside). Payload section:
-    /// ChaChaPoly(k_payload, nonce 0, blocks ‖ zero padding to a 16-byte boundary).
+    /// Static section: ChaChaPoly(k_static, nonce 0, sender static public key) —
+    /// 32-byte ciphertext plus the 16-byte tag. Payload section:
+    /// ChaChaPoly(k_payload, nonce 0, blocks) — the payload blocks plus the tag.
+    /// The nonce is implicit zeros and never on the wire: each section key is
+    /// derived fresh per envelope, so the fixed nonce cannot repeat under a key.
     static func sealNewSession(_ payloadBlocks: Data,
                                peerStatic: Curve25519.KeyAgreement.PublicKey,
                                senderStatic: Curve25519.KeyAgreement.PrivateKey) throws -> Data {
@@ -344,18 +296,17 @@ enum I2PGarlicCrypto {
         let temp = hmac(es.withUnsafeBytes { Data($0) }, key: h0)
         let ck1 = hmac(Data([0x01]), key: temp)
         let staticSectionKey = hmac(ck1, key: temp)
-        let staticBox = try ChaChaPoly.seal(senderStatic.publicKey.rawRepresentation,
-                                            using: SymmetricKey(data: staticSectionKey))
-        let staticSection = staticBox.combined // 32 + 16 = 48
+        let staticSection = try I2PCrypto.chacha20Poly1305Seal(
+            key: staticSectionKey, nonce: zeroNonce,
+            plaintext: senderStatic.publicKey.rawRepresentation)
         let h2 = sha256(h1 + staticSection)
         let ss = try senderStatic.sharedSecretFromKeyAgreement(with: peerStatic)
         let temp2 = hmac(ss.withUnsafeBytes { Data($0) }, key: ck1)
         let ck2 = hmac(Data([0x01]), key: temp2)
         let payloadKey = hmac(ck2 + h2, key: temp2)
-        var paddedPayload = payloadBlocks
-        while paddedPayload.count % 16 != 0 { paddedPayload.append(0) }
-        let payloadBox = try ChaChaPoly.seal(paddedPayload, using: SymmetricKey(data: payloadKey))
-        return ephemeralPublic + staticSection + payloadBox.combined
+        let payloadSection = try I2PCrypto.chacha20Poly1305Seal(
+            key: payloadKey, nonce: zeroNonce, plaintext: payloadBlocks)
+        return ephemeralPublic + staticSection + payloadSection
     }
 
     /// Opens a new-session envelope: returns the decrypted payload-block
@@ -373,8 +324,9 @@ enum I2PGarlicCrypto {
         let ck1 = hmac(Data([0x01]), key: temp)
         let staticSectionKey = hmac(ck1, key: temp)
         let staticSection = payload.subdata(in: 32..<80)
-        let staticBox = try ChaChaPoly.SealedBox(combined: staticSection)
-        guard let staticPlain = try? ChaChaPoly.open(staticBox, using: SymmetricKey(data: staticSectionKey)),
+        guard let staticPlain = try? I2PCrypto.chacha20Poly1305Open(
+                key: staticSectionKey, nonce: zeroNonce,
+                ciphertextAndTag: staticSection),
               staticPlain.count == 32 else {
             throw I2PGarlicError.decryptFailed
         }
@@ -385,8 +337,9 @@ enum I2PGarlicCrypto {
         let ck2 = hmac(Data([0x01]), key: temp2)
         let payloadKey = hmac(ck2 + h2, key: temp2)
         let payloadSection = payload.subdata(in: 80..<payload.count)
-        let payloadBox = try ChaChaPoly.SealedBox(combined: payloadSection)
-        guard let blocks = try? ChaChaPoly.open(payloadBox, using: SymmetricKey(data: payloadKey)) else {
+        guard let blocks = try? I2PCrypto.chacha20Poly1305Open(
+                key: payloadKey, nonce: zeroNonce,
+                ciphertextAndTag: payloadSection) else {
             throw I2PGarlicError.decryptFailed
         }
         return (blocks, staticPlain)
@@ -419,6 +372,16 @@ enum I2PGarlicCrypto {
 final class I2PGarlicInboundTagManager {
     private let lock = NSLock()
     private var bindings: [Data: Data] = [:] // tag → per-tag AEAD key
+    /// Tags this session already spent, oldest first. Keeping them is what makes
+    /// single-use enforcement real: a replayed envelope is recognised as a spent
+    /// tag and rejected, instead of being misread as a new-session ephemeral key.
+    private var consumed: Set<Data> = []
+    private var consumedOrder: [Data] = []
+    private static let rememberedTagLimit = 4096
+
+    /// Called after a new tag set is installed, so envelopes that arrived
+    /// before the new-session message that armed it can be retried.
+    var onRegistered: (() -> Void)?
 
     /// Registers a tag set delivered in an Options block: the seed ratchets
     /// into `count` tags, each binding to its own ratcheted AEAD key.
@@ -429,12 +392,29 @@ final class I2PGarlicInboundTagManager {
             bindings[entry.tag] = entry.key
         }
         lock.unlock()
+        onRegistered?()
     }
 
+    /// Spends a tag and returns its per-tag AEAD key (nil when never issued or
+    /// already spent).
     func consume(_ tag: Data) -> Data? {
         lock.lock()
         defer { lock.unlock() }
-        return bindings.removeValue(forKey: tag)
+        guard let key = bindings.removeValue(forKey: tag) else { return nil }
+        consumed.insert(tag)
+        consumedOrder.append(tag)
+        if consumedOrder.count > Self.rememberedTagLimit {
+            let dropped = consumedOrder.removeFirst()
+            consumed.remove(dropped)
+        }
+        return key
+    }
+
+    /// True when the tag was issued and already spent (a replay).
+    func wasConsumed(_ tag: Data) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return consumed.contains(tag)
     }
 
     var count: Int { lock.lock(); defer { lock.unlock() }; return bindings.count }
@@ -458,13 +438,18 @@ final class I2PGarlicInboundSessionManager {
         if encrypted.count > I2PGarlicCrypto.tagLength + 16 {
             let tag = Data(encrypted.prefix(I2PGarlicCrypto.tagLength))
             if let key = tagManager.consume(tag) {
-                let box = try ChaChaPoly.SealedBox(
-                    combined: encrypted.subdata(in: I2PGarlicCrypto.tagLength..<encrypted.count))
-                guard let plain = try? ChaChaPoly.open(
-                    box, using: SymmetricKey(data: key)) else {
+                guard let plain = try? I2PCrypto.chacha20Poly1305Open(
+                    key: key, nonce: I2PGarlicCrypto.zeroNonce,
+                    ciphertextAndTag: encrypted.subdata(in: I2PGarlicCrypto.tagLength..<encrypted.count)) else {
                     throw I2PGarlicError.decryptFailed
                 }
                 return try I2PGarlicCloveSet.parse(plain, messageID: messageID)
+            }
+            // A tag we issued and already spent is a replay: reject it here
+            // rather than letting the spent tag masquerade as a new-session
+            // ephemeral key.
+            if tagManager.wasConsumed(tag) {
+                throw I2PGarlicError.decryptFailed
             }
         }
         let (blocks, _) = try I2PGarlicCrypto.openNewSession(encrypted, localKey: localKey)
@@ -491,6 +476,14 @@ final class I2PGarlicSession {
     private var tagSetSeed: Data?
     private var tagEntries: [(tag: Data, key: Data)] = []
     private let lock = NSLock()
+    private let sendLock = NSLock()
+
+    /// Serialises one whole send decision (tag-set embedding + sealing).
+    func withSendLock<T>(_ body: () throws -> T) rethrows -> T {
+        sendLock.lock()
+        defer { sendLock.unlock() }
+        return try body()
+    }
 
     init(peerPublicKey: Curve25519.KeyAgreement.PublicKey,
          staticKey: Curve25519.KeyAgreement.PrivateKey = Curve25519.KeyAgreement.PrivateKey(),
@@ -533,8 +526,11 @@ final class I2PGarlicSession {
         if let entry = tagEntries.first {
             tagEntries.removeFirst()
             lock.unlock()
-            let box = try ChaChaPoly.seal(cloveSetBytes, using: SymmetricKey(data: entry.key))
-            return entry.tag + box.combined
+            // Tag frame: [tag (32)][ciphertext + 16-byte tag]. The per-tag key
+            // is single-use, so the AEAD nonce is the implicit zero nonce.
+            let box = try I2PCrypto.chacha20Poly1305Seal(
+                key: entry.key, nonce: I2PGarlicCrypto.zeroNonce, plaintext: cloveSetBytes)
+            return entry.tag + box
         }
         lock.unlock()
         // New session: three-section envelope; arm the tag set (the seed
@@ -583,16 +579,25 @@ enum I2PGarlicEndToEndPipeline {
         // clove's own delivery is local to the destination.
         let delivery = I2PDeliveryInstructions(mode: .local,
                                                tunnelID: nil,
-                                               routerHash: nil,
-                                               delayMilliseconds: nil)
+                                               routerHash: nil)
         let cloves = [I2PGarlicClove(deliveryInstructions: delivery, message: message)]
-        let tagSet = session.prepareHandshakeTags()
-        let cloveSet = try I2PGarlicCloveSet(expiration: expiry,
-                                             messageID: UInt32.random(in: 1...UInt32.max),
-                                             cloves: cloves,
-                                             tagSetSeed: tagSet?.seed,
-                                             tagCount: tagSet?.count ?? 0)
-        let encrypted = try session.wrapCloveSet(try cloveSet.serialize())
+        // Deciding whether this envelope carries a tag set and sealing it must
+        // be one atomic step per session. Concurrent sends (the chunks of a
+        // fragmented datagram, parallel stream writes) otherwise interleave:
+        // one send sees "tags remain" and embeds no Options block, another
+        // spends the last tag, and the first then seals as a NEW SESSION with
+        // no tag set while the sender arms tags the receiver never learned,
+        // stranding every later tagged frame.
+        let (_, cloveSet, encrypted) = try session.withSendLock {
+            let tagSet = session.prepareHandshakeTags()
+            let cloveSet = try I2PGarlicCloveSet(expiration: expiry,
+                                                 messageID: UInt32.random(in: 1...UInt32.max),
+                                                 cloves: cloves,
+                                                 tagSetSeed: tagSet?.seed,
+                                                 tagCount: tagSet?.count ?? 0)
+            let encrypted = try session.wrapCloveSet(try cloveSet.serialize())
+            return (tagSet, cloveSet, encrypted)
+        }
         // The GarlicMessage I2NP header carries the message ID and expiration.
         let garlic = I2NPMessage(type: .garlic,
                                  messageID: cloveSet.messageID,
@@ -628,10 +633,20 @@ final class I2PGarlicMessageHandler {
     private let lock = NSLock()
     private var localConsumers: [(I2NPMessage, Data) -> Void] = []
 
+    /// Optional diagnostics hook: a garlic message that fails to unwrap is
+    /// otherwise dropped silently, which is undebuggable from a caller.
+    var onError: ((String) -> Void)?
+    /// Optional diagnostics hook for a successfully opened envelope.
+    var onMessage: ((String) -> Void)?
+
     init(sessionManager: I2PGarlicInboundSessionManager,
          deliveryTransport: I2PDeliveryTransport?) {
         self.sessionManager = sessionManager
         self.deliveryTransport = deliveryTransport
+        // A new tag set lets envelopes that arrived too early be retried.
+        sessionManager.tagManager.onRegistered = { [weak self] in
+            self?.retryDeferred()
+        }
     }
 
     func addLocalConsumer(_ consumer: @escaping (I2NPMessage, Data) -> Void) {
@@ -642,9 +657,35 @@ final class I2PGarlicMessageHandler {
 
     func handle(_ message: I2NPMessage, from source: Data) {
         guard message.type == .garlic else { return }
-        guard let cloveSet = try? sessionManager.unwrapPayload(message.payload,
-                                                               messageID: message.messageID) else { return }
-        guard cloveSet.expiration > Date() else { return } // expiration enforcement
+        do {
+            let cloveSet = try sessionManager.unwrapPayload(message.payload,
+                                                           messageID: message.messageID)
+            deliver(cloveSet, from: source)
+        } catch let error as I2PGarlicError {
+            // A tag-based envelope can overtake the new-session message that
+            // armed its tag set: hops deliver concurrently, so the small
+            // continuation frames can arrive before the (larger) new-session
+            // envelope. Hold it briefly and retry when the tags appear.
+            if message.payload.count > I2PGarlicCrypto.tagLength + 16,
+               error == .decryptFailed || error == .invalidPayload {
+                // `invalidPayload` covers short tag frames (acks, FINs): too
+                // small to parse as a new-session envelope, so the fall-through
+                // reports a size error rather than an authentication failure.
+                deferEnvelope(message, from: source)
+            } else {
+                onError?("garlic unwrap failed: \(error) (\(message.payload.count)B)")
+            }
+        } catch {
+            onError?("garlic unwrap failed: \(error) (\(message.payload.count)B)")
+        }
+    }
+
+    private func deliver(_ cloveSet: I2PGarlicCloveSet, from source: Data) {
+        guard cloveSet.expiration > Date() else {
+            onError?("garlic clove set expired")
+            return
+        }
+        onMessage?("garlic ok: cloves=\(cloveSet.cloves.count) tags=\(cloveSet.tagSetSeed == nil ? "none" : "\(cloveSet.tagCount)")")
         for clove in cloveSet.cloves {
             switch clove.deliveryInstructions.mode {
             case .local:
@@ -666,9 +707,92 @@ final class I2PGarlicMessageHandler {
                 guard let transport = deliveryTransport,
                       let routerHash = clove.deliveryInstructions.routerHash else { continue }
                 Task { try? await transport.deliver(clove.message.serialize(), to: routerHash) }
+            case .destination:
+                // Addressed to a destination this acceptor does not own.
+                continue
             }
-            // Delay-flagged cloves would sleep `delayMilliseconds` before
-            // delivery; the dispatch above applies to immediate delivery.
+            // Delay is never present in the spec's 1/33/37-byte forms; every
+            // dispatched clove is delivered immediately.
+        }
+    }
+
+    // MARK: Envelopes that outran their tag set
+
+    private struct DeferredEnvelope {
+        let message: I2NPMessage
+        let source: Data
+        let since: Date
+    }
+
+    private var deferredEnvelopes: [DeferredEnvelope] = []
+    private static let maximumDeferred = 64
+    /// How long an envelope waits for its tag set. The wait is bounded by age,
+    /// not by retry count: any session's tag registration triggers a retry
+    /// pass, so with several sessions running a count-based limit is used up
+    /// by registrations that have nothing to do with the held envelope.
+    private static let deferralLifetime: TimeInterval = 30
+
+    private func deferEnvelope(_ message: I2NPMessage, from source: Data) {
+        lock.lock()
+        if deferredEnvelopes.count >= Self.maximumDeferred { deferredEnvelopes.removeFirst() }
+        deferredEnvelopes.append(DeferredEnvelope(message: message, source: source, since: Date()))
+        lock.unlock()
+        onMessage?("garlic held: \(message.payload.count)B awaiting its tag set")
+        // The tag set may have been registered between the failed unwrap and
+        // this append (the registration's retry pass saw an empty queue), so
+        // look once more now that the envelope is queued.
+        retryDeferred()
+    }
+
+    private func retryDeferred() {
+        // A registration that lands while another pass is mid-flight sees an
+        // empty queue (the pass drained it) and would otherwise retry nothing,
+        // stranding an envelope the pass re-queues after its own failed
+        // unwrap. The generation counter makes the pass repeat in that case.
+        lock.lock()
+        registrationGeneration &+= 1
+        if retryInFlight {
+            lock.unlock()
+            return
+        }
+        retryInFlight = true
+        lock.unlock()
+        while true {
+            lock.lock()
+            let generation = registrationGeneration
+            let pending = deferredEnvelopes
+            deferredEnvelopes.removeAll()
+            lock.unlock()
+            if !pending.isEmpty { retry(pending) }
+            lock.lock()
+            if registrationGeneration == generation || deferredEnvelopes.isEmpty {
+                retryInFlight = false
+                lock.unlock()
+                return
+            }
+            lock.unlock()
+        }
+    }
+
+    private var registrationGeneration: UInt64 = 0
+    private var retryInFlight = false
+
+    private func retry(_ pending: [DeferredEnvelope]) {
+        let now = Date()
+        for item in pending {
+            do {
+                let cloveSet = try sessionManager.unwrapPayload(item.message.payload,
+                                                               messageID: item.message.messageID)
+                deliver(cloveSet, from: item.source)
+            } catch {
+                if now.timeIntervalSince(item.since) < Self.deferralLifetime {
+                    lock.lock()
+                    deferredEnvelopes.append(item)
+                    lock.unlock()
+                } else {
+                    onError?("garlic held envelope dropped after \(Int(Self.deferralLifetime))s: \(error)")
+                }
+            }
         }
     }
 }
@@ -714,14 +838,11 @@ private func garlicCloveSetTest() async throws -> String {
     let messageB = I2NPMessage(type: .dataMessage, payload: Data("clove B".utf8))
     let messageC = I2NPMessage(type: .deliveryStatus, messageID: 7, payload: Data("clove C".utf8))
 
-    let local = I2PDeliveryInstructions(mode: .local, tunnelID: nil,
-                                        routerHash: nil, delayMilliseconds: nil)
+    let local = I2PDeliveryInstructions(mode: .local, tunnelID: nil, routerHash: nil)
     let tunnel = I2PDeliveryInstructions(mode: .tunnel, tunnelID: 0x11223344,
-                                         routerHash: I2PCrypto.randomBytes(32),
-                                         delayMilliseconds: 500)
+                                         routerHash: I2PCrypto.randomBytes(32))
     let router = I2PDeliveryInstructions(mode: .router, tunnelID: nil,
-                                         routerHash: I2PCrypto.randomBytes(32),
-                                         delayMilliseconds: nil)
+                                         routerHash: I2PCrypto.randomBytes(32))
 
     let expiration = Date().addingTimeInterval(120)
     let messageID: UInt32 = 0x00C10AFF
@@ -741,7 +862,6 @@ private func garlicCloveSetTest() async throws -> String {
     let modes = parsed.cloves.map { $0.deliveryInstructions.mode }
     guard modes == [.local, .tunnel, .router] else { throw I2PGarlicError.invalidPayload }
     guard parsed.cloves[1].deliveryInstructions.tunnelID == 0x11223344,
-          parsed.cloves[1].deliveryInstructions.delayMilliseconds == 500,
           parsed.cloves[1].deliveryInstructions.routerHash == tunnel.routerHash else { throw I2PGarlicError.invalidPayload }
     guard sameMessage(parsed.cloves[0].message, messageA),
           sameMessage(parsed.cloves[1].message, messageB),
@@ -760,7 +880,7 @@ private func garlicCloveSetTest() async throws -> String {
     guard try I2PGarlicCloveSet.parse(withUnknown.data, messageID: messageID).cloves.count == 3 else {
         throw I2PGarlicError.invalidPayload
     }
-    return "DateTime/I2NP blocks round-trip byte-for-byte; 3 cloves across all delivery modes with delay intact; unknown blocks skipped"
+    return "DateTime/I2NP blocks round-trip byte-for-byte; 3 cloves across all delivery modes; unknown blocks skipped"
 }
 
 // Test: ECIES-X25519 three-section envelope, tag-set delivery in Options
@@ -771,7 +891,7 @@ private func garlicSessionTagsTest() async throws -> String {
     let aliceManager = I2PGarlicInboundSessionManager(localKey: aliceKey)
     let bobSession = I2PGarlicSession(peerPublicKey: aliceKey.publicKey, tagsPerHandshake: 4)
     let localDelivery = I2PDeliveryInstructions(mode: .local, tunnelID: nil,
-                                                routerHash: nil, delayMilliseconds: nil)
+                                                routerHash: nil)
 
     func dataClove(_ text: String) throws -> I2PGarlicClove {
         I2PGarlicClove(deliveryInstructions: localDelivery,

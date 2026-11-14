@@ -52,8 +52,10 @@ struct I2PWriter {
         data.append(contentsOf: utf8)
     }
 
-    /// I2P Mapping: 2-byte big-endian length of the body, then key/value pairs
-    /// (keys sorted for deterministic encoding).
+    /// I2P Mapping: 2-byte big-endian length of the body, then
+    /// `[len][key]=[len][value];` pairs (keys sorted for deterministic
+    /// encoding). The '=' and ';' separators are part of the wire format —
+    /// without them every real RouterInfo/LeaseSet2 options mapping mis-parses.
     mutating func mapping(_ value: [String: String]) {
         var body = Data()
         for key in value.keys.sorted() {
@@ -61,8 +63,10 @@ struct I2PWriter {
             let v = Array(value[key]!.utf8)
             body.append(UInt8(k.count))
             body.append(contentsOf: k)
+            body.append(0x3D) // '='
             body.append(UInt8(v.count))
             body.append(contentsOf: v)
+            body.append(0x3B) // ';'
         }
         short(UInt16(body.count))
         raw(body)
@@ -126,7 +130,9 @@ struct I2PReader {
         var result: [String: String] = [:]
         while inner.remaining > 0 {
             let key = try inner.string()
+            guard try inner.byte() == 0x3D else { throw I2PWireError.invalidFormat } // '='
             let value = try inner.string()
+            guard try inner.byte() == 0x3B else { throw I2PWireError.invalidFormat } // ';'
             result[key] = value
         }
         return result

@@ -12,11 +12,52 @@ import CryptoKit
 
 // MARK: - Test rig (loopback router network)
 
+/// Keeps the most recent bridges' activity logs so a failed case reports the
+/// commands and replies of the connection it lost, not just "timeout".
+private enum SAMTestLog {
+    private static let lock = NSLock()
+    private static var servers: [I2PSAMServer] = []
+    private static var trace: [String] = []
+
+    static func register(_ server: I2PSAMServer) {
+        lock.lock()
+        servers.append(server)
+        if servers.count > 8 { servers.removeFirst(servers.count - 8) }
+        lock.unlock()
+    }
+
+    static func note(_ line: String) {
+        lock.lock()
+        trace.append(line)
+        if trace.count > 200 { trace.removeFirst(trace.count - 200) }
+        lock.unlock()
+    }
+
+    static func reset() {
+        lock.lock()
+        trace.removeAll()
+        lock.unlock()
+    }
+
+    static func recent(_ limit: Int = 3) -> String {
+        lock.lock()
+        let snapshot = Array(servers.suffix(limit))
+        let route = Array(trace.suffix(120))
+        lock.unlock()
+        let logs = snapshot.flatMap { $0.log.suffix(14) }
+        return (logs + route).joined(separator: " | ")
+    }
+}
+
 private final class SAMTestNode {
     let routerHash = I2PCrypto.randomBytes(32)
     let encryptionKey = Curve25519.KeyAgreement.PrivateKey()
     let participant: I2PTunnelParticipant
     let router: I2NPMessageRouter
+    /// Strongly held: `I2NPMessageRouter.deliveryTransport` is weak, so a
+    /// transport kept only there is deallocated and every hop-to-hop forward
+    /// (the message-path end handing the payload on) silently goes nowhere.
+    let deliveryTransport: I2NPLoopbackDeliveryTransport
 
     init(buildHub: I2PTunnelBuildHub, deliveryHub: I2NPLoopbackDeliveryHub) {
         participant = I2PTunnelParticipant(
@@ -26,9 +67,17 @@ private final class SAMTestNode {
         )
         buildHub.register(participant)
         router = I2NPMessageRouter(localRouterHash: routerHash)
-        let delivery = I2NPLoopbackDeliveryTransport(hub: deliveryHub, localRouterHash: routerHash)
-        router.deliveryTransport = delivery
+        // The router must know the participant, or an arriving TunnelData
+        // message finds no hop state and the whole tunnel silently drops it —
+        // exactly what every cross-rig stream and datagram timed out on.
+        router.addTunnelParticipant(participant)
+        deliveryTransport = I2NPLoopbackDeliveryTransport(hub: deliveryHub, localRouterHash: routerHash)
+        router.deliveryTransport = deliveryTransport
         deliveryHub.attach(router)
+        let label = routerHash.hex.prefix(4)
+        router.onMessageRouted = { message, _ in
+            SAMTestLog.note("\(label)<-\(message.type)(\(message.payload.count))")
+        }
     }
 
     var peer: I2PTunnelPeer {
@@ -56,11 +105,18 @@ private final class SAMTestRig {
     let netDB: I2PNetworkDatabase
     let server: I2PSAMServer
 
+    /// One delivery bus for every rig. Each rig models a separate router, but
+    /// they all sit on the same network: a garlic envelope a sender's outbound
+    /// tunnel hands to a lease gateway in the peer's rig must still be
+    /// routable. A per-rig bus dropped it, which timed out every cross-rig
+    /// stream and datagram case.
+    private static let sharedDeliveryHub = I2NPLoopbackDeliveryHub()
+
     init(label: String) throws {
         // Build everything with local constants first so the core's
         // controlledRouter closure captures nodes, not self.
         let buildHub = I2PTunnelBuildHub()
-        let deliveryHub = I2NPLoopbackDeliveryHub()
+        let deliveryHub = SAMTestRig.sharedDeliveryHub
         let ownerNode = SAMTestNode(buildHub: buildHub, deliveryHub: deliveryHub)
         let hopNodeList = (0..<3).map { _ in
             SAMTestNode(buildHub: buildHub, deliveryHub: deliveryHub)
@@ -102,6 +158,7 @@ private final class SAMTestRig {
         self.hopNodes = hopNodeList
         self.netDB = netDBInstance
         self.server = serverInstance
+        SAMTestLog.register(serverInstance)
     }
 
     var boundPort: UInt16? {
@@ -233,16 +290,19 @@ private final class SAMTestClient: @unchecked Sendable {
     func readLine() async throws -> String {
         try await withCheckedThrowingContinuation { continuation in
             lock.lock()
-            if receivedEOF {
-                lock.unlock()
-                continuation.resume(throwing: SAMTestClientError.eof)
-                return
-            }
+            // Buffered data wins over EOF: the server may write its final reply
+            // and close in one segment, so the line is already in the buffer by
+            // the time the close is observed.
             if let newline = buffer.firstIndex(of: 0x0A) {
                 let lineData = Data(Array(buffer[buffer.startIndex..<newline]))
                 buffer = Data(Array(buffer[buffer.index(after: newline)...]))
                 lock.unlock()
                 continuation.resume(returning: String(decoding: lineData, as: UTF8.self))
+                return
+            }
+            if receivedEOF {
+                lock.unlock()
+                continuation.resume(throwing: SAMTestClientError.eof)
                 return
             }
             let pending = SAMTestPendingRead<String>(continuation: continuation)
@@ -255,16 +315,16 @@ private final class SAMTestClient: @unchecked Sendable {
     func readBytes(_ count: Int) async throws -> Data {
         try await withCheckedThrowingContinuation { continuation in
             lock.lock()
-            if receivedEOF {
-                lock.unlock()
-                continuation.resume(throwing: SAMTestClientError.eof)
-                return
-            }
             if buffer.count >= count {
                 let payload = Data(Array(buffer.prefix(count)))
                 buffer = Data(Array(buffer.dropFirst(count)))
                 lock.unlock()
                 continuation.resume(returning: payload)
+                return
+            }
+            if receivedEOF {
+                lock.unlock()
+                continuation.resume(throwing: SAMTestClientError.eof)
                 return
             }
             let pending = SAMTestPendingRead<Data>(continuation: continuation)
@@ -349,19 +409,34 @@ private func sampleSessionHandshake(_ client: SAMTestClient, id: String,
 // MARK: - Suite
 
 enum I2PSAMConformanceTest {
+    /// Stage tracing for the load case (SAM_TRACE=1), so a stalled concurrent
+    /// stream names the step it reached instead of only reporting a timeout.
+    private static let loadTrace = ProcessInfo.processInfo.environment["SAM_TRACE"] != nil
+
     static func runAll() async -> [I2PSelfTestResult] {
         var results: [I2PSelfTestResult] = []
         func run(_ name: String, _ body: () async throws -> String) async {
+            SAMTestLog.reset()
+            // Optional single-case filter for diagnosing one failing scenario
+            // (SAM_ONLY=DATAGRAM), so a full 20 s timeout sweep isn't required.
+            if let only = ProcessInfo.processInfo.environment["SAM_ONLY"],
+               !name.uppercased().contains(only.uppercased()) {
+                return
+            }
             do {
                 results.append(I2PSelfTestResult(name: name, passed: true, detail: try await body()))
             } catch {
-                results.append(I2PSelfTestResult(name: name, passed: false, detail: String(describing: error)))
+                // A SAM failure is almost always a line that never arrived; the
+                // bridge's own command log says which stage stalled.
+                results.append(I2PSelfTestResult(name: name, passed: false,
+                                                 detail: "\(error) · \(SAMTestLog.recent())"))
             }
         }
         await run("SAM handshake + command grammar edge cases over loopback TCP", handshakeTest)
         await run("SAM STREAM session create, LeaseSet publication + session registry", sessionTest)
         await run("SAM NAMING lookup (ME/b32/addressbook) + DEST GENERATE round trip", namingTest)
         await run("SAM NAMING b33 lookup (credentialled resolve + stranger opaque failure)", b33NamingTest)
+        await run("SAM b33 publication (encrypted LS2 under the blinded key + self-resolution)", encryptedPublicationTest)
         await run("SAM STREAM CONNECT/ACCEPT end-to-end through tunnels", streamE2ETest)
         await run("SAM DATAGRAM SEND fragmentation + reassembly", datagramTest)
         await run("SAM RAW anonymous datagram delivery", rawTest)
@@ -562,7 +637,7 @@ enum I2PSAMConformanceTest {
             leases: [
                 I2PLease2(gatewayHash: rig.hopNodes[0].routerHash,
                           tunnelId: 0x0BAD_F00D,
-                          expiration: Date().addingTimeInterval(600), cost: 3),
+                          expiration: Date().addingTimeInterval(600)),
             ],
             signingSeed: keys.signingSeed)
         let envelope = try I2PB33Blinding.buildEncryptedLeaseSet2(
@@ -607,6 +682,118 @@ enum I2PSAMConformanceTest {
 
         client.close()
         return "credentialled b33 resolved to the real destination; stranger and corrupt b33 failed closed"
+    }
+
+    /// Encrypted (b33) LeaseSet2 publication: a session created with
+    /// ENCRYPTED_LEASESET=true publishes its leases encrypted under its
+    /// destination's blinded key (stored under the blinded netdb key, no plain
+    /// entry left behind), hands out its own b33 address, and the published
+    /// entry resolves back to the session's own live leases.
+    private static func encryptedPublicationTest() async throws -> String {
+        let rig = try SAMTestRig(label: "b33-publish")
+        rig.start()
+        defer { rig.stop() }
+        guard let port = await waitForPort(rig) else { throw I2PSAMError.timeout }
+
+        // Imported keys (not TRANSIENT) so the test derives the same b33.
+        let keys = I2PSAMDestinationKeys.generate()
+        let client = SAMTestClient()
+        try await client.connect(port: port)
+        defer { client.close() }
+        client.send("HELLO VERSION MIN=3.0 MAX=3.3")
+        _ = try await client.readLine()
+        client.send("SESSION CREATE STYLE=STREAM ID=b33pub DESTINATION=\(keys.privateKeyData.base64EncodedString()) ENCRYPTED_LEASESET=true")
+        let status = try await client.readLine()
+        guard status.hasPrefix("SESSION STATUS RESULT=OK") else {
+            throw I2PSAMError.invalidCommand("encrypted session failed: \(status)")
+        }
+
+        let blinded = try I2PB33Blinding.blind(
+            destinationSeed: keys.signingSeed,
+            encryptionPublicKey: keys.encryptionKey.publicKey.rawRepresentation)
+
+        // The session hands out its own b33 address.
+        guard replyValue(after: "B33", in: status) == blinded.b33Address,
+              I2PB33Blinding.b33Decode(blinded.b33Address) == blinded.blindedPublicKey else {
+            throw I2PSAMError.invalidCommand("b33 address not handed out: \(status)")
+        }
+        guard let session = rig.server.session(named: "b33pub"),
+              session.b33Address == blinded.b33Address,
+              session.blindedNetDBKey == blinded.netDBKey else {
+            throw I2PSAMError.invalidCommand("session b33 key set mismatch")
+        }
+
+        let liveLeases = session.pool.inboundTunnels.filter { !$0.isExpired() }
+        guard !liveLeases.isEmpty else { throw I2PSAMError.noTunnels }
+
+        // Publication: the encrypted entry is stored under the blinded netdb
+        // key, signature-verified, and its envelope destination carries the
+        // blinded signing key.
+        guard let entry = await rig.netDB.lookup(blinded.netDBKey),
+              let envelope = entry.leaseSet2,
+              entry.entryType == .encryptedLeaseSet2,
+              envelope.storeType == .encrypted,
+              envelope.destination.hash == blinded.netDBKey,
+              envelope.destination.signingPublicKey == blinded.blindedPublicKey,
+              envelope.verifySignature() else {
+            throw I2PSAMError.invalidCommand("encrypted entry missing under the blinded key")
+        }
+        // Nothing plain was left behind under the destination hash.
+        guard await rig.netDB.lookup(keys.destination.hash) == nil,
+              session.leaseSet == nil else {
+            throw I2PSAMError.invalidCommand("plain LeaseSet published alongside the b33 entry")
+        }
+
+        // Self-resolution: the published entry decrypts back to the session's
+        // own live leases and destination.
+        let credentials = I2PB33Credentials(
+            ed25519Seed: keys.signingSeed,
+            x25519PrivateKey: keys.encryptionKey.rawRepresentation)
+        guard let resolved = await rig.netDB.lookupEncryptedLeaseSet2(credentials: credentials),
+              resolved.storeType == .plain,
+              resolved.destination.hash == keys.destination.hash,
+              Set(resolved.leases.map(\.tunnelId)) == Set(liveLeases.map(\.gatewayTunnelID)),
+              Set(resolved.leases.map(\.gatewayHash)) == Set(liveLeases.map { $0.hops[0].routerHash }) else {
+            throw I2PSAMError.destinationNotFound
+        }
+        // ... and surfaces through the delivery path plain LS2s use.
+        guard let delivery = await rig.netDB.resolveEncryptedDestination(credentials: credentials),
+              delivery.destination.hash == keys.destination.hash,
+              delivery.leases.count == liveLeases.count else {
+            throw I2PSAMError.destinationNotFound
+        }
+
+        // A renewal cycle rebuilds from the live leases and the entry keeps
+        // resolving; a stranger's credentials still resolve nothing.
+        _ = await session.publishLeaseSet()
+        _ = await session.refreshEncryptedPublication()
+        guard let again = await rig.netDB.lookupEncryptedLeaseSet2(credentials: credentials),
+              again.destination.hash == keys.destination.hash,
+              Set(again.leases.map(\.tunnelId)) == Set(liveLeases.map(\.gatewayTunnelID)) else {
+            throw I2PSAMError.invalidCommand("renewal lost the published b33 entry")
+        }
+        let stranger = I2PB33Credentials(
+            ed25519Seed: I2PCrypto.generateEd25519Seed(),
+            x25519PrivateKey: I2PCrypto.generateX25519KeyPair().privateKey)
+        guard await rig.netDB.lookupEncryptedLeaseSet2(credentials: stranger) == nil else {
+            throw I2PSAMError.invalidCommand("stranger credentials resolved the b33 entry")
+        }
+
+        // A session without the option publishes its plain LeaseSet and hands
+        // out no b33 address.
+        let plainClient = SAMTestClient()
+        try await plainClient.connect(port: port)
+        defer { plainClient.close() }
+        plainClient.send("HELLO VERSION MIN=3.0 MAX=3.3")
+        _ = try await plainClient.readLine()
+        plainClient.send("SESSION CREATE STYLE=STREAM ID=plain1 DESTINATION=TRANSIENT")
+        let plainStatus = try await plainClient.readLine()
+        guard plainStatus.hasPrefix("SESSION STATUS RESULT=OK"),
+              replyValue(after: "B33", in: plainStatus) == nil else {
+            throw I2PSAMError.invalidCommand("plain session handed out a b33: \(plainStatus)")
+        }
+
+        return "b33 publication under the blinded key \(blinded.netDBKey.hex.prefix(12))… · \(liveLeases.count) leases self-resolved; plain session stayed unblinded"
     }
 
     private static func streamE2ETest() async throws -> String {
@@ -828,6 +1015,7 @@ enum I2PSAMConformanceTest {
             }
             aliceClients.append(aliceClient)
             bobClients.append(bobClient)
+            if loadTrace { print("TRACE load: pair \(index) established") }
         }
 
         // Concurrent workout: latency probes then a bidirectional bulk
@@ -840,8 +1028,9 @@ enum I2PSAMConformanceTest {
         try await withThrowingTaskGroup(of: (rttMs: Double, kbps: Double).self) { group in
             for index in 0..<pairs {
                 group.addTask {
+                    let trace = loadTrace
                     var rttTotal = 0.0
-                    for _ in 0..<6 {
+                    for round in 0..<6 {
                         let sent = Date()
                         bobClients[index].sendRaw(probe)
                         let echoed = try await aliceClients[index].readBytes(probe.count)
@@ -851,18 +1040,22 @@ enum I2PSAMConformanceTest {
                         aliceClients[index].sendRaw(echoed)
                         _ = try await bobClients[index].readBytes(probe.count)
                         rttTotal += Date().timeIntervalSince(sent)
+                        if trace { print("TRACE load: stream \(index) probe \(round) ok") }
                     }
                     let roundTripStart = Date()
                     bobClients[index].sendRaw(bulk)
+                    if trace { print("TRACE load: stream \(index) bulk sent") }
                     let inbound = try await aliceClients[index].readBytes(bulk.count)
                     guard inbound == bulk else {
                         throw I2PSAMError.invalidCommand("bulk inbound mismatch")
                     }
+                    if trace { print("TRACE load: stream \(index) bulk inbound ok") }
                     aliceClients[index].sendRaw(inbound)
                     let outbound = try await bobClients[index].readBytes(bulk.count)
                     guard outbound == bulk else {
                         throw I2PSAMError.invalidCommand("bulk echo mismatch")
                     }
+                    if trace { print("TRACE load: stream \(index) bulk echo ok") }
                     let elapsed = Date().timeIntervalSince(roundTripStart)
                     let kbps = elapsed > 0 ? Double(bulk.count * 2) / elapsed / 1024 : 0
                     return (rttMs: (rttTotal / 6) * 1000, kbps: kbps)

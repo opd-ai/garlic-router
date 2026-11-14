@@ -59,6 +59,43 @@ enum I2PCrypto {
         return shared.withUnsafeBytes { Data($0) }
     }
 
+    /// The canonical wire encoding of an X25519 public key: RFC 7748 §5 says
+    /// the most significant bit of the final byte is ignored (implementations
+    /// mask it on decode), and reference routers **validate** that bit on a
+    /// published NTCP2 `s` option (`!(s[31] & 0x80)`). CryptoKit does not
+    /// guarantee a cleared bit, so half the keys it generates would otherwise
+    /// make our RouterAddress invalid (transport style → unknown) and peers
+    /// would close the session right after SessionConfirmed with no reason.
+    static func canonicalX25519PublicKey(_ raw: Data) -> Data {
+        guard raw.count == 32 else { return raw }
+        var normalized = Data(raw)
+        let last = normalized.index(normalized.startIndex, offsetBy: 31)
+        normalized[last] &= 0x7f
+        return normalized
+    }
+
+    // MARK: - I2P base 64
+
+    /// The I2P Base 64 alphabet: standard base 64 with '+' written as '-' and
+    /// '/' as '~'. The trailing '=' padding is part of the form on the wire:
+    /// reference routers decode RouterAddress `s`/`i` with a strict block
+    /// decoder (EVP_DecodeBlock) that rejects unpadded input.
+    static func i2pBase64(_ data: Data) -> String {
+        data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "~")
+    }
+
+    /// Decodes I2P Base 64 tolerantly: both alphabets, with or without padding.
+    static func i2pBase64Decode(_ text: String) -> Data? {
+        var sanitized = text
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "~", with: "/")
+            .replacingOccurrences(of: "_", with: "/")
+        while sanitized.count % 4 != 0 { sanitized += "=" }
+        return Data(base64Encoded: sanitized)
+    }
+
     /// Derives the X25519 public key matching a private key (e.g. the
     /// destination ECIES key of a b33 credential set, which rides the
     /// blinded envelope for keying).
@@ -97,7 +134,12 @@ enum I2PCrypto {
         )
         // Wire format: ciphertext || tag. The nonce rides implicitly (it is an
         // input to this call), never prefixed onto the output blob.
-        return box.ciphertext + box.tag
+        // CryptoKit returns slice-backed Data (non-zero startIndex); append into
+        // a fresh buffer so callers can safely index from 0.
+        var out = Data()
+        out.append(contentsOf: box.ciphertext)
+        out.append(contentsOf: box.tag)
+        return out
     }
 
     static func chacha20Poly1305Open(key: Data, nonce: Data, ciphertextAndTag: Data, aad: Data = Data()) throws -> Data {
@@ -187,7 +229,7 @@ enum I2PCrypto {
 /// block ciphers, no MD5/SHA-1 digest paths, and no ad-hoc un-HKDF'd key
 /// stretching anywhere in the codebase. The two AES-256-CBC call sites are
 /// spec-mandated components of the modern protocols themselves (the NTCP2
-/// ephemeral-key obfuscation keystream in `NTCP2KeyObfuscation` and the tunnel
+/// ephemeral-key obfuscation keystream in `NTCP2HandshakeObfuscator` and the tunnel
 /// layer cipher in `I2PTunnelLayerCipher`), not legacy session crypto — both
 /// are recorded as aligned in the truth table and retained.
 enum I2PCryptoPolicy {

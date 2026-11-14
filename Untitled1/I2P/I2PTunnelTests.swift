@@ -10,7 +10,33 @@ private enum I2PTunnelTestTimeout: Error {
     case timedOut
 }
 
+/// A named pool-invariant violation, so a failing run names the property it
+/// broke instead of reporting a bare `invalidFormat`.
+private struct I2PTunnelTestFailure: Error, CustomStringConvertible {
+    let description: String
+    init(_ description: String) { self.description = description }
+}
+
+private extension Data {
+    /// Parses a lowercase/uppercase hex string into bytes (test vectors).
+    init(hex: String) {
+        var bytes = [UInt8]()
+        var index = hex.startIndex
+        while index < hex.endIndex {
+            guard let next = hex.index(index, offsetBy: 2, limitedBy: hex.endIndex),
+                  let byte = UInt8(hex[index..<next], radix: 16) else {
+                self = Data()
+                return
+            }
+            bytes.append(byte)
+            index = next
+        }
+        self.init(bytes)
+    }
+}
+
 private func tunnelTestWaitUntil(timeout: TimeInterval = 15, _ condition: @escaping () -> Bool) async throws {
+
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
         if condition() { return }
@@ -71,7 +97,7 @@ enum I2PTunnelSelfTest {
             }
         }
 
-        await run("Tunnel build record encryption (528-byte ECIES)") {
+        await run("Tunnel build record encryption (218-byte short ECIES)") {
             try await recordEncryptionTest()
         }
         await run("Outbound tunnel build through 2 hops") {
@@ -96,46 +122,59 @@ enum I2PTunnelSelfTest {
             receiveTunnelID: 0x11223344,
             nextHopHash: I2PCrypto.randomBytes(32),
             nextTunnelID: 0x55667788,
-            layerKey: I2PCrypto.randomBytes(32),
-            ivKey: I2PCrypto.randomBytes(32),
-            replyKey: I2PCrypto.randomBytes(32),
-            replyIV: I2PCrypto.randomBytes(16),
             isMessagePathEnd: true,
             nextHopIsOriginator: true,
-            hasMoreRecords: false,
-            padding: I2PCrypto.randomBytes(372)
+            hasMoreRecords: false
         )
-        let wire = try I2PTunnelBuildCrypto.encryptRecord(
+        let encrypted = try I2PTunnelBuildCrypto.encryptRecordWithMaterial(
             record.serialize(),
             to: key.publicKey.rawRepresentation,
+            hopHash: nil,
             recordIndex: 3
         )
+        let wire = encrypted.wire
         guard wire.count == I2PTunnelBuildRequestRecord.wireLength else {
             throw I2PWireError.invalidFormat
         }
-        let plaintext = try I2PTunnelBuildCrypto.decryptRecord(
+        let (plaintext, material) = try I2PTunnelBuildCrypto.decryptRecordWithMaterial(
             wire,
             localEncryptionKey: key,
             recordIndex: 3
         )
+        guard plaintext.count == I2PTunnelBuildRequestRecord.plaintextLength else {
+            throw I2PWireError.invalidFormat
+        }
         let parsed = try I2PTunnelBuildRequestRecord.parse(plaintext)
         guard parsed.receiveTunnelID == record.receiveTunnelID,
               parsed.nextHopHash == record.nextHopHash,
-              parsed.layerKey == record.layerKey,
-              parsed.ivKey == record.ivKey,
-              parsed.replyKey == record.replyKey,
-              parsed.replyIV == record.replyIV,
+              parsed.nextTunnelID == record.nextTunnelID,
               parsed.flags == record.flags,
-              parsed.hasMoreRecords == record.hasMoreRecords else {
+              parsed.isMessagePathEnd,
+              parsed.layerEncryptionType == 0 else {
             throw I2PWireError.invalidFormat
         }
-        // A record index mismatch must fail the AEAD.
-        var wrongIndexWorked = false
-        if (try? I2PTunnelBuildCrypto.decryptRecord(wire, localEncryptionKey: key, recordIndex: 4)) != nil {
-            wrongIndexWorked = true
+        guard material.layerKey == encrypted.material.layerKey,
+              material.replyKey == encrypted.material.replyKey else {
+            throw I2PWireError.invalidFormat
         }
-        guard !wrongIndexWorked else { throw I2PWireError.invalidFormat }
-        return "528-byte record: X25519 + HKDF AEAD, all fields intact"
+        // A record addressed to another hop must fail its AEAD.
+        let otherHop = Curve25519.KeyAgreement.PrivateKey()
+        var wrongKeyWorked = false
+        if (try? I2PTunnelBuildCrypto.decryptRecord(wire, localEncryptionKey: otherHop, recordIndex: 3)) != nil {
+            wrongKeyWorked = true
+        }
+        guard !wrongKeyWorked else { throw I2PWireError.invalidFormat }
+        // The reply path rides plain ChaCha20: pin the all-zero block against
+        // the well-known RFC 8439 keystream before trusting the re-encryption.
+        guard let stream = I2PChaCha20.apply(key: Data(repeating: 0, count: 32),
+                                             nonce: Data(repeating: 0, count: 12),
+                                             data: Data(repeating: 0, count: 64)) else {
+            throw I2PWireError.invalidFormat
+        }
+        guard stream == Data(hex: "76b8e0ada0f13d90405d6ae55386bd28bdd219b8a08ded1aa836efcc8b770dc7da41597c5157488d7724e03fb8d84a376a43b8f41518a11cc387b669b2ee6586") else {
+            throw I2PWireError.invalidFormat
+        }
+        return "218-byte short record: Noise N + X25519 + HKDF AEAD; reply ChaCha20 matches RFC 8439"
     }
 private static func outboundBuildTest() async throws -> String {
         let hub = I2PTunnelBuildHub()
@@ -297,27 +336,39 @@ private static func rejectTest() async throws -> String {
         let fillStarted = Date()
         await pool.fillPools()
         guard pool.outboundCount == 2, pool.inboundCount == 2 else {
-            throw I2PWireError.invalidFormat
+            throw I2PTunnelTestFailure(
+                "fillPools reached \(pool.outboundCount) outbound / \(pool.inboundCount) inbound, expected 2 / 2")
         }
         // Builds must be staggered: consecutive build starts are spread out.
         let starts = pool.buildStartTimes.map { $0.timeIntervalSince(fillStarted) }
-        guard starts.count == 4 else { throw I2PWireError.invalidFormat }
+        guard starts.count == 4 else {
+            throw I2PTunnelTestFailure("fillPools initiated \(starts.count) builds, expected 4")
+        }
         for index in 1..<starts.count {
-            guard starts[index] - starts[index - 1] >= config.staggerInterval * 0.3 else {
-                throw I2PWireError.invalidFormat
+            let gap = starts[index] - starts[index - 1]
+            guard gap >= config.staggerInterval * 0.3 else {
+                throw I2PTunnelTestFailure(String(
+                    format: "builds %d and %d started %.3f s apart; stagger requires >= %.3f s",
+                    index - 1, index, gap, config.staggerInterval * 0.3))
             }
         }
         guard let average = pool.averageBuildLatency, average >= 0 else {
-            throw I2PWireError.invalidFormat
+            throw I2PTunnelTestFailure("average build latency missing on a filled pool")
         }
 
         // Lifetime clamping into the spec's 10-30 minute range.
         var clampConfig = I2PTunnelPool.Config()
         clampConfig.enforceSpecLimits = true
         clampConfig.lifetime = 60
-        guard clampConfig.clampedLifetime == 600 else { throw I2PWireError.invalidFormat }
+        guard clampConfig.clampedLifetime == 600 else {
+            throw I2PTunnelTestFailure(
+                "lifetime 60 clamped to \(clampConfig.clampedLifetime), expected 600")
+        }
         clampConfig.lifetime = 4000
-        guard clampConfig.clampedLifetime == 1800 else { throw I2PWireError.invalidFormat }
+        guard clampConfig.clampedLifetime == 1800 else {
+            throw I2PTunnelTestFailure(
+                "lifetime 4000 clamped to \(clampConfig.clampedLifetime), expected 1800")
+        }
 
         // Selection + pruning on a quiet pool (targets 0 = no auto builds).
         var quietConfig = I2PTunnelPool.Config()
@@ -343,7 +394,11 @@ private static func rejectTest() async throws -> String {
             buildLatency: 0.1
         )
         quiet.adopt(expired)
-        guard quiet.pruneExpired() == 1 else { throw I2PWireError.invalidFormat }
+        let pruned = quiet.pruneExpired()
+        guard pruned == 1 else {
+            throw I2PTunnelTestFailure("pruneExpired removed \(pruned) tunnels, expected exactly 1")
+        }
+
         let fast = I2PTunnel(
             direction: .outbound,
             hops: [],
@@ -369,18 +424,34 @@ private static func rejectTest() async throws -> String {
         quiet.adopt(fast)
         quiet.adopt(slow)
         guard quiet.selectOutboundTunnel()?.buildLatency == 0.05 else {
-            throw I2PWireError.invalidFormat
+            throw I2PTunnelTestFailure(
+                "selection picked a tunnel with latency \(String(describing: quiet.selectOutboundTunnel()?.buildLatency)), expected 0.05")
         }
-        guard quiet.selectInboundTunnel() == nil else { throw I2PWireError.invalidFormat }
+        guard quiet.selectInboundTunnel() == nil else {
+            throw I2PTunnelTestFailure("an empty inbound pool returned a tunnel")
+        }
 
         // Maintenance: expired tunnels are pruned and replacements are
-        // pre-built before the pool drains.
+        // pre-built before the pool drains. A pre-build briefly overlaps the
+        // expiring tunnel it replaces (that is the point of pre-building), so
+        // the pool holds at least the target, never fewer, with at least the
+        // target's worth of young tunnels.
         pool.start()
-        try await tunnelTestWaitUntil(timeout: 15) {
-            pool.outboundCount == 2
-                && pool.inboundCount == 2
-                && pool.outboundTunnels.allSatisfy { $0.remainingLifetime() > 1.2 }
-                && pool.inboundTunnels.allSatisfy { $0.remainingLifetime() > 1.2 }
+        let youngThreshold: TimeInterval = 1.2
+        do {
+            try await tunnelTestWaitUntil(timeout: 15) {
+                pool.outboundCount >= 2
+                    && pool.outboundTunnels.filter { $0.remainingLifetime() > youngThreshold }.count >= 2
+                    && pool.inboundCount >= 2
+                    && pool.inboundTunnels.filter { $0.remainingLifetime() > youngThreshold }.count >= 2
+            }
+        } catch {
+            throw I2PTunnelTestFailure(String(
+                format: "maintenance left %d outbound (%d young) / %d inbound (%d young)",
+                pool.outboundCount,
+                pool.outboundTunnels.filter { $0.remainingLifetime() > youngThreshold }.count,
+                pool.inboundCount,
+                pool.inboundTunnels.filter { $0.remainingLifetime() > youngThreshold }.count))
         }
         pool.stop()
         return String(

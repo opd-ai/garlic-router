@@ -25,19 +25,26 @@ enum I2PTunnelLayerCipher {
         return withUnsafeBytes(of: &value) { Data($0) }
     }
 
-    /// AES-256-ECB encryption of one 16-byte block (CBC of a single block with
-    /// a zero IV), used for the spec's IV-key transform.
+    /// AES-ECB encryption of one 16-byte block (CBC of a single block with a
+    /// zero IV), used for the spec's IV-key transform.
+    ///
+    /// The spec's short build record carries a 32-byte layer key and a 16-byte
+    /// `TunnelLayerIVKey` (reference routers run the IV transform as AES-256-ECB
+    /// over the IV-key block when the key material is 32 bytes, AES-128-ECB when
+    /// it is 16). Both shapes are accepted so a hop always derives the CBC IV
+    /// the creator actually used.
     ///
     /// Fail closed by throwing, never by trapping: an IV field or key of the
     /// wrong size can arrive from any path (malformed wire data, a fuzz input,
     /// a misbehaving caller), and a precondition here would kill the whole
     /// router process — the exact crash class the stability audit hunts.
     static func ecbBlock(_ block: Data, key: Data) throws -> Data {
-        guard block.count == 16, key.count == 32 else {
+        guard block.count == 16, key.count == 16 || key.count == 32 else {
             throw I2PWireError.invalidFormat
         }
         return I2PAESCBC.encrypt(block, key: key, iv: Data(repeating: 0, count: 16))
     }
+
 
     /// IV_used = AES-256-ECB(IV_key, IV_field) XOR IV_field.
     static func deriveCBCIV(ivField: Data, ivKey: Data) throws -> Data {
@@ -92,9 +99,9 @@ enum I2PTunnelLayerCipher {
 ///
 /// Layer nesting follows the spec's fixed-size messages: each transit hop's
 /// decrypted body frames the next hop's message as
-/// [BE16 length][nextTunnelID (4)][nextIV (16)][next ciphertext region], so the
-/// encrypted region shrinks by 32 bytes per hop (block-aligned room for the
-/// tunnel ID + IV prefix and the length field). The region a hop's key never
+/// [nextTunnelID (4)][nextIV (16)][next ciphertext region] — the length field
+/// that bounds it is the layer's own `padded` header, added when the layer is
+/// wrapped and stripped when it is unwrapped. The region a hop's key never
 /// covered is re-randomized by the forwarding hop; here it stays zero padding.
 enum I2PTunnelDataProcessor {
     /// Encrypted region length per hop in data-path order: the outermost layer
@@ -109,20 +116,24 @@ enum I2PTunnelDataProcessor {
                            via tunnel: I2PTunnel,
                            gatewayID: UInt32? = nil,
                            ivProvider: (() -> Data)? = nil) throws -> I2PTunnelDataPayload {
-        guard !tunnel.hops.isEmpty else { throw I2NPError.invalidConfiguration }
+        guard !tunnel.hops.isEmpty,
+              tunnel.layerKeys.count == tunnel.hops.count,
+              tunnel.ivKeys.count == tunnel.hops.count else {
+            throw I2NPError.invalidConfiguration
+        }
         let gateway = gatewayID ?? (tunnel.direction == .outbound
             ? tunnel.gatewayTunnelID
             : tunnel.endpointTunnelID)
         let lengths = layerLengths(hopCount: tunnel.hops.count)
 
-        // Innermost (message-path end) content: the padded TunnelGateway
-        // payload frame. Its budget is the innermost layer's covered region
-        // minus the length field.
+        // Innermost (message-path end) content: the TunnelGateway payload the
+        // last hop delivers. Its budget is the innermost layer's covered region
+        // minus the 2-byte length prefix `padded` adds when the layer is wrapped.
         let gatewayPayload = I2PTunnelGatewayPayload(gatewayID: gateway, message: i2npMessage).serialize()
         let innerBudget = lengths[lengths.count - 1] - 2
         guard gatewayPayload.count <= innerBudget else { throw I2NPError.invalidPayload }
-        var plaintext = try I2PTunnelLayerCipher.padded(gatewayPayload)
 
+        var plaintext = gatewayPayload
         var ciphertext = Data()
         var nextTunnelID: UInt32 = 0
         var nextIV = Data()
@@ -130,19 +141,15 @@ enum I2PTunnelDataProcessor {
             let hop = tunnel.hops[index]
             if index < tunnel.hops.count - 1 {
                 // Frame the next hop's message for this hop's layer:
-                // [BE16 length][nextTunnelID (4)][nextIV (16)][next region].
-                let regionLength = lengths[index + 1]
-                let innerLength = 20 + regionLength
-                guard innerLength <= I2PTunnelDataPayload.bodySize - 2 else {
+                // [nextTunnelID (4)][nextIV (16)][next region]. `wrap` supplies
+                // the length prefix that lets the hop recover exactly this frame.
+                guard nextIV.count == 16, 20 + ciphertext.count <= lengths[index] else {
                     throw I2NPError.invalidConfiguration
                 }
                 var frame = Data()
-                frame.append(UInt8((innerLength >> 8) & 0xff))
-                frame.append(UInt8(innerLength & 0xff))
                 frame.append(contentsOf: I2PTunnelLayerCipher.tunnelIDBytes(nextTunnelID))
                 frame.append(contentsOf: nextIV)
                 frame.append(contentsOf: ciphertext)
-                while frame.count < I2PTunnelDataPayload.bodySize { frame.append(0) }
                 plaintext = frame
             }
             let iv = ivProvider?() ?? I2PCrypto.randomBytes(16)
@@ -197,7 +204,7 @@ final class I2NPMessageRouter {
     }
 
     /// Registers a consumer for every other routed body (netdb, garlic,
-    /// status, options, data messages, tunnel builds).
+    /// status, data messages, tunnel builds).
     func addBodyHandler(_ handler: @escaping (I2NPMessage, Data) -> Void) {
         lock.lock()
         bodyHandlers.append(handler)
@@ -208,6 +215,14 @@ final class I2NPMessageRouter {
     /// dispatch (used by the status engine for throughput counting).
     var onMessageRouted: ((I2NPMessage, Data) -> Void)?
 
+    /// Observation hook for traffic this router forwards on behalf of other
+    /// participants' tunnels (transit traffic), with the forwarded byte count.
+    var onTransitForward: ((Int) -> Void)?
+
+    /// Observation hook for a tunnel message whose message-path end is this
+    /// router — traffic we consumed rather than carried for someone else.
+    var onLocalTunnelDelivery: (() -> Void)?
+
     /// Routes an inbound I2NP message from the given source router.
     func handleIncoming(_ message: I2NPMessage, from source: Data) async {
         onMessageRouted?(message, source)
@@ -217,9 +232,10 @@ final class I2NPMessageRouter {
         switch body {
         case .tunnelData(let payload):
             for participant in participants {
-                guard let action = try? participant.processTunnelData(payload) else { continue }
-                await perform(action)
-                return
+                if let action = try? participant.processTunnelData(payload) {
+                    await perform(action)
+                    return
+                }
             }
             // No participation state for this tunnel ID: drop.
         case .tunnelGateway(let gatewayID, let innerBytes):
@@ -250,7 +266,7 @@ final class I2NPMessageRouter {
             for participant in participants {
                 participant.handleBuildReply(body, from: source)
             }
-        case .deliveryStatus, .options, .dataMessage, .garlic,
+        case .deliveryStatus, .dataMessage, .garlic,
              .databaseStore, .databaseLookup, .databaseSearchReply:
             notifyBodyHandlers(message, source)
         }
@@ -267,12 +283,26 @@ final class I2NPMessageRouter {
         case .forward(let nextHopHash, let tunnelData):
             do {
                 let envelope = I2NPMessage(type: .tunnelData, payload: tunnelData.serialize())
-                try await deliveryTransport?.deliver(envelope.serialize(), to: nextHopHash)
+                let bytes = envelope.serialize()
+                try await deliveryTransport?.deliver(bytes, to: nextHopHash)
+                onTransitForward?(bytes.count)
             } catch { /* drop on framing failure */ }
         case .deliverGateway(let toRouterHash, let gatewayPayload):
+            // Message-path end at our own inbound endpoint: the payload is
+            // ours, so it is delivered locally instead of being addressed to
+            // a remote router (a delivery to our own hash would try to open a
+            // session to ourselves and never reach the local body handlers).
+            if toRouterHash == localRouterHash,
+               let envelope = try? I2NPMessage(type: .tunnelGateway, payload: gatewayPayload) {
+                onLocalTunnelDelivery?()
+                await handleIncoming(envelope, from: localRouterHash)
+                return
+            }
             do {
                 let envelope = I2NPMessage(type: .tunnelGateway, payload: gatewayPayload)
-                try await deliveryTransport?.deliver(envelope.serialize(), to: toRouterHash)
+                let bytes = envelope.serialize()
+                try await deliveryTransport?.deliver(bytes, to: toRouterHash)
+                onTransitForward?(bytes.count)
             } catch { /* drop on framing failure */ }
         }
     }

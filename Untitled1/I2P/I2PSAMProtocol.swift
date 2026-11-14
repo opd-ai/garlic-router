@@ -142,9 +142,11 @@ enum I2PSAMReply {
            : "HELLO REPLY RESULT=NO_VERSION"
     }
 
-    static func sessionStatus(result: String, destination: String? = nil, message: String? = nil) -> String {
+    static func sessionStatus(result: String, destination: String? = nil,
+                              b33: String? = nil, message: String? = nil) -> String {
         var line = "SESSION STATUS RESULT=\(result)"
         if let destination { line += " DESTINATION=\(destination)" }
+        if let b33 { line += " B33=\(b33)" }
         if let message { line += " MESSAGE=\(message)" }
         return line
     }

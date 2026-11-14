@@ -1,8 +1,51 @@
+# macOS
+.DS_Store
+
 # Milq metadata (conversation history, project settings, etc.)
 .milq_meta/
 
-# Build artifacts
-*_build/
+# Xcode build artifacts and per-user state
+build/
+DerivedData/
+*.xcarchive
+*.ipa
+*.dSYM
+*.dSYM.zip
+*.hmap
+*.o
+*.swiftmodule
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+*.moved-aside
+xcuserdata/
+Untitled1.xcodeproj/project.xcworkspace/xcuserdata/
+Untitled1.xcworkspace/xcuserdata/
 
-# macOS
-.DS_Store
+# Swift Package Manager
+.build/
+.swiftpm/
+*.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/configuration/
+.probe-build/
+
+# CocoaPods (not used by this project, ignored if ever added)
+Pods/
+
+# Signing material and secrets — never commit these
+*.p12
+*.pfx
+*.cer
+*.certSigningRequest
+*.mobileprovision
+*.provisionprofile
+*.p8
+AuthKey_*.p8
+private_keys/
+*.keystore
+*.jks
+secrets/
+.env
+.env.*
+!/.env.example
+# Ciphertext of API keys entered in the app; treat it as key material
+Untitled1/ENCRYPTED_KEYS.plist

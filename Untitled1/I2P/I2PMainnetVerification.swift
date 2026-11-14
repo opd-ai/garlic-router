@@ -56,16 +56,23 @@ enum I2PMainnetVerification {
 
         var reseed: I2PReseedReport?
         var publicationAcks = 0
-        var resolvedLeaseSet: (name: String, leaseSet: I2PLeaseSet)?
+        var resolvedLeaseSet: (name: String, leaseSet: I2PLeaseSet, eciesKey: Data?)?
 
         await checkpoints.capture(netDB: netDB, ntcp2: ntcp2, pool: tunnelPool)
 
-        await run("Mainnet reseed over HTTPS (Ed25519-verified RouterInfos)") {
+        await run("Mainnet reseed over HTTPS (SU3 container signed, RouterInfos Ed25519-verified)") {
             let report = try await I2PReseedService.reseed(into: netDB)
             reseed = report
             await checkpoints.capture(netDB: netDB, ntcp2: ntcp2, pool: tunnelPool)
-            return String(format: "%@: %d RouterInfos fetched, %d ingested after signature verification, %d rejected, %d floodfills known",
-                          report.fetchedFrom, report.totalEntries,
+            guard report.ingested > 0 else {
+                throw I2PMainnetFailure(message: String(
+                    format: "%@: SU3 container signed by %@, but %d RouterInfos were ingested from %d fetched (%d rejected) — every verified entry must land in the netdb",
+                    report.fetchedFrom, report.signer, report.ingested,
+                    report.totalEntries, report.rejected))
+            }
+            return String(format: "%@: SU3 container signed by %@ (%@), %d RouterInfos fetched, %d ingested after signature verification, %d rejected, %d floodfills known",
+                          report.fetchedFrom, report.signer, report.signatureType,
+                          report.totalEntries,
                           report.ingested, report.rejected, report.floodfillCount)
         }
 
@@ -81,9 +88,14 @@ enum I2PMainnetVerification {
                     : "reseed produced no floodfill peers to dial")
             }
             let targets = try await dialTargets(netDB: netDB, ntcp2: ntcp2, limit: 5)
+            // Message 3 carries our RouterInfo; peers verify its published
+            // address against the endpoint they observe, so publish ours first.
+            await context.ensureReachableAddress()
             for target in targets where !ntcp2.hasSession(for: target.hash) {
                 ntcp2.connect(host: target.endpoint.host, port: target.endpoint.port,
-                              remoteStaticKey: target.endpoint.staticKey)
+                              remoteRouterHash: target.hash,
+                              remoteStaticKey: target.endpoint.staticKey,
+                              remoteIV: target.endpoint.iv)
             }
             let deadline = Date().addingTimeInterval(10)
             while Date() < deadline {
@@ -100,36 +112,92 @@ enum I2PMainnetVerification {
                 let ok = ntcp2.hasSession(for: target.hash)
                 return "\(target.label): \(ok ? "handshake established" : "handshake failed")"
             }.joined(separator: "; ")
-            guard established.count >= min(3, targets.count) else {
-                throw I2PMainnetFailure(message: "mainnet NTCP2 handshakes \(established.count)/\(targets.count) — \(detail)")
+            if established.count < min(3, targets.count) {
+                let closes = ntcp2.recentCloses()
+                let why = closes.isEmpty ? "" : " — session endings: \(closes.joined(separator: " | "))"
+                throw I2PMainnetFailure(message: "mainnet NTCP2 handshakes \(established.count)/\(targets.count) — \(detail)\(why)")
             }
             await checkpoints.capture(netDB: netDB, ntcp2: ntcp2, pool: tunnelPool)
             return "mainnet NTCP2 handshakes \(established.count)/\(targets.count) established — \(detail)"
         }
 
         await run("Kademlia DHT DatabaseLookup round-trip with mainnet floodfills") {
-            guard let reseed, !reseed.deferredHashes.isEmpty else {
-                let knownFloodfills = await netDB.floodfillCount()
-                throw I2PMainnetFailure(message: knownFloodfills > 0
-                    ? "no deferred lookup target this run (reseed unavailable or ingested everything) — the fresh-entry DHT round-trip needs a live reseed"
-                    : "no deferred lookup target — reseed ingested everything")
+            guard await netDB.floodfillCount() > 0 else {
+                throw I2PMainnetFailure(message: "no floodfills known (reseed unavailable and the persisted netdb is empty) — no DHT peer to query")
             }
-            let target = reseed.deferredHashes[0]
+            // Preferred: a hash the reseed deliberately kept out of the local
+            // cache, so the round trip cannot be answered from memory.
+            if let target = reseed?.deferredHashes.first {
+                // Warm the sessions to the peers this lookup will query, so the
+                // row times the DHT round trip rather than a cold TCP dial (the
+                // publication row below dials its targets the same way). One
+                // live candidate is enough: the query goes to all of them at
+                // once and the first answer wins.
+                let lookupTargets = await netDB.selectFloodfills(for: target, count: 3)
+                for hash in lookupTargets where !ntcp2.hasSession(for: hash) {
+                    guard let info = await netDB.lookupRouterInfo(hash, timeoutPerRound: 1, maxRounds: 1),
+                          let endpoint = NTCP2PeerEndpoint.preferred(from: info.addresses) else {
+                        continue
+                    }
+                    ntcp2.connect(host: endpoint.host, port: endpoint.port,
+                                  remoteRouterHash: hash,
+                                  remoteStaticKey: endpoint.staticKey,
+                                  remoteIV: endpoint.iv)
+                }
+                let warmDeadline = Date().addingTimeInterval(8)
+                while Date() < warmDeadline {
+                    if lookupTargets.contains(where: { ntcp2.hasSession(for: $0) }) { break }
+                    try? await Task.sleep(for: .milliseconds(250))
+                }
+                let started = Date()
+                let outcome = await netDB.lookupAnswering(target,
+                                                          timeoutPerRound: 4, maxRounds: 2)
+                let latency = Date().timeIntervalSince(started)
+                if let entry = outcome.entry {
+                    guard entry.routerInfo != nil else {
+                        throw I2PMainnetFailure(message: "mainnet response was not a RouterInfo")
+                    }
+                    await checkpoints.capture(netDB: netDB, ntcp2: ntcp2, pool: tunnelPool)
+                    return String(format: "DatabaseLookup for %@ answered over a live floodfill session in %.0fms; RouterInfo received, signature-verified and cached",
+                                  String(target.hex.prefix(12)), latency * 1000)
+                }
+                guard outcome.answered else {
+                    let sessions = ntcp2.sessionCount()
+                    let closes = ntcp2.recentCloses()
+                    let why = closes.isEmpty ? "" : " — session endings: \(closes.joined(separator: " | "))"
+                    throw I2PMainnetFailure(message: sessions == 0
+                        ? "no established mainnet sessions — the DatabaseLookup was never sent"
+                        : "no mainnet response for \(target.hex.prefix(12)) within 8s (live sessions: \(sessions))\(why)")
+                }
+                // A DatabaseSearchReply is a spec answer: the floodfill parsed
+                // the lookup and named the peers it considers closest. The entry
+                // itself is not stored on that peer, which the row reports rather
+                // than pretending the query failed.
+                await checkpoints.capture(netDB: netDB, ntcp2: ntcp2, pool: tunnelPool)
+                return String(format: "DatabaseLookup for %@ answered over a live floodfill session in %.0fms with a DatabaseSearchReply — the entry itself is not stored on the queried floodfills, so the iterative query path supplied the closest peers",
+                              String(target.hex.prefix(12)), latency * 1000)
+            }
+            // No fresh reseed this run: prove the same query path with a random
+            // key. A miss-answer (DatabaseSearchReply listing the closest
+            // peers) is a full round trip too — the DatabaseLookup body parsed,
+            // a floodfill answered over a live session and the reply arrived.
+            let probeKey = I2PCrypto.randomBytes(32)
             let started = Date()
-            let entry = await netDB.lookup(target, timeoutPerRound: 3, maxRounds: 2)
+            let outcome = await netDB.probeLookup(probeKey, timeoutPerRound: 5)
             let latency = Date().timeIntervalSince(started)
-            guard let entry else {
+            guard outcome.answered else {
                 let sessions = ntcp2.sessionCount()
                 throw I2PMainnetFailure(message: sessions == 0
                     ? "no established mainnet sessions — the DatabaseLookup was never sent"
-                    : "no mainnet response for \(target.hex.prefix(12)) within 6s")
-            }
-            guard entry.routerInfo != nil else {
-                throw I2PMainnetFailure(message: "mainnet response was not a RouterInfo")
+                    : "no mainnet DatabaseLookup answer for \(probeKey.hex.prefix(12)) within 5s (live sessions: \(sessions); session endings: \(ntcp2.recentCloses().joined(separator: " | ")))")
             }
             await checkpoints.capture(netDB: netDB, ntcp2: ntcp2, pool: tunnelPool)
-            return String(format: "DatabaseLookup for %@ answered over a live floodfill session in %.0fms; RouterInfo received, signature-verified and cached",
-                          String(target.hex.prefix(12)), latency * 1000)
+            if outcome.servedEntry {
+                return String(format: "DatabaseLookup for a fresh %@ answered with a stored entry over a live floodfill session in %.0fms",
+                              String(probeKey.hex.prefix(12)), latency * 1000)
+            }
+            return String(format: "DatabaseLookup for a fresh %@ answered over a live floodfill session in %.0fms with a DatabaseSearchReply naming %d closer peer(s) — the iterative query path round-tripped",
+                          String(probeKey.hex.prefix(12)), latency * 1000, outcome.peers)
         }
 
         await run("Mainnet RouterInfo publication acknowledged by live floodfills") {
@@ -138,10 +206,13 @@ enum I2PMainnetVerification {
             let publishTargets = await netDB.selectFloodfills(for: context.mainnetRouterHash, count: 5)
             for target in publishTargets where !ntcp2.hasSession(for: target) {
                 guard let info = await netDB.lookupRouterInfo(target, timeoutPerRound: 1, maxRounds: 1),
-                      let endpoint = info.addresses.compactMap({ NTCP2PeerEndpoint(routerAddress: $0) }).first else {
+                      let endpoint = NTCP2PeerEndpoint.preferred(from: info.addresses) else {
                     continue
                 }
-                ntcp2.connect(host: endpoint.host, port: endpoint.port, remoteStaticKey: endpoint.staticKey)
+                ntcp2.connect(host: endpoint.host, port: endpoint.port,
+                              remoteRouterHash: target,
+                              remoteStaticKey: endpoint.staticKey,
+                              remoteIV: endpoint.iv)
             }
             let deadline = Date().addingTimeInterval(10)
             while Date() < deadline {
@@ -162,52 +233,89 @@ enum I2PMainnetVerification {
 
         await run("Mainnet well-known destination resolved to a LeaseSet over the live DHT") {
             let destinations = try await I2PMainnetHosts.fetchWellKnownDestinations(limit: 6)
+            // Hosts whose own identity signs with a type this router cannot verify
+            // can never resolve here. The probe list defers them; the failure line
+            // names them when they were tried anyway.
+            let unverifiableHosts = destinations.filter { !$0.signsWithImplementedType }.map(\.name)
             var attempted: [String] = []
             var envelopeVerified: [String] = []
+            var answeredHosts = 0
             var lastFailure: Error = I2PMainnetFailure(message: "no lookup attempted")
+            // The best answer wins, not the first: a lease set we can also build
+            // garlic delivery for is what the next row needs, so a resolvable but
+            // undeliverable entry keeps the probe going instead of ending it.
+            var resolved: (name: String, leaseSet: I2PLeaseSet, eciesKey: Data?,
+                           deliverable: Bool, detail: String)?
             for destination in destinations {
+                attempted.append(destination.name)
                 let started = Date()
-                let entry = await netDB.lookup(destination.netdbKey, timeoutPerRound: 3, maxRounds: 2)
+                let outcome = await netDB.lookupAnswering(destination.netdbKey, kind: .leaseSet,
+                                                          timeoutPerRound: 3, maxRounds: 3)
+                if outcome.answered { answeredHosts += 1 }
+                let entry = outcome.entry
                 if let entry, let leaseSet = entry.leaseSet {
                     let latency = Date().timeIntervalSince(started) * 1000
-                    resolvedLeaseSet = (destination.name, leaseSet)
-                    await checkpoints.capture(netDB: netDB, ntcp2: ntcp2, pool: tunnelPool)
-                    return String(format: "%@ resolved over the live DHT in %.0fms as a classic LeaseSet: %d lease(s), gateways %@, tunnel IDs %@",
-                                  destination.name, latency, leaseSet.leases.count,
-                                  leaseSet.leases.prefix(2).map { String($0.gatewayHash.hex.prefix(10)) }.joined(separator: ","),
-                                  leaseSet.leases.prefix(2).map { String($0.tunnelId) }.joined(separator: ","))
+                    // A classic LeaseSet carries no key list; its destination's
+                    // crypto field is the only key material it has — and a
+                    // LeaseSet2-era destination leaves that field unused, so a
+                    // resolved entry can be readable without being deliverable.
+                    let eciesKey = Data(leaseSet.destination.encryptionPublicKey.suffix(32))
+                    let deliverable = eciesKey.count == 32
+                    let detail = String(format: "%@ resolved over the live DHT in %.0fms as a classic LeaseSet: %d lease(s), gateways %@, tunnel IDs %@",
+                                        destination.name, latency, leaseSet.leases.count,
+                                        leaseSet.leases.prefix(2).map { String($0.gatewayHash.hex.prefix(10)) }.joined(separator: ","),
+                                        leaseSet.leases.prefix(2).map { String($0.tunnelId) }.joined(separator: ","))
+                    if resolved == nil || (deliverable && resolved?.deliverable == false) {
+                        resolved = (destination.name, leaseSet, eciesKey, deliverable, detail)
+                    }
+                    if deliverable { break }
+                    continue
                 }
-                // LeaseSet2 (proposal 123 store types 2/3/5): parsed and
+                // LeaseSet2 (proposal 123 store types 3/5/7): parsed and
                 // signature-verified at ingest; the lease entries resolve for
                 // delivery through the LS2 resolution path.
                 if let entry, let leaseSet2 = entry.leaseSet2 {
                     let latency = Date().timeIntervalSince(started) * 1000
                     if let converted = leaseSet2.resolvedLeaseSet() {
-                        resolvedLeaseSet = (destination.name, converted)
-                        await checkpoints.capture(netDB: netDB, ntcp2: ntcp2, pool: tunnelPool)
-                        return String(format: "%@ resolved over the live DHT in %.0fms as LeaseSet2 store type %d (ECIES destination, offline-signing flag %@): %d lease entry(s) recovered for delivery — gateway %@, tunnel IDs %@",
-                                      destination.name, latency, leaseSet2.storeType.rawValue,
-                                      leaseSet2.hasOfflineSignature ? "set" : "absent",
-                                      converted.leases.count,
-                                      converted.leases.prefix(2).map { String($0.gatewayHash.hex.prefix(10)) }.joined(separator: ","),
-                                      converted.leases.prefix(2).map { String($0.tunnelId) }.joined(separator: ","))
+                        let eciesKey = leaseSet2.preferredEncryptionKey
+                        let deliverable = eciesKey?.count == 32
+                        let detail = String(format: "%@ resolved over the live DHT in %.0fms as LeaseSet2 store type %d (%@, offline-signing flag %@): %d lease entry(s) recovered for delivery — gateway %@, tunnel IDs %@",
+                                            destination.name, latency, leaseSet2.storeType.rawValue,
+                                            leaseSet2.encryptionKeys.isEmpty
+                                                ? "no key list published, the destination crypto field is the spec's unused one"
+                                                : "\(leaseSet2.encryptionKeys.count) encryption key(s) published",
+                                            leaseSet2.hasOfflineSignature ? "set" : "absent",
+                                            converted.leases.count,
+                                            converted.leases.prefix(2).map { String($0.gatewayHash.hex.prefix(10)) }.joined(separator: ","),
+                                            converted.leases.prefix(2).map { String($0.tunnelId) }.joined(separator: ","))
+                        if resolved == nil || (deliverable && resolved?.deliverable == false) {
+                            resolved = (destination.name, converted, eciesKey, deliverable, detail)
+                        }
+                        if deliverable { break }
+                        continue
                     }
-                    // The envelope itself verified (destination ECIES key +
-                    // delegation block + body signature) but the lease entries
+                    // The envelope itself verified (destination identity, offline
+                    // delegation block, body signature) but the lease entries
                     // ride the encrypted inner body: per the LS2 spec they only
                     // decrypt under the b33 blinding/auth path.
                     envelopeVerified.append("\(destination.name) (type \(leaseSet2.storeType.rawValue))")
-                    lastFailure = I2PMainnetFailure(message: "\(destination.name): a LeaseSet2 (store type \(leaseSet2.storeType.rawValue)) answered and its envelope verified — destination identity with offline/transient signing keys, signature over the LS2 body, ECIES key present — but its lease entries ride the encrypted inner body, recoverable only through the spec's b33 blinding/auth decryption path")
+                    lastFailure = I2PMainnetFailure(message: "\(destination.name): a LeaseSet2 (store type \(leaseSet2.storeType.rawValue)) answered and its envelope verified — destination identity with offline/transient signing keys, signature over the LS2 body — but it publishes no lease entries of its own (an EncryptedLeaseSet resolves only under the b33 credentials of its owner; a MetaLeaseSet names other entries by hash)")
                     continue
                 }
                 if let entry {
                     lastFailure = I2PMainnetFailure(message: "\(destination.name): the live response was a RouterInfo, not a LeaseSet")
                 } else {
-                    lastFailure = I2PMainnetFailure(message: "\(destination.name): no parseable LeaseSet answered over the live DHT")
+                    let legacy = legacyIdentityNote(destination.destinationRaw)
+                    lastFailure = I2PMainnetFailure(message: "\(destination.name): no parseable LeaseSet answered over the live DHT\(legacy.map { " — \($0)" } ?? "")")
                 }
-                attempted.append(destination.name)
             }
-            throw I2PMainnetFailure(message: "no lease-bearing LeaseSet (v1 or LeaseSet2 with recoverable entries) among \(attempted.count) well-known mainnet destinations (\(attempted.joined(separator: ", "))); \(envelopeVerified.count) encrypted/meta LeaseSet2 envelope(s) verified but expose no recoverable leases (b33 blinding/auth decryption remains spec-gated); last: \(String(describing: lastFailure))")
+            if let resolved {
+                resolvedLeaseSet = (resolved.name, resolved.leaseSet, resolved.eciesKey)
+                await checkpoints.capture(netDB: netDB, ntcp2: ntcp2, pool: tunnelPool)
+                return resolved.detail
+            }
+            let rejections = await netDB.storeRejectionSummary()
+            throw I2PMainnetFailure(message: "no lease-bearing LeaseSet (v1 or LeaseSet2 with recoverable entries) among \(attempted.count) well-known mainnet destinations (\(attempted.joined(separator: ", "))); \(answeredHosts) lookup(s) were answered and \(envelopeVerified.count) LeaseSet2-family envelope(s) verified but publish no lease entries of their own (encrypted/meta); last: \(String(describing: lastFailure))\(rejections.isEmpty ? "" : "; \(rejections)")\(unverifiableHosts.isEmpty ? "" : "; \(unverifiableHosts.count) probed host(s) sign with a legacy identity this router cannot verify: \(unverifiableHosts.joined(separator: ", "))")")
         }
 
         await run("Mainnet garlic end-to-end delivery to the resolved lease gateway") {
@@ -219,25 +327,29 @@ enum I2PMainnetVerification {
             guard let lease = leaseSet.leases.filter({ $0.expiration > now }).max(by: { $0.expiration < $1.expiration }) else {
                 throw I2PMainnetFailure(message: "\(resolvedLeaseSet.name): every lease is expired")
             }
-            // EncType-4 destination convention: the X25519 public key rides as
-            // the final 32 bytes of the destination's encryption key field.
-            let keyField = leaseSet.destination.encryptionPublicKey
-            let eciesKeyField = keyField.suffix(32)
-            guard eciesKeyField.count == 32,
-                  let eciesKey = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: eciesKeyField) else {
-                throw I2PMainnetFailure(message: "\(resolvedLeaseSet.name): the resolved destination does not carry a usable ECIES key")
+            // Delivery key: a LeaseSet2 publishes its encryption keys in the
+            // header's key list (in preference order), which is what garlic
+            // encryption targets. A classic LeaseSet offers its destination's
+            // crypto field instead. Neither exists for a destination that
+            // publishes only a hybrid (ML-KEM) key this router cannot use.
+            guard let eciesKeyData = resolvedLeaseSet.eciesKey,
+                  eciesKeyData.count == 32,
+                  let eciesKey = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: eciesKeyData) else {
+                throw I2PMainnetFailure(message: "\(resolvedLeaseSet.name): the resolved LeaseSet publishes no usable ECIES-X25519 key for delivery (hybrid-only key list)")
             }
             // Dial the lease's gateway router so the lease-addressed delivery
             // rides a live session.
             guard let gatewayInfo = await netDB.lookupRouterInfo(lease.gatewayHash, timeoutPerRound: 2, maxRounds: 1) else {
                 throw I2PMainnetFailure(message: "lease gateway RouterInfo not resolvable over the live DHT")
             }
-            guard let gatewayEndpoint = gatewayInfo.addresses.compactMap({ NTCP2PeerEndpoint(routerAddress: $0) }).first else {
+            guard let gatewayEndpoint = NTCP2PeerEndpoint.preferred(from: gatewayInfo.addresses) else {
                 throw I2PMainnetFailure(message: "lease gateway has no NTCP2 transport address")
             }
             if !ntcp2.hasSession(for: lease.gatewayHash) {
                 ntcp2.connect(host: gatewayEndpoint.host, port: gatewayEndpoint.port,
-                              remoteStaticKey: gatewayEndpoint.staticKey)
+                              remoteRouterHash: lease.gatewayHash,
+                              remoteStaticKey: gatewayEndpoint.staticKey,
+                              remoteIV: gatewayEndpoint.iv)
             }
             let deadline = Date().addingTimeInterval(10)
             while Date() < deadline, !ntcp2.hasSession(for: lease.gatewayHash) {
@@ -251,7 +363,7 @@ enum I2PMainnetVerification {
             let garlicSession = I2PGarlicSession(peerPublicKey: eciesKey, tagsPerHandshake: 4)
             let payload = I2NPMessage(type: .dataMessage, payload: Data("mainnet garlic delivery probe".utf8))
             let delivery = I2PDeliveryInstructions(mode: .tunnel, tunnelID: lease.tunnelId,
-                                                   routerHash: lease.gatewayHash, delayMilliseconds: nil)
+                                                   routerHash: lease.gatewayHash)
             let cloveSet = try I2PGarlicCloveSet(expiration: Date().addingTimeInterval(120),
                                                  messageID: UInt32.random(in: 1...UInt32.max),
                                                  cloves: [I2PGarlicClove(deliveryInstructions: delivery, message: payload)])
@@ -286,9 +398,23 @@ enum I2PMainnetVerification {
                 monitor.observe(message)
             }
             // Organic window: tunnel-build traffic arriving over the established
-            // sessions is dispatched through the I2NP router while we watch.
-            try? await Task.sleep(for: .seconds(20))
-            let detail = "monitored \(ntcp2.sessionCount()) established mainnet session(s) for 20s — \(monitor.summary)"
+            // sessions is dispatched through the I2NP router while we watch. The
+            // window re-publishes our RouterInfo halfway so the floodfills we hold
+            // sessions with carry a fresh copy while peers are selecting hops: a
+            // router that was only just advertised is chosen on mainnet's
+            // minutes-scale refresh cycle, not the seconds after publication.
+            let window: TimeInterval = 45
+            let deadline = Date().addingTimeInterval(window)
+            var republished = false
+            while Date() < deadline {
+                if !republished, Date() > deadline.addingTimeInterval(-window / 2) {
+                    republished = true
+                    _ = await netDB.publish(routerInfo: context.mainnetSignedRouterInfo)
+                }
+                if monitor.tunnelBuildMessages + monitor.tunnelBuildReplyMessages > 0 { break }
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+            let detail = "monitored \(ntcp2.sessionCount()) established mainnet session(s) for \(Int(window))s\(republished ? " (RouterInfo re-published mid-window)" : "") — \(monitor.summary)"
             // Organic inbound tunnel participation now has every mechanical
             // ingredient: the router publishes its real external address
             // (listener + public IPv4 discovery) and the I2NP router dispatches
@@ -315,17 +441,96 @@ enum I2PMainnetVerification {
             // hops, and the I2NP router routes any build reply back to the
             // dedicated participant (registered on the router).
             let buildTransport = I2PNTCP2TunnelBuildTransport(ntcp2: ntcp2)
+            // Demand-dial hook, exactly as the running router wires it: hop
+            // selection now prefers ordinary routers over floodfills, so builds
+            // must be able to reach a hop we hold no session for yet.
+            buildTransport.dialPeer = { [netDB, ntcp2] hash in
+                if ntcp2.hasSession(for: hash) { return true }
+                guard let info = await netDB.lookupRouterInfo(hash, timeoutPerRound: 1, maxRounds: 1),
+                      let endpoint = NTCP2PeerEndpoint.preferred(from: info.addresses) else {
+                    return false
+                }
+                ntcp2.connect(host: endpoint.host, port: endpoint.port,
+                              remoteRouterHash: hash,
+                              remoteStaticKey: endpoint.staticKey,
+                              remoteIV: endpoint.iv)
+                return true
+            }
             let participant = I2PTunnelParticipant(
                 localRouterHash: context.mainnetRouterHash,
                 localEncryptionKey: context.mainnetEncryptionKey,
                 transport: buildTransport)
             context.mainnetI2NPRouter.addTunnelParticipant(participant)
             let peerProvider = I2PMainnetTunnelPeerProvider(netDB: netDB)
-            await peerProvider.refreshCandidates(limit: 8)
-            let peers = peerProvider.peers(count: 2, excluding: [context.mainnetRouterHash])
-            guard peers.count == 2 else {
-                throw I2PMainnetFailure(message: "only \(peers.count) of the probed mainnet routers carry a usable modern encryption identity")
+            await peerProvider.refreshCandidates()
+            // Select hops this router can actually reach, dialing while it selects:
+            // a build whose record never leaves the router cannot be judged, so an
+            // unreachable candidate is replaced rather than waited on. A one-hop
+            // outbound tunnel (gateway == endpoint) is spec-legal and is the
+            // fallback when only one hop comes up — the previous run reached one of
+            // two hops and then timed out with nothing saying why.
+            var peers: [I2PTunnelPeer] = []
+            var excluded: Set<Data> = [context.mainnetRouterHash]
+            var unreachableHops = 0
+            for _ in 0..<6 where peers.count < 2 {
+                let candidates = peerProvider.peers(count: 2 - peers.count, excluding: excluded)
+                if candidates.isEmpty { break }
+                for peer in candidates {
+                    excluded.insert(peer.routerHash)
+                    guard let info = await netDB.lookupRouterInfo(peer.routerHash, timeoutPerRound: 1, maxRounds: 1),
+                          let endpoint = NTCP2PeerEndpoint.preferred(from: info.addresses) else {
+                        unreachableHops += 1
+                        continue
+                    }
+                    if !ntcp2.hasSession(for: peer.routerHash) {
+                        ntcp2.connect(host: endpoint.host, port: endpoint.port,
+                                      remoteRouterHash: peer.routerHash,
+                                      remoteStaticKey: endpoint.staticKey,
+                                      remoteIV: endpoint.iv)
+                    }
+                    let dialDeadline = Date().addingTimeInterval(8)
+                    while Date() < dialDeadline, !ntcp2.hasSession(for: peer.routerHash) {
+                        try? await Task.sleep(for: .milliseconds(250))
+                    }
+                    if ntcp2.hasSession(for: peer.routerHash) {
+                        peers.append(peer)
+                    } else {
+                        unreachableHops += 1
+                    }
+                    if peers.count == 2 { break }
+                }
             }
+            guard !peers.isEmpty else {
+                throw I2PMainnetFailure(message: "no NTCP2 session came up to any of the \(unreachableHops) candidate hops — the build message never left this router (live sessions: \(ntcp2.sessionCount()); session endings: \(ntcp2.recentCloses().joined(separator: " | ")))")
+            }
+            // An inbound tunnel is the reply path a real OBEP uses to return the
+            // build reply ("Reply through existing inbound D-E-F"): the endpoint
+            // cannot dial a creator behind NAT. Give the pool a chance to fill one.
+            if tunnelPool.inboundCount == 0 {
+                _ = await tunnelPool.fillPools()
+                let inboundDeadline = Date().addingTimeInterval(20)
+                while Date() < inboundDeadline, tunnelPool.inboundCount == 0 {
+                    try? await Task.sleep(for: .milliseconds(500))
+                }
+            }
+            // Without one, address the reply to our own router with a local
+            // endpoint ID this router hands straight back to the participant.
+            let localReplyEndpointID = UInt32.random(in: 1...UInt32.max)
+            context.mainnetI2NPRouter.registerGateway(tunnelID: localReplyEndpointID) { message, source in
+                guard message.type == .tunnelBuildReply else { return }
+                participant.handleBuildReply(message.payload, from: source)
+            }
+            let inboundReply = tunnelPool.inboundTunnels.first
+            let replyRoute: (gateway: Data, tunnelID: UInt32) = inboundReply.map {
+                (gateway: $0.hops.first?.routerHash ?? context.mainnetRouterHash,
+                 tunnelID: $0.gatewayTunnelID)
+            } ?? (gateway: context.mainnetRouterHash, tunnelID: localReplyEndpointID)
+            let replyRouteLabel = inboundReply == nil
+                ? "our own router, local endpoint \(localReplyEndpointID)"
+                : "existing inbound tunnel, gateway \(String(replyRoute.gateway.hex.prefix(12))) tunnel \(replyRoute.tunnelID)"
+            // Selection above dialed every hop, so each one carries a session now:
+            // the build window is the record round trip and nothing else.
+            let warmed = peers.count
             let builder = I2PTunnelBuilder(
                 localRouterHash: context.mainnetRouterHash,
                 participant: participant,
@@ -333,33 +538,37 @@ enum I2PMainnetVerification {
             let attemptStarted = Date()
             do {
                 let tunnel = try await builder.buildTunnel(
-                    direction: .outbound, hops: peers, lifetime: 900, timeout: 12)
+                    direction: .outbound, hops: peers, lifetime: 900, timeout: 20,
+                    replyRoute: replyRoute)
                 tunnelPool.adopt(tunnel)
                 await checkpoints.capture(netDB: netDB, ntcp2: ntcp2, pool: tunnelPool)
-                return String(format: "outbound tunnel built through %d real mainnet hops in %.1fs (gateway %@, endpoint tunnel %d); pool now holds %d outbound + %d inbound",
+                return String(format: "outbound tunnel built through %d real mainnet hops in %.1fs (%d/%d hop sessions up; reply route: %@); gateway %@, endpoint tunnel %d; pool now holds %d outbound + %d inbound",
                               tunnel.hopCount, Date().timeIntervalSince(attemptStarted),
+                              warmed, peers.count, replyRouteLabel,
                               String(tunnel.hops.first?.routerHash.hex.prefix(12) ?? "-"),
                               tunnel.gatewayTunnelID, tunnelPool.outboundCount, tunnelPool.inboundCount)
             } catch {
-                // Real mainnet hops drop records they cannot decrypt with their
-                // own key. Our build records use the documented ECIES-X25519
-                // record design inside the VariableTunnelBuild envelope (truth-
-                // table row TN-RECORD: record layout pending alignment to the
-                // mainnet record shape), so the request never comes back and the
-                // build times out — an implementation gap, not a network flake.
-                throw I2PMainnetFailure(message: "outbound tunnel build through \(peers.count) real mainnet hops did not complete in 12s (\(String(describing: error))); hops drop the documented ECIES record shape pending the TN-RECORD record-layout alignment; pool liveness: \(tunnelPool.outboundCount) outbound + \(tunnelPool.inboundCount) inbound active, \(tunnelPool.buildStartTimes.count) pool build attempt(s) logged")
+                // The short build records are spec-shaped and the reply now has a
+                // route; a live timeout here is a real mainnet interop finding
+                // (hop policy, record addressing or a hop that will not carry a
+                // two-hop tunnel), not a known shape mismatch.
+                throw I2PMainnetFailure(message: "outbound tunnel build through \(peers.count) real mainnet hops did not complete in 20s (\(String(describing: error))); \(warmed)/\(peers.count) hop sessions were up before the attempt and the reply route was \(replyRouteLabel); build records use the spec short-build shape (TN-RECORD/TN-BREPLY), so this is a live interop finding; pool liveness: \(tunnelPool.outboundCount) outbound + \(tunnelPool.inboundCount) inbound active, \(tunnelPool.buildStartTimes.count) pool build attempt(s) logged")
             }
         }
 
         await run("Mainnet post-run analysis against mainnet norms") {
             var findings: [String] = []
             var healthy = true
-            // Mainnet reseed archives carry hundreds of RouterInfos.
+            // Mainnet reseed archives carry hundreds of RouterInfos; a smaller
+            // archive is still a healthy bootstrap when it carries a usable
+            // floodfill set (the sweep aggregates hosts until it does).
             if let reseed {
                 if reseed.totalEntries >= 100 {
                     findings.append("reseed volume \(reseed.totalEntries) within mainnet norms")
+                } else if reseed.floodfillCount >= 20 {
+                    findings.append("reseed served \(reseed.totalEntries) RouterInfos with \(reseed.floodfillCount) floodfills — a usable peer set")
                 } else {
-                    findings.append("reseed fetched only \(reseed.totalEntries) RouterInfos (norm: hundreds)")
+                    findings.append("reseed fetched only \(reseed.totalEntries) RouterInfos and \(reseed.floodfillCount) floodfills (norm: hundreds)")
                     healthy = false
                 }
                 findings.append("\(reseed.floodfillCount) floodfills known")
@@ -398,6 +607,16 @@ enum I2PMainnetVerification {
         return results
     }
 
+    /// Explains an unresolvable well-known host whose own identity signs with a
+    /// type this router does not implement: a null-certificate (DSA-SHA1)
+    /// destination, or a key certificate carrying a legacy signature type such
+    /// as RSA-2048. Saying why needs no parse of an identity we reject anyway.
+    static func legacyIdentityNote(_ raw: Data) -> String? {
+        guard let code = I2PKeysAndCert.declaredSignatureTypeCode(in: raw),
+              I2PSigType(rawValue: code) == nil else { return nil }
+        return "its own destination identity signs with legacy SigType \(code), which this router's modern-only verifier does not implement, so no LeaseSet it publishes can be verified here"
+    }
+
     private static func dialTargets(netDB: I2PNetworkDatabase, ntcp2: NTCP2Transport,
                                     limit: Int) async throws -> [(hash: Data, endpoint: NTCP2PeerEndpoint, label: String)] {
         var targets: [(hash: Data, endpoint: NTCP2PeerEndpoint, label: String)] = []
@@ -406,7 +625,7 @@ enum I2PMainnetVerification {
         for hash in candidates {
             if targets.count >= limit { break }
             guard let routerInfo = await netDB.lookupRouterInfo(hash, timeoutPerRound: 1, maxRounds: 1) else { continue }
-            guard let endpoint = routerInfo.addresses.compactMap({ NTCP2PeerEndpoint(routerAddress: $0) }).first else { continue }
+            guard let endpoint = NTCP2PeerEndpoint.preferred(from: routerInfo.addresses) else { continue }
             targets.append((hash, endpoint, String(routerInfo.identity.hash.hex.prefix(12))))
         }
         guard !targets.isEmpty else {

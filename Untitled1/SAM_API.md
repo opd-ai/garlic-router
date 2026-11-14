@@ -35,6 +35,20 @@ SESSION QUIT                            →  (connection closes)
   payload only). Without `PORT`, inbound datagrams are delivered on the TCP
   connection as `DATAGRAM RECEIVED DESTINATION=<b64> SIZE=n\n<payload>\n`
   (anonymous sends carry no DESTINATION).
+- `ENCRYPTED_LEASESET=true` publishes the session's leases as an encrypted
+  LeaseSet2 instead of a plain LeaseSet: the inner lease set is sealed to the
+  session destination's own ECIES key, the envelope is signed with the blinded
+  private key derived from the destination credentials (Ed25519 seed + X25519
+  private key), and the entry is stored under the destination's blinded (b33)
+  netdb key — no plain entry is left under the destination hash. The
+  `SESSION STATUS` reply then also carries `B33=<address>`, the session's own
+  b33 address to hand out, and the entry is re-published as its leases rotate
+  (and on the renewal cycle).
+
+```
+SESSION CREATE STYLE=STREAM ID=hidden DESTINATION=TRANSIENT ENCRYPTED_LEASESET=true
+                                       →  SESSION STATUS RESULT=OK DESTINATION=<b64> B33=<address>
+```
 
 ### Streams (STYLE=STREAM)
 
@@ -117,9 +131,10 @@ The in-app self-test suite drives the full command set over a real loopback
 TCP socket against a live in-memory router network (tunnel hops, netdb,
 garlic pipeline): HELLO negotiation and edge cases, session creation with
 transient and imported keys, LeaseSet publication, NAMING lookups (ME, b32
-DHT, addressbook) and DEST GENERATE, STREAM CONNECT/ACCEPT end-to-end through
-tunnels with bidirectional data and FIN propagation, fragmented DATAGRAM
-SEND with reassembly, and anonymous RAW datagrams.
+DHT, addressbook) and DEST GENERATE, encrypted (b33) LeaseSet2 publication
+with self-resolution of the published entry, STREAM CONNECT/ACCEPT end-to-end
+through tunnels with bidirectional data and FIN propagation, fragmented
+DATAGRAM SEND with reassembly, and anonymous RAW datagrams.
 
 ## Deviations & integration notes
 
@@ -151,7 +166,7 @@ The conformance suite includes a load validation: three concurrent stream pairs 
 
 The automated self-test suite includes a live-network stage (`I2PMainnetVerification`) that connects the router to the main I2P network from CI — reseed and floodfill connectivity are ordinary router behavior:
 
-1. **Reseed** — fetches an `i2pseeds.su3` file from public reseed servers over HTTPS (five known hosts with fallback), parses the SU3 container and the embedded zip archive (EOCD scan, central directory, stored/raw-deflate entries via the Compression framework), and ingests every RouterInfo into the netdb after Ed25519 signature verification; `caps: f` entries register as floodfills. A couple of non-floodfill RouterInfos are deliberately withheld from the local cache as live DHT lookup targets. The SU3 container signature itself is not verified — documented deviation (RSA/ECDSA container signatures sit outside the modern crypto stack); integrity rides on the HTTPS transport and every RouterInfo inside is signature-verified on ingestion.
+1. **Reseed** — fetches an `i2pseeds.su3` file from public reseed servers over HTTPS (nine known hosts with fallback), verifies the SU3 container signature over the whole prefix (header included) against the signer's bundled reseed certificate in `Resources/reseed-certs`, then parses the embedded zip archive (EOCD scan, central directory, stored/raw-deflate entries via the Compression framework) and ingests every RouterInfo into the netdb after Ed25519 signature verification; `caps: f` entries register as floodfills. An unknown signer or a rejected signature discards that host's archive and the run moves on. A couple of non-floodfill RouterInfos are deliberately withheld from the local cache as live DHT lookup targets.
 2. **Baseline connectivity** — dials NTCP2 to up to five mainnet floodfill routers from the reseeded netdb and requires the spec's 3-5 floodfill connections; per-peer handshake results are reported.
 3. **DHT round-trip** — sends a real DatabaseLookup for a withheld RouterInfo over a live floodfill session and verifies the mainnet answer (signature-verified and cached), reporting measured latency.
 

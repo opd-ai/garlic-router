@@ -92,6 +92,7 @@ enum I2PSelfTest {
         results.append(contentsOf: await I2NPSelfTest.runAll())
         results.append(contentsOf: await I2PGarlicSelfTest.runAll())
         results.append(contentsOf: await I2PB33BlindingSelfTest.runAll())
+        results.append(contentsOf: await I2PB33HostBookSelfTest.runAll())
         results.append(contentsOf: await I2PSSU2SelfTest.runAll())
         results.append(contentsOf: await I2PRouterStatusSelfTest.runAll())
         results.append(contentsOf: I2PSpecComplianceSelfTest.runAll())
@@ -304,12 +305,27 @@ enum I2PSelfTest {
             guard parsedLookup.queryKey == key, parsedLookup.fromHash == gateway,
                   parsedLookup.excludedPeers == [key, gateway],
                   parsedLookup.replyTunnels.count == 1, parsedLookup.replyTunnels[0].tunnelId == 9,
-                  parsedLookup.replyToken == 5 else {
+                  parsedLookup.replyToken == 0 else {
                 throw I2PWireError.invalidFormat
             }
             let reply = I2PDatabaseSearchReply(queryKey: key, fromHash: gateway, peerHashes: [key, gateway])
-            let parsedReply = try I2PDatabaseSearchReply.parse(reply.serialize())
-            guard parsedReply.peerHashes == [key, gateway] else { throw I2PWireError.invalidFormat }
+            let replyBytes = reply.serialize()
+            let parsedReply = try I2PDatabaseSearchReply.parse(replyBytes)
+            guard parsedReply.peerHashes == [key, gateway], parsedReply.fromHash == gateway else {
+                throw I2PWireError.invalidFormat
+            }
+            // Wire layout per the spec: key (32) | num (1) | peer hashes | from (32).
+            // The `from` hash trails the peer list; putting it second made every
+            // real mainnet search reply unparseable and no lookup ever saw an answer.
+            let wire = Array(replyBytes)
+            guard wire.count == 32 + 1 + 2 * 32 + 32,
+                  Data(wire[0..<32]) == key,
+                  wire[32] == 2,
+                  Data(wire[33..<65]) == key,
+                  Data(wire[65..<97]) == gateway,
+                  Data(wire[97..<129]) == gateway else {
+                throw I2PWireError.invalidFormat
+            }
             let message = I2PNetDBMessage.store(store)
             let reparsed = try I2PNetDBMessage.parse(message.serialize(), i2npType: message.i2npType)
             guard case .store(let s2) = reparsed, s2.replyToken == 0x1122_3344 else {
@@ -321,10 +337,10 @@ enum I2PSelfTest {
         run("BLAKE2b-512 vector") {
             let digest = BLAKE2b.digest([], outLen: 64)
             let hex = Data(digest).hex
-            guard hex.hasPrefix("786a02f7673b5856") else {
+            guard hex.hasPrefix("786a02f742015903") else {
                 // Name the digest this build actually produced: a pure function
                 // missing a fixed vector is otherwise undiagnosable from a tag.
-                throw SSU2Error.testFailed("empty-input digest \(hex.prefix(16))… diverges from the RFC 7693 vector 786a02f7673b5856…")
+                throw SSU2Error.testFailed("empty-input digest \(hex.prefix(16))… diverges from the RFC 7693 vector 786a02f742015903…")
             }
             return "empty-input digest matches reference vector"
         }
@@ -383,19 +399,28 @@ enum I2PSpecComplianceSelfTest {
             // types; these are the spec's codes.
             let expected: [I2NPMessageType: UInt8] = [
                 .databaseStore: 1, .databaseLookup: 2, .databaseSearchReply: 3,
-                .deliveryStatus: 4, .garlic: 5, .tunnelData: 6,
-                .tunnelGateway: 7, .dataMessage: 8, .tunnelBuild: 21,
-                .tunnelBuildReply: 22
+                .deliveryStatus: 10, .garlic: 11, .tunnelData: 18,
+                .tunnelGateway: 19, .dataMessage: 20, .tunnelBuild: 25,
+                .tunnelBuildReply: 26
             ]
             for (messageType, code) in expected {
                 guard messageType.rawValue == code else {
                     throw I2PWireError.invalidFormat
                 }
             }
-            guard I2NPMessageType.options.rawValue == 12 else {
-                throw I2PWireError.invalidFormat // router-internal, obsolete slot
+            guard I2NPMessageType.allCases.map(\.rawValue).sorted()
+                    == [1, 2, 3, 10, 11, 18, 19, 20, 25, 26] else {
+                throw I2PWireError.invalidFormat
             }
-            return "10 mainnet codes verified; options documented as router-internal"
+            // There is no Options I2NP message: the spec's table has none and
+            // type 19 is TunnelGateway, so the obsolete type-12 slot the router
+            // once used for one must not parse at all.
+            var obsolete = I2NPMessage(type: .dataMessage, payload: Data([0x7A])).serialize()
+            obsolete[0] = 12
+            guard (try? I2NPMessage.parse(obsolete)) == nil else {
+                throw I2PWireError.invalidFormat
+            }
+            return "10 spec codes verified; no Options message type; obsolete slot 12 rejected"
         }
 
         run("I2NP header round trip + expiry enforcement") {
@@ -439,22 +464,26 @@ enum I2PSpecComplianceSelfTest {
         }
 
         run("NTCP2 protocol-name chaining (Noise §5)") {
-            let nameBytes = Array(NTCP2NoiseChain.protocolName.utf8)
-            guard nameBytes.count == 32 else { throw I2PWireError.invalidFormat }
-            // At exactly HASHLEN bytes the name must ride verbatim, unhashed.
+            // The NTCP2 protocol_name is 48 bytes, so Noise hashes it:
+            // h = SHA256(protocol_name), ck = h, then the null prologue gives
+            // h = SHA256(h).
+            let nameBytes = Data(NTCP2NoiseChain.protocolName.utf8)
+            guard nameBytes.count == 48 else { throw I2PWireError.invalidFormat }
             let chain = NTCP2NoiseChain()
-            guard chain.chainingKey == Data(nameBytes), chain.hash == Data(nameBytes) else {
+            let nameHash = I2PCrypto.sha256(nameBytes)
+            guard chain.chainingKey == nameHash,
+                  chain.hash == I2PCrypto.sha256(nameHash) else {
                 throw I2PWireError.invalidFormat
             }
-            return "32-byte name used verbatim as chaining key and hash"
+            return "48-byte spec name hashed into ck and h; null prologue mixed"
         }
 
         run("NTCP2 nonce96 + block codec + frame MAC rejection") {
-            // nonce96 must be exactly [4 zero bytes][big-endian counter]:
+            // nonce96 must be exactly [4 zero bytes][little-endian counter]:
             // verified functionally against a manually built 12-byte nonce.
             let key = I2PCrypto.randomBytes(32)
             let counter: UInt64 = 0x0102_0304_0506_0708
-            let manual = Data([0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8])
+            let manual = Data([0, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1])
             let a = try! ChaChaPoly.seal(Data(), using: SymmetricKey(data: key),
                                          nonce: NTCP2NoiseChain.nonce96(counter))
             let b = try! ChaChaPoly.seal(Data(), using: SymmetricKey(data: key),
@@ -464,7 +493,7 @@ enum I2PSpecComplianceSelfTest {
                 .data(Data("payload".utf8)),
                 .time(Date(timeIntervalSince1970: 1_700_000_000)),
                 .padding(7),
-                .termination(reason: 0, validTime: Date(timeIntervalSince1970: 1_700_000_000))
+                .termination(reason: 0, validFrames: 0)
             ]
             let encoded = try NTCP2Block.encode(blocks)
             let decoded = try NTCP2Block.decode(NTCP2Block.aligned(encoded))
@@ -472,17 +501,22 @@ enum I2PSpecComplianceSelfTest {
                   case .data(let payload) = decoded[0], payload == Data("payload".utf8) else {
                 throw I2PWireError.invalidFormat
             }
-            let codec = NTCP2FrameCodec(directionKeys: NTCP2DirectionKeys(
-                aeadKey: I2PCrypto.randomBytes(32), sipKey: I2PCrypto.randomBytes(16)
-            ))
-            let framed = try codec.frame(Data("i2np-frame".utf8))
-            guard (try codec.unframe(framed))?.payload == Data("i2np-frame".utf8) else {
+            let keys = NTCP2DirectionKeys(
+                aeadKey: I2PCrypto.randomBytes(32), sipKeys: I2PCrypto.randomBytes(24)
+            )
+            // Each direction owns its SipHash length-mask counter: a codec that
+            // both sends and receives advances the counter before the length is
+            // unmasked and decodes its own frame with the wrong mask (BUG-001).
+            let sender = NTCP2FrameCodec(directionKeys: keys)
+            let receiver = NTCP2FrameCodec(directionKeys: keys)
+            let framed = try sender.frame(Data("i2np-frame".utf8))
+            guard (try receiver.unframe(framed))?.payload == Data("i2np-frame".utf8) else {
                 throw I2PWireError.invalidFormat
             }
             var tampered = framed
             tampered[tampered.count - 3] ^= 0xff
             do {
-                _ = try codec.unframe(tampered)
+                _ = try NTCP2FrameCodec(directionKeys: keys).unframe(tampered)
                 throw I2PWireError.invalidSignature
             } catch let error as NTCP2Error {
                 guard case .decryptFailed = error else { throw I2PWireError.invalidSignature }
@@ -520,6 +554,10 @@ enum I2PSpecComplianceSelfTest {
         }
 
         run("SipHash-2-4 length obfuscation determinism") {
+            // Reference known-answer vector: key 00..0f, message 00..0e.
+            guard SipHash24.hash(key: Data(0..<16), message: Data(0..<15)) == 0xa129_ca61_49be_45e5 else {
+                throw I2PWireError.invalidFormat
+            }
             let key = I2PCrypto.randomBytes(16)
             let maskA = UInt16(truncatingIfNeeded: SipHash24.hash(
                 key: key, message: withUnsafeBytes(of: UInt64(0).bigEndian) { Data($0) }

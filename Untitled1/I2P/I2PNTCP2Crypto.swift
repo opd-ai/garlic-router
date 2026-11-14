@@ -2,10 +2,10 @@
 //  I2PNTCP2Crypto.swift
 //  I2P
 //
-//  NTCP2 cryptographic core: Noise_XK_25519_ChaChaPoly_SHA256 chaining state,
-//  the spec's AES-256-CBC ephemeral-key obfuscation (proposal 111 KDF),
-//  SipHash-2-4 length obfuscation with the spec data-phase KDF, and the
-//  NTCP2 payload block codec.
+//  NTCP2 cryptographic core: the Noise XK chaining state for the
+//  Noise_XKaesobfse+hs2+hs3_25519_ChaChaPoly_SHA256 protocol, the spec's
+//  AES-256-CBC ephemeral-key obfuscation, SipHash-2-4 length obfuscation with
+//  the spec data-phase KDF, and the NTCP2 payload block codec.
 //
 
 import Foundation
@@ -22,17 +22,24 @@ enum NTCP2Error: Error {
     case noSession(forHash: Data)
 }
 
-/// Noise_XK chaining state. `h` starts as HASH(protocol_name); the responder's
-/// static key is folded in as the Noise pre-message. `MixKey` rekeys via HKDF and
-/// resets the handshake AEAD nonce; `MixHash` folds wire material into `h`.
-struct NTCP2NoiseChain {
-    static let protocolName = "Noise_XK_25519_ChaChaPoly_SHA256"
+/// Constant handshake fields of the NTCP2 protocol.
+enum NTCP2Handshake {
+    /// Network ID (spec §SessionRequest options block: "currently 2, except for
+    /// test networks"). A peer advertising another ID is on a different network.
+    static let networkID: UInt8 = 2
+    /// NTCP2 protocol version this implementation speaks.
+    static let version: UInt8 = 2
+}
 
-    /// The ephemeral-key obfuscation KDF binds to this initial chaining key
-    /// (the protocol name verbatim), not to any advanced handshake state, so
-    /// both sides derive the obfuscation key and IV before any handshake
-    /// processing.
-    static var initialChainingKey: Data { NTCP2NoiseChain().chainingKey }
+/// Noise_XK chaining state over NTCP2's protocol name. `h` and `ck` start at
+/// SHA256(protocol_name); the null prologue and the responder's static key are
+/// folded in as the Noise pre-messages. `MixKey` rekeys via HKDF and resets the
+/// handshake AEAD nonce; `MixHash` folds wire material into `h`.
+struct NTCP2NoiseChain {
+    /// The spec's `protocol_name`: 48 bytes of US-ASCII, no NULL terminator.
+    /// The shorthand "Noise_XK_25519_ChaChaPoly_SHA256" names the base pattern
+    /// but is not the identifier that seeds the KDF, so it can never interop.
+    static let protocolName = "Noise_XKaesobfse+hs2+hs3_25519_ChaChaPoly_SHA256"
 
     private(set) var chainingKey: Data
     private(set) var hash: Data
@@ -40,21 +47,13 @@ struct NTCP2NoiseChain {
     private(set) var nonce: UInt64 = 0
 
     init() {
-        // Noise §5: protocol names of at most HASHLEN bytes are used verbatim
-        // (zero-padded to HASHLEN) as both chaining key and hash; longer names
-        // are SHA-256 hashed first. The NTCP2 protocol name is exactly 32
-        // bytes, so it rides unhashed — matching every mainnet NTCP2 peer.
-        let nameBytes = Data(Self.protocolName.utf8)
-        if nameBytes.count <= 32 {
-            var padded = nameBytes
-            padded.append(contentsOf: [UInt8](repeating: 0, count: 32 - nameBytes.count))
-            chainingKey = padded
-            hash = padded
-        } else {
-            let nameHash = Data(SHA256.hash(data: nameBytes))
-            chainingKey = nameHash
-            hash = nameHash
-        }
+        // Spec KDF: h = SHA256(protocol_name); ck = h; then MixHash(null
+        // prologue), h = SHA256(h). Both sides precalculate this before any
+        // connection-specific material arrives.
+        let nameHash = Self.sha256(Data(Self.protocolName.utf8))
+        chainingKey = nameHash
+        hash = nameHash
+        mixHash(Data())
     }
 
     mutating func mixHash(_ data: Data) {
@@ -79,9 +78,13 @@ struct NTCP2NoiseChain {
                                       nonce: Self.nonce96(nonce),
                                       authenticating: hash)
         nonce += 1
-        let ciphertext = box.ciphertext + box.tag
-        mixHash(ciphertext)
-        return ciphertext
+        // CryptoKit's ciphertext is a slice with a non-zero index base; copy it
+        // into a fresh buffer so the wire blob is safe to index from zero.
+        var wire = Data()
+        wire.append(contentsOf: box.ciphertext)
+        wire.append(contentsOf: box.tag)
+        mixHash(wire)
+        return wire
     }
 
     /// Noise DecryptWithAd over a ciphertext || tag wire blob.
@@ -104,24 +107,31 @@ struct NTCP2NoiseChain {
         return plaintext
     }
 
-    /// Noise Split(): temp_key = HMAC-SHA256(chaining_key, zerolen);
-    /// k_ab = HMAC-SHA256(temp_key, chaining_key || byte(0x01));
-    /// k_ba = HMAC-SHA256(temp_key, chaining_key || byte(0x02)).
-    /// The SipHash length-obfuscation keys come from the NTCP2 spec's
-    /// data-phase KDF (dataPhaseSipKey), not from the split output directly.
+    /// The spec's data-phase KDF. It needs the final handshake hash as well as
+    /// the chaining key, because the SipHash labels are seeded with `h`.
+    ///
+    /// temp_key = HMAC-SHA256(ck, zerolen); k_ab = HMAC(temp_key, 0x01);
+    /// k_ba = HMAC(temp_key, k_ab || 0x02); ask_master = HMAC(temp_key,
+    /// "ask" || 0x01); temp_key = HMAC(ask_master, h || "siphash");
+    /// sip_master = HMAC(temp_key, 0x01); temp_key = HMAC(sip_master, zerolen);
+    /// sipkeys_ab = HMAC(temp_key, 0x01),
+    /// sipkeys_ba = HMAC(temp_key, sipkeys_ab || 0x02).
     func split() -> (ab: NTCP2DirectionKeys, ba: NTCP2DirectionKeys) {
-        let temp = Self.hmac(Data(), key: chainingKey)
-        let k_ab = Self.hmac(chainingKey + Data([0x01]), key: temp)
-        let k_ba = Self.hmac(chainingKey + Data([0x02]), key: temp)
-        return (NTCP2DirectionKeys(aeadKey: k_ab, sipKey: Self.dataPhaseSipKey(k_ab)),
-                NTCP2DirectionKeys(aeadKey: k_ba, sipKey: Self.dataPhaseSipKey(k_ba)))
-    }
+        let tempKey = Self.hmac(Data(), key: chainingKey)
+        let kAB = Self.hmac(Data([0x01]), key: tempKey)
+        let kBA = Self.hmac(kAB + Data([0x02]), key: tempKey)
 
-    /// NTCP2 spec data-phase KDF for one direction's SipHash length-obfuscation key:
-    /// temp_key = HMAC-SHA256(k_direction, zerolen);
-    /// sipkey = first 16 bytes of HMAC-SHA256(temp_key, zerolen).
-    static func dataPhaseSipKey(_ directionKey: Data) -> Data {
-        Data(hmac(Data(), key: hmac(Data(), key: directionKey)).prefix(16))
+        let askMaster = Self.hmac(Data("ask".utf8) + Data([0x01]), key: tempKey)
+        let sipTempKey = Self.hmac(hash + Data("siphash".utf8), key: askMaster)
+        let sipMaster = Self.hmac(Data([0x01]), key: sipTempKey)
+        let sipExpand = Self.hmac(Data(), key: sipMaster)
+        let sipAB = Self.hmac(Data([0x01]), key: sipExpand)
+        let sipBA = Self.hmac(sipAB + Data([0x02]), key: sipExpand)
+
+        // Each direction gets 24 bytes: two 8-byte SipHash keys and the 8-byte
+        // initial IV, in the order the spec's KDF emits them.
+        return (NTCP2DirectionKeys(aeadKey: kAB, sipKeys: Data(sipAB.prefix(24))),
+                NTCP2DirectionKeys(aeadKey: kBA, sipKeys: Data(sipBA.prefix(24))))
     }
 
     private static func hmac(_ message: Data, key: Data) -> Data {
@@ -142,12 +152,12 @@ struct NTCP2NoiseChain {
         return out
     }
 
-    /// Noise 96-bit nonce: 32 zero bits, then the 64-bit big-endian counter.
+    /// Noise 96-bit nonce: 32 zero bits, then the 64-bit **little-endian**
+    /// counter, as the Noise spec (and NTCP2 §Authenticated Encryption) require.
     static func nonce96(_ counter: UInt64) -> ChaChaPoly.Nonce {
         var bytes = [UInt8](repeating: 0, count: 12)
-        var value = counter.bigEndian
-        withUnsafeBytes(of: &value) { raw in
-            for (index, byte) in raw.enumerated() { bytes[4 + index] = byte }
+        for index in 0..<8 {
+            bytes[4 + index] = UInt8((counter >> (8 * UInt64(index))) & 0xff)
         }
         return (try? ChaChaPoly.Nonce(data: Data(bytes)))!
     }
@@ -157,9 +167,11 @@ struct NTCP2NoiseChain {
     }
 }
 
+/// One direction of the established session: the ChaChaPoly data key plus the
+/// 24 bytes of SipHash key material (k1 ‖ k2 ‖ iv) the data-phase KDF emits.
 struct NTCP2DirectionKeys: Equatable {
     let aeadKey: Data
-    let sipKey: Data
+    let sipKeys: Data
 }
 
 struct NTCP2SessionKeys {
@@ -167,39 +179,49 @@ struct NTCP2SessionKeys {
     let recvKeys: NTCP2DirectionKeys
 }
 
-/// NTCP2 spec ephemeral-key obfuscation (proposal 111): the 32-byte ephemeral
-/// keys in messages 1 and 2 are AES-256-CBC-encrypted with a key and IV derived
-/// by the spec KDF — temp_key = HMAC-SHA256(chaining_key, remote_material), then
-/// the HKDF chain expansion of temp_key yields the 32-byte AES key and the
-/// 16-byte IV. `remote_material` is the responder's static public key for
-/// message 1 and the initiator's deobfuscated ephemeral key for message 2; both
-/// bind to the initial chaining key (protocol name verbatim) so both sides can
-/// derive them before any handshake state advances. Deterministic: the same
-/// inputs always produce the same wire bytes.
-enum NTCP2KeyObfuscation {
-    static func keyAndIV(material: Data, chainingKey: Data) -> (key: Data, iv: Data) {
-        let temp = hmac(material, key: chainingKey)
-        let blocks = NTCP2NoiseChain.hkdf(temp, Data(), outputs: 2)
-        return (blocks[0], Data(blocks[1].prefix(16)))
+/// NTCP2 §SessionRequest: the 32-byte X25519 ephemeral key is AES-256-CBC
+/// encrypted under the responder's router hash with the IV the responder
+/// publishes in its RouterInfo `i` option. Message 2 continues the same CBC
+/// chain ("iv: Using AES state from message 1"), so one instance carries the
+/// whole exchange: the initiator encrypts X then decrypts Y, the responder
+/// decrypts X then encrypts Y.
+struct NTCP2HandshakeObfuscator {
+    private let key: Data
+    private var iv: Data
+
+    init(routerHash: Data, iv: Data) throws {
+        guard routerHash.count == 32 else {
+            throw NTCP2Error.handshakeFailed("NTCP2 obfuscation key must be the 32-byte router hash")
+        }
+        guard iv.count == 16 else {
+            throw NTCP2Error.handshakeFailed("NTCP2 obfuscation IV must be the 16-byte published 'i' option")
+        }
+        self.key = routerHash
+        self.iv = iv
     }
 
-    static func encrypt(_ key32: Data, chainingKey: Data, material: Data) throws -> Data {
-        let (k, iv) = keyAndIV(material: material, chainingKey: chainingKey)
-        return I2PAESCBC.encrypt(key32, key: k, iv: iv)
+    mutating func encrypt(_ ephemeralKey: Data) throws -> Data {
+        guard ephemeralKey.count == 32 else {
+            throw NTCP2Error.handshakeFailed("NTCP2 ephemeral key must be 32 bytes")
+        }
+        let ciphertext = I2PAESCBC.encrypt(ephemeralKey, key: key, iv: iv)
+        iv = Data(ciphertext.suffix(16))
+        return ciphertext
     }
 
-    static func decrypt(_ key32: Data, chainingKey: Data, material: Data) throws -> Data {
-        let (k, iv) = keyAndIV(material: material, chainingKey: chainingKey)
-        return I2PAESCBC.decrypt(key32, key: k, iv: iv)
-    }
-
-    private static func hmac(_ message: Data, key: Data) -> Data {
-        Data(HMAC<SHA256>.authenticationCode(for: message, using: SymmetricKey(data: key)))
+    mutating func decrypt(_ wire: Data) throws -> Data {
+        guard wire.count == 32 else {
+            throw NTCP2Error.handshakeFailed("obfuscated NTCP2 ephemeral key must be 32 bytes")
+        }
+        let plaintext = I2PAESCBC.decrypt(wire, key: key, iv: iv)
+        iv = Data(wire.suffix(16))
+        return plaintext
     }
 }
 
-/// AES-256-CBC without padding (CommonCrypto), as required by the NTCP2 spec's
-/// ephemeral-key obfuscation (block-aligned 32-byte input, 32-byte output).
+/// AES-CBC without padding (CommonCrypto), as required by the NTCP2 spec's
+/// ephemeral-key obfuscation (block-aligned 32-byte input, 32-byte output) and
+/// by the tunnel layer cipher's IV transform (AES-128-ECB over one block).
 enum I2PAESCBC {
     static func encrypt(_ data: Data, key: Data, iv: Data) -> Data {
         crypt(data, key: key, iv: iv, operation: CCOperation(kCCEncrypt))
@@ -210,7 +232,12 @@ enum I2PAESCBC {
     }
 
     private static func crypt(_ data: Data, key: Data, iv: Data, operation: CCOperation) -> Data {
-        precondition(key.count == Int(kCCKeySizeAES256), "AES-256 key required")
+        // AES-256 (32-byte key) is what NTCP2's obfuscation uses; the tunnel IV
+        // transform keys AES-128 with the spec's 16-byte IV key. Both ride the
+        // same CommonCrypto path, so the key length decides the AES variant.
+        precondition(key.count == Int(kCCKeySizeAES128) || key.count == Int(kCCKeySizeAES192)
+                     || key.count == Int(kCCKeySizeAES256),
+                     "AES key must be 16, 24 or 32 bytes")
         precondition(iv.count == Int(kCCBlockSizeAES128), "16-byte IV required")
         precondition(data.count % Int(kCCBlockSizeAES128) == 0, "AES-CBC input must be block-aligned")
         var output = Data(repeating: 0, count: data.count)
@@ -235,19 +262,38 @@ enum I2PAESCBC {
 
 /// SipHash-2-4, used to obfuscate data-phase frame length fields.
 enum SipHash24 {
+    /// The two 64-bit keys are loaded **little-endian** from the 16-byte key
+    /// material. The spec's "two 8-byte keys (big endian)" line describes the
+    /// integer-to-wire order of the mask, not the key load: reference routers
+    /// read the KDF bytes with a little-endian 64-bit load (Java I2P's
+    /// `fromLong8LE` in NTCPConnection), and reading them big-endian here makes
+    /// every length mask differ from the peer's.
     static func hash(key: Data, message: Data) -> UInt64 {
         precondition(key.count == 16)
+        let bytes = Array(key)
+        var k0: UInt64 = 0
+        var k1: UInt64 = 0
+        for index in 0..<8 {
+            k0 |= UInt64(bytes[index]) << (8 * UInt64(index))
+            k1 |= UInt64(bytes[8 + index]) << (8 * UInt64(index))
+        }
+        return hash(k0: k0, k1: k1, message: message)
+    }
+
+    static func hash(k0: UInt64, k1: UInt64, message: Data) -> UInt64 {
+        // SipHash reads each 64-bit message word little-endian (the reference
+        // `U8TO64_LE`); loading it big-endian produces a digest no reference
+        // implementation agrees with, so every NTCP2 frame length mask would
+        // differ from the peer's and the peer would read a bogus frame length
+        // and drop the session right after the first data frame.
         func le64(_ data: [UInt8], _ offset: Int) -> UInt64 {
             var value: UInt64 = 0
-            for index in stride(from: offset + 7, through: offset, by: -1) {
-                value = (value << 8) | UInt64(data[index])
+            for index in 0..<8 {
+                value |= UInt64(data[offset + index]) << (8 * UInt64(index))
             }
             return value
         }
-        let keyBytes = Array(key)
         let messageBytes = Array(message)
-        let k0 = le64(keyBytes, 0)
-        let k1 = le64(keyBytes, 8)
         var v0 = 0x736f_6d65_7073_6575 ^ k0
         var v1 = 0x646f_7261_6e64_6f6d ^ k1
         var v2 = 0x6c79_6765_6e65_7261 ^ k0
@@ -266,7 +312,12 @@ enum SipHash24 {
             v0 ^= m
             index += 8
         }
-        var tail: UInt64 = UInt64(messageBytes.count - index) << 56
+        // The tail word's high byte carries the TOTAL message length (the
+        // reference's `b = inlen << 56`), not the leftover byte count: using the
+        // remainder matches the published vectors for messages shorter than 8
+        // bytes and silently diverges for every longer one, which would corrupt
+        // every NTCP2 frame length mask once a session sends a full block.
+        var tail: UInt64 = UInt64(messageBytes.count) << 56
         var shift: UInt64 = 0
         while index < messageBytes.count {
             tail |= UInt64(messageBytes[index]) << shift
@@ -277,69 +328,144 @@ enum SipHash24 {
         sipRound(); sipRound()
         v0 ^= tail
         v2 ^= 0xff
-        sipRound(); sipRound(); sipRound()
+        // SipHash-**2-4**: two compression rounds per block, four finalization
+        // rounds. Three final rounds (the previous code) produces a digest no
+        // reference implementation agrees with, so every frame length mask
+        // differed from the peer's.
+        sipRound(); sipRound(); sipRound(); sipRound()
         return v0 ^ v1 ^ v2 ^ v3
     }
 }
 
-/// Big-endian millisecond timestamps used in NTCP2 blocks.
+/// 4-byte big-endian Unix timestamps in seconds, the only timestamp form NTCP2
+/// puts on the wire (handshake options blocks and datetime blocks).
 enum NTCP2Time {
-    static func milliseconds(_ date: Date) -> Data {
-        let ms = UInt64(max(0, date.timeIntervalSince1970 * 1000).rounded())
-        var value = ms.bigEndian
-        return withUnsafeBytes(of: &value) { Data($0) }
+    static func seconds(_ date: Date) -> Data {
+        let value = UInt32(truncatingIfNeeded: UInt64(max(0, date.timeIntervalSince1970)))
+        var bytes = [UInt8](repeating: 0, count: 4)
+        for index in 0..<4 {
+            let shift = UInt32(8 * (3 - index))
+            bytes[index] = UInt8((value >> shift) & 0xff)
+        }
+        return Data(bytes)
     }
 
     static func date(_ data: Data) -> Date {
-        var ms: UInt64 = 0
-        for byte in data { ms = (ms << 8) | UInt64(byte) }
-        return Date(timeIntervalSince1970: Double(ms) / 1000)
+        var value: UInt32 = 0
+        for byte in data.prefix(4) { value = (value << 8) | UInt32(byte) }
+        return Date(timeIntervalSince1970: TimeInterval(value))
+    }
+}
+
+/// The data-phase options block (type 1): the padding negotiation record. Each
+/// ratio is a 4.4 fixed-point value (0x10 = 100% padding); the dummy and delay
+/// fields are 16-bit big-endian byte- and millisecond-per-second averages.
+struct NTCP2Options: Equatable {
+    var transmitMin: UInt8 = 0
+    var transmitMax: UInt8 = 0
+    var receiveMin: UInt8 = 0
+    var receiveMax: UInt8 = 0
+    var transmitDummy: UInt16 = 0
+    var receiveDummy: UInt16 = 0
+    var transmitDelay: UInt16 = 0
+    var receiveDelay: UInt16 = 0
+
+    /// The spec's minimum record; later revisions append `more_options`.
+    static let wireLength = 12
+
+    func encode() -> Data {
+        var writer = I2PWriter()
+        writer.byte(transmitMin)
+        writer.byte(transmitMax)
+        writer.byte(receiveMin)
+        writer.byte(receiveMax)
+        writer.short(transmitDummy)
+        writer.short(receiveDummy)
+        writer.short(transmitDelay)
+        writer.short(receiveDelay)
+        return writer.data
+    }
+
+    static func decode(_ data: Data) -> NTCP2Options? {
+        guard data.count >= wireLength else { return nil }
+        var reader = I2PReader(Data(data.prefix(wireLength)))
+        guard let transmitMin = try? reader.byte(),
+              let transmitMax = try? reader.byte(),
+              let receiveMin = try? reader.byte(),
+              let receiveMax = try? reader.byte(),
+              let transmitDummy = try? reader.short(),
+              let receiveDummy = try? reader.short(),
+              let transmitDelay = try? reader.short(),
+              let receiveDelay = try? reader.short() else {
+            return nil
+        }
+        return NTCP2Options(transmitMin: transmitMin,
+                            transmitMax: transmitMax,
+                            receiveMin: receiveMin,
+                            receiveMax: receiveMax,
+                            transmitDummy: transmitDummy,
+                            receiveDummy: receiveDummy,
+                            transmitDelay: transmitDelay,
+                            receiveDelay: receiveDelay)
     }
 }
 
 /// NTCP2 payload blocks: [1-byte type][2-byte big-endian length][contents].
+/// The type codes are the spec's: 0 datetime, 1 options, 2 RouterInfo,
+/// 3 I2NP message, 4 termination, 254 padding.
 enum NTCP2BlockType: UInt8 {
-    case padding = 0
+    case time = 0
     case options = 1
     case routerInfo = 2
     case data = 3
     case termination = 4
-    case time = 5
+    case padding = 254
 }
 
 enum NTCP2Block {
-    case padding(Int)
-    case options([String: String])
-    case routerInfo(Data)
-    case data(Data)
-    case termination(reason: UInt8, validTime: Date)
+    /// Type 0: a 4-byte Unix-seconds timestamp (rounded to the second).
     case time(Date)
+    /// Type 1: the padding negotiation record.
+    case options(NTCP2Options)
+    /// Type 2: a RouterInfo preceded by a 1-byte flags field (bit 0 = flood
+    /// request). The enum carries the RouterInfo itself, flag stripped. The
+    /// RouterInfo is NOT gzipped here, unlike in a DatabaseStore message.
+    case routerInfo(Data)
+    /// Type 3: one I2NP message in the 9-byte short header (type, message ID,
+    /// 4-byte seconds-level expiry, body).
+    case data(Data)
+    /// Type 4: the number of valid AEAD data frames received, then the reason
+    /// code; this must be the last non-padding block of the frame.
+    case termination(reason: UInt8, validFrames: UInt64)
+    /// Type 254: opaque padding, last block of the frame when present.
+    case padding(Int)
 
     static func encode(_ blocks: [NTCP2Block]) throws -> Data {
         var writer = I2PWriter()
-        func write(_ type: NTCP2BlockType, _ content: Data) {
+        func write(_ type: NTCP2BlockType, _ content: Data) throws {
+            guard content.count <= 0xFFFE else { throw NTCP2Error.invalidBlock }
             writer.byte(type.rawValue)
             writer.short(UInt16(content.count))
             writer.raw(content)
         }
         for block in blocks {
             switch block {
-            case .padding(let count):
-                write(.padding, Data(repeating: 0, count: count))
-            case .options(let mapping):
-                var mappingWriter = I2PWriter()
-                mappingWriter.mapping(mapping)
-                write(.options, mappingWriter.data)
-            case .routerInfo(let routerInfo):
-                write(.routerInfo, routerInfo)
-            case .data(let payload):
-                write(.data, payload)
-            case .termination(let reason, let validTime):
-                var content = Data([reason])
-                content += NTCP2Time.milliseconds(validTime)
-                write(.termination, content)
             case .time(let date):
-                write(.time, NTCP2Time.milliseconds(date))
+                try write(.time, NTCP2Time.seconds(date))
+            case .options(let options):
+                try write(.options, options.encode())
+            case .routerInfo(let routerInfo):
+                try write(.routerInfo, Data([0]) + routerInfo)
+            case .data(let payload):
+                try write(.data, payload)
+            case .termination(let reason, let validFrames):
+                var content = Data()
+                var count = validFrames.bigEndian
+                withUnsafeBytes(of: &count) { content.append(contentsOf: $0) }
+                content.append(reason)
+                try write(.termination, content)
+            case .padding(let count):
+                try write(.padding, Data(repeating: 0, count: max(0, count)))
             }
         }
         return writer.data
@@ -349,27 +475,33 @@ enum NTCP2Block {
         var reader = I2PReader(payload)
         var blocks: [NTCP2Block] = []
         while reader.remaining > 0 {
-            guard let type = NTCP2BlockType(rawValue: try reader.byte()) else {
-                throw NTCP2Error.invalidBlock
-            }
+            let rawType = try reader.byte()
             let length = Int(try reader.short())
             let content = try reader.raw(length)
-            switch type {
-            case .padding:
+            guard let type = NTCP2BlockType(rawValue: rawType) else {
+                // Spec: unknown block identifiers are ignored, as if padding.
                 blocks.append(.padding(length))
+                continue
+            }
+            switch type {
+            case .time:
+                guard content.count >= 4 else { throw NTCP2Error.invalidBlock }
+                blocks.append(.time(NTCP2Time.date(content)))
             case .options:
-                var contentReader = I2PReader(content)
-                blocks.append(.options(try contentReader.mapping()))
+                guard let options = NTCP2Options.decode(content) else { throw NTCP2Error.invalidBlock }
+                blocks.append(.options(options))
             case .routerInfo:
-                blocks.append(.routerInfo(content))
+                guard content.count >= 1 else { throw NTCP2Error.invalidBlock }
+                blocks.append(.routerInfo(Data(content.dropFirst(1))))
             case .data:
                 blocks.append(.data(content))
             case .termination:
                 guard content.count >= 9 else { throw NTCP2Error.invalidBlock }
-                blocks.append(.termination(reason: content[0], validTime: NTCP2Time.date(Data(content.dropFirst(1)))))
-            case .time:
-                guard content.count == 8 else { throw NTCP2Error.invalidBlock }
-                blocks.append(.time(NTCP2Time.date(content)))
+                var frames: UInt64 = 0
+                for index in 0..<8 { frames = (frames << 8) | UInt64(content[index]) }
+                blocks.append(.termination(reason: content[8], validFrames: frames))
+            case .padding:
+                blocks.append(.padding(length))
             }
         }
         return blocks
@@ -377,13 +509,12 @@ enum NTCP2Block {
 
     /// NTCP2 payloads are padded so their total length is a multiple of 16.
     static func aligned(_ payload: Data) -> Data {
-        let remainder = payload.count % 16
-        guard remainder != 0 else { return payload }
+        guard payload.count % 16 != 0 else { return payload }
         let pad = (16 - ((payload.count + 3) % 16)) % 16
         var out = payload
         out.append(NTCP2BlockType.padding.rawValue)
-        out.append(UInt8((pad >> 8) & 0xff))
-        out.append(UInt8(pad & 0xff))
+        out.append(0)
+        out.append(UInt8(pad))
         out.append(contentsOf: [UInt8](repeating: 0, count: pad))
         return out
     }
@@ -393,25 +524,41 @@ enum NTCP2Block {
 /// A class so sessions share one mutable codec per direction.
 final class NTCP2FrameCodec {
     private let aeadKey: Data
-    private let sipKey: Data
+    private let sipKey1: UInt64
+    private let sipKey2: UInt64
+    private var sipIV: Data
     private(set) var counter: UInt64 = 0
 
     init(directionKeys: NTCP2DirectionKeys) {
+        precondition(directionKeys.sipKeys.count >= 24, "24-byte SipHash key material required")
         aeadKey = directionKeys.aeadKey
-        sipKey = directionKeys.sipKey
+        let keys = Array(directionKeys.sipKeys)
+        // Key material layout from the data-phase KDF: two 8-byte SipHash keys
+        // then the 8-byte IV. Reference routers load each 64-bit key
+        // little-endian (Java I2P `fromLong8LE`) — using the same load is what
+        // makes our mask chain identical to the peer's.
+        sipKey1 = keys[0..<8].enumerated().reduce(UInt64(0)) { $0 | (UInt64($1.element) << (8 * UInt64($1.offset))) }
+        sipKey2 = keys[8..<16].enumerated().reduce(UInt64(0)) { $0 | (UInt64($1.element) << (8 * UInt64($1.offset))) }
+        sipIV = Data(keys[16..<24])
     }
 
     func frame(_ payload: Data) throws -> Data {
         let box = try ChaChaPoly.seal(payload,
                                       using: SymmetricKey(data: aeadKey),
                                       nonce: NTCP2NoiseChain.nonce96(counter))
-        let ciphertext = box.ciphertext + box.tag
-        let mask = lengthMask(counter)
-        let obfuscated = UInt16(ciphertext.count) ^ mask
+        // Normalize the CryptoKit slice into a zero-based buffer before the
+        // caller prepends the obfuscated length.
+        var ciphertext = Data()
+        ciphertext.append(contentsOf: box.ciphertext)
+        ciphertext.append(contentsOf: box.tag)
+        guard ciphertext.count <= 0xFFFF else { throw NTCP2Error.invalidFrame }
+        let mask = deriveMask()
+        let length = UInt16(ciphertext.count)
+        sipIV = mask.iv
         counter += 1
         var out = Data()
-        out.append(UInt8((obfuscated >> 8) & 0xff))
-        out.append(UInt8(obfuscated & 0xff))
+        out.append(UInt8((length >> 8) & 0xff) ^ mask.high)
+        out.append(UInt8(length & 0xff) ^ mask.low)
         out.append(ciphertext)
         return out
     }
@@ -420,13 +567,12 @@ final class NTCP2FrameCodec {
     func unframe(_ buffer: Data) throws -> (payload: Data, consumed: Int)? {
         let bytes = Array(buffer)
         guard bytes.count >= 2 else { return nil }
-        let obfuscated = (UInt16(bytes[0]) << 8) | UInt16(bytes[1])
-        let length = obfuscated ^ lengthMask(counter)
+        let mask = deriveMask()
+        let length = (UInt16(bytes[0] ^ mask.high) << 8) | UInt16(bytes[1] ^ mask.low)
         guard length >= 16 else { throw NTCP2Error.invalidFrame }
         let total = 2 + Int(length)
         guard bytes.count >= total else { return nil }
         let body = Data(bytes[2..<total])
-        guard body.count > 16 else { throw NTCP2Error.invalidFrame }
         // Same slice-safe split as NoiseChain.decrypt (see note there).
         let box = try ChaChaPoly.SealedBox(
             nonce: NTCP2NoiseChain.nonce96(counter),
@@ -435,13 +581,32 @@ final class NTCP2FrameCodec {
         guard let payload = try? ChaChaPoly.open(box, using: SymmetricKey(data: aeadKey), authenticating: Data()) else {
             throw NTCP2Error.decryptFailed
         }
+        sipIV = mask.iv
         counter += 1
         return (payload, total)
     }
 
-    private func lengthMask(_ frameCounter: UInt64) -> UInt16 {
-        var input = frameCounter.bigEndian
-        let message = withUnsafeBytes(of: &input) { Data($0) }
-        return UInt16(truncatingIfNeeded: SipHash24.hash(key: sipKey, message: message))
+    /// The mask the next frame's big-endian length field is XORed with. Deriving
+    /// it does not commit the chained IV, so a partial read can be retried with
+    /// the same state; both directions derive identical masks from the KDF.
+    func nextLengthMask() -> UInt16 {
+        let mask = deriveMask()
+        return (UInt16(mask.high) << 8) | UInt16(mask.low)
+    }
+
+    /// NTCP2 §SipHash obfuscated length: IV[n] = SipHash-2-4(k1, k2, IV[n-1]);
+    /// Mask[n] = first two bytes of IV[n], obfuscatedLength = length ^ Mask[n],
+    /// with the first length XORed against IV[1]. The digest is carried into the
+    /// next round as a **little-endian** 64-bit value, and the mask is the least
+    /// significant two bytes of the digest XORed onto the big-endian length —
+    /// the high length byte against the digest's second byte and the low byte
+    /// against its first (Java I2P: `enc[0] ^= sipIV >> 8`, `enc[1] ^= sipIV`).
+    private func deriveMask() -> (high: UInt8, low: UInt8, iv: Data) {
+        let digest = SipHash24.hash(k0: sipKey1, k1: sipKey2, message: sipIV)
+        var next = [UInt8](repeating: 0, count: 8)
+        for index in 0..<8 {
+            next[index] = UInt8((digest >> (8 * UInt64(index))) & 0xff)
+        }
+        return (next[1], next[0], Data(next))
     }
 }

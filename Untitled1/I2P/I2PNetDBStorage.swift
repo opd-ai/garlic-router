@@ -42,23 +42,25 @@ final class I2PNetDBStorage {
     /// Loads every persisted record; corrupt or malformed files are removed.
     func loadAll() -> [(key: Data, record: Record)] {
         let fm = FileManager.default
-        guard let files = try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else {
+        guard let names = try? fm.contentsOfDirectory(atPath: directory.path) else {
             return []
         }
         var out: [(key: Data, record: Record)] = []
-        for file in files where file.pathExtension == "json" {
-            guard let data = try? Data(contentsOf: file),
+        for name in names where name.hasSuffix(".json") {
+            let url = directory.appendingPathComponent(name)
+            guard let data = try? Data(contentsOf: url),
                   let record = try? JSONDecoder().decode(Record.self, from: data) else {
-                try? fm.removeItem(at: file)
+                try? fm.removeItem(at: url)
                 continue
             }
-            guard let key = Self.dataFromHex(file.deletingPathExtension().lastPathComponent),
+            let hexName = String(name.dropLast(5)) // strip ".json"
+            guard let key = Self.dataFromHex(keyName: hexName),
                   key.count == 32 else {
                 // A decodable record whose file name is not a valid 32-byte hex
                 // key can never be addressed again — remove() and every restore
                 // key off the hex name — so it would survive every load forever
                 // as unaddressable state. Fail closed: reclaim the orphan.
-                try? fm.removeItem(at: file)
+                try? fm.removeItem(at: url)
                 continue
             }
             out.append((key, record))
@@ -74,15 +76,19 @@ final class I2PNetDBStorage {
         directory.appendingPathComponent(key.hex + ".json")
     }
 
-    private static func dataFromHex(_ string: String) -> Data? {
+    private static func dataFromHex(keyName string: String) -> Data? {
         guard string.count % 2 == 0 else { return nil }
         var bytes: [UInt8] = []
         var index = string.startIndex
         while index < string.endIndex {
-            let next = string.index(after: index)
-            guard let byte = UInt8(string[index..<next], radix: 16) else { return nil }
+            // Two hex characters per byte: taking one character at a time
+            // decoded a 64-character key into 64 bytes, so no restored record
+            // ever matched its file name and every one was reclaimed as
+            // unaddressable on the next launch.
+            guard let end = string.index(index, offsetBy: 2, limitedBy: string.endIndex),
+                  let byte = UInt8(string[index..<end], radix: 16) else { return nil }
             bytes.append(byte)
-            index = next
+            index = end
         }
         return Data(bytes)
     }

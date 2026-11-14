@@ -50,6 +50,14 @@ struct I2PRouterStatusSnapshot {
     let outRate: Double
     let inRateHistory: [Double]
     let outRateHistory: [Double]
+    // Network participation (participation controls)
+    let participatingTunnelCount: Int
+    let transitMessages: Int
+    let transitBytes: Int
+    let transitRatePerMinute: Double
+    let measuredTransitShare: Double
+    let floodfillAdvertised: Bool
+    let routerInfoPublishedAt: Date?
     // Per-peer session readings (peer inspector)
     let peers: [I2PPeerSummary]
 }
@@ -92,6 +100,11 @@ enum I2PNetDBI2NPBridge {
             return I2NPMessage(type: .databaseLookup, payload: l.serialize())
         case .searchReply(let r):
             return I2NPMessage(type: .databaseSearchReply, payload: r.serialize())
+        case .deliveryStatus(let id, let timestamp):
+            var writer = I2PWriter()
+            writer.integer(id)
+            writer.long(UInt64((timestamp.timeIntervalSince1970 * 1000).rounded()))
+            return I2NPMessage(type: .deliveryStatus, payload: writer.data)
         }
     }
 
@@ -101,6 +114,7 @@ enum I2PNetDBI2NPBridge {
         case .databaseStore(let s): return .store(s)
         case .databaseLookup(let l): return .lookup(l)
         case .databaseSearchReply(let r): return .searchReply(r)
+        case .deliveryStatus(let id, let stamp): return .deliveryStatus(messageID: id, timestamp: stamp)
         default: return nil
         }
     }
@@ -164,6 +178,9 @@ final class I2PNTCP2DeliveryTransport: I2PDeliveryTransport {
             _ = await dialPeer?(routerHash)
             await waitForSession(to: routerHash)
         }
+        // Outbound bandwidth cap: the send waits for its tokens, so the cap
+        // takes effect on the running router as soon as it is configured.
+        await I2PBandwidthGovernor.shared.admitOutbound(bytes: i2npBytes.count)
         try ntcp2.send(to: routerHash, data: i2npBytes)
         onSent?(i2npBytes.count)
     }
@@ -191,6 +208,9 @@ final class I2PRouterStatusEngine {
     /// running router, it supplies established-session readings in the same
     /// shape the NTCP2 transport reports, so the peer inspector lists both.
     var ssu2PeerSummaries: (() -> [(hash: Data, establishedAt: Date, bytesIn: Int, bytesOut: Int)])?
+    /// Optional participation surface: the live count of tunnels this router
+    /// currently carries for other participants (the share's measured side).
+    var participatingTunnels: (() -> Int)?
 
     private let startedAt = Date()
     private let lock = NSLock()
@@ -198,6 +218,12 @@ final class I2PRouterStatusEngine {
     private var messagesOut = 0
     private var bytesIn = 0
     private var bytesOut = 0
+    private var transitMessages = 0
+    private var transitBytes = 0
+    private var localTunnelMessages = 0
+    private var transitHistory: [(date: Date, transit: Int, local: Int)] = []
+    private var floodfillAdvertised = false
+    private var routerInfoPublishedAt: Date?
     private var lastSampleAt = Date()
     private var lastSampleIn = 0
     private var lastSampleOut = 0
@@ -205,6 +231,9 @@ final class I2PRouterStatusEngine {
     private var outRateHistory: [Double] = []
     private var emitTask: Task<Void, Never>?
     private var continuation: AsyncStream<I2PRouterStatusSnapshot>.Continuation?
+
+    /// The window the participation share and transit rate are measured over.
+    private static let participationWindow: TimeInterval = 60
 
     private(set) lazy var snapshots: AsyncStream<I2PRouterStatusSnapshot> = {
         AsyncStream(bufferingPolicy: .bufferingNewest(1)) { [weak self] continuation in
@@ -220,11 +249,49 @@ final class I2PRouterStatusEngine {
     func attach(ntcp2: NTCP2Transport) { self.ntcp2 = ntcp2 }
     func attach(tunnelPool: I2PTunnelPool) { self.tunnelPool = tunnelPool }
 
+    /// Attaches the tunnel participant so the participation screen can read how
+    /// many tunnels the router currently carries for other participants.
+    func attach(participant: I2PTunnelParticipant) {
+        participatingTunnels = { [weak participant] in
+            participant?.activeHopStateCount ?? 0
+        }
+    }
+
     /// Counts routed inbound messages via the I2NP router's observation hook.
     func attach(to i2npRouter: I2NPMessageRouter) {
         i2npRouter.onMessageRouted = { [weak self] message, _ in
             self?.recordIncoming(bytes: I2NPMessage.headerLength + message.payload.count)
         }
+        i2npRouter.onTransitForward = { [weak self] bytes in
+            self?.recordTransit(bytes: bytes)
+        }
+        i2npRouter.onLocalTunnelDelivery = { [weak self] in
+            self?.recordLocalTunnelDelivery()
+        }
+    }
+
+    /// Records traffic forwarded for another participant's tunnel.
+    func recordTransit(bytes: Int) {
+        lock.lock()
+        transitMessages += 1
+        transitBytes += bytes
+        lock.unlock()
+    }
+
+    /// Records a tunnel message this router consumed at its message-path end.
+    func recordLocalTunnelDelivery() {
+        lock.lock()
+        localTunnelMessages += 1
+        lock.unlock()
+    }
+
+    /// Records the floodfill capability our published RouterInfo carries, so
+    /// the participation screen can name the advertisement's state and age.
+    func recordFloodfillAdvertisement(advertised: Bool, publishedAt: Date?) {
+        lock.lock()
+        floodfillAdvertised = advertised
+        routerInfoPublishedAt = publishedAt
+        lock.unlock()
     }
 
     func recordIncoming(bytes: Int) {
@@ -357,6 +424,9 @@ final class I2PRouterStatusEngine {
                         ntcp2SessionCount: Int,
                         pools: [I2PRouterStatusSnapshot.PoolSummary],
                         peers: [I2PPeerSummary]) -> I2PRouterStatusSnapshot {
+        // The tunnel participant owns its own lock; read it before taking ours
+        // so the lock order stays one-way.
+        let participating = participatingTunnels?() ?? 0
         lock.lock()
         defer { lock.unlock() }
         let now = Date()
@@ -367,6 +437,7 @@ final class I2PRouterStatusEngine {
         outRateHistory.append(outRate)
         if inRateHistory.count > 12 { inRateHistory.removeFirst(inRateHistory.count - 12) }
         if outRateHistory.count > 12 { outRateHistory.removeFirst(outRateHistory.count - 12) }
+        let participation = participationReadingLocked(now: now)
         let snapshot = I2PRouterStatusSnapshot(
             capturedAt: now,
             identityHashHex: Self.hex(localRouterHash),
@@ -386,12 +457,37 @@ final class I2PRouterStatusEngine {
             outRate: outRate,
             inRateHistory: inRateHistory,
             outRateHistory: outRateHistory,
+            participatingTunnelCount: participating,
+            transitMessages: transitMessages,
+            transitBytes: transitBytes,
+            transitRatePerMinute: participation.rate,
+            measuredTransitShare: participation.share,
+            floodfillAdvertised: floodfillAdvertised,
+            routerInfoPublishedAt: routerInfoPublishedAt,
             peers: peers
         )
         lastSampleAt = now
         lastSampleIn = messagesIn
         lastSampleOut = messagesOut
         return snapshot
+    }
+
+    /// Transit rate (messages per minute) and the measured share ratio: the
+    /// transit messages we forwarded versus the tunnel traffic we consumed at
+    /// our own message-path end, over the last minute.
+    private func participationReadingLocked(now: Date) -> (rate: Double, share: Double) {
+        transitHistory.append((now, transitMessages, localTunnelMessages))
+        let cutoff = now.addingTimeInterval(-Self.participationWindow)
+        transitHistory.removeAll { $0.date < cutoff }
+        guard let oldest = transitHistory.first else { return (0, 0) }
+        let seconds = max(now.timeIntervalSince(oldest.date), 1)
+        let transitDelta = transitMessages - oldest.transit
+        let localDelta = max(0, localTunnelMessages - oldest.local)
+        let rate = Double(transitDelta) / seconds * 60
+        let share = transitDelta + localDelta > 0
+            ? Double(transitDelta) / Double(transitDelta + localDelta)
+            : 0
+        return (rate, share)
     }
 
     private static func hex(_ data: Data) -> String {

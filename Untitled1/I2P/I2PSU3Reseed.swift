@@ -5,12 +5,21 @@
 //  RouterInfo payloads for signature-verified ingestion into the network
 //  database.
 //
-//  SU3 container layout: magic "I2Psu3" (6), format version (2), signature
-//  type (2), signature length (2), padding length (1), version length (2),
-//  signer ID length (2), content length (8), timestamp (8), then version,
-//  signer, content (zip), padding and signature. The reseed container
-//  signature is NOT verified — a documented deviation: the container signature
-//  algorithms used in the wild sit outside the modern-only crypto policy.
+//  SU3 container layout: magic "I2Psu3" (6), unused (1), file format version
+//  (1), signature type (2), signature length (2), unused (1), version length
+//  (1), unused (1), signer ID length (1), content length (8), unused (1), file
+//  type (1), unused (1), content type (1) and twelve reserved bytes — a 40-byte
+//  header, then the version string, the signer ID, the content and the
+//  signature. There is no padding section: the byte this file once read as a
+//  padding length is one of the header's unused bytes.
+//
+//  The container signature is VERIFIED before anything is unpacked. It covers
+//  the whole prefix from byte 0 through the last content byte — header, version
+//  and signer ID included — and the signer must hold a certificate bundled with
+//  the app (Resources/reseed-certs, the same public cert set Java I2P and i2pd
+//  ship). A host whose archive names an unknown signer, or whose signature does
+//  not verify, is skipped like any other refusing host. This is the spec's
+//  trust model: transport integrity alone never admits an archive.
 //
 //  Transport trust: reseed servers in the wild commonly present SELF-SIGNED
 //  TLS certificates — which is why Java I2P and i2pd ship pinned copies of
@@ -18,9 +27,9 @@
 //  reseed session therefore accepts a self-signed leaf (single-certificate
 //  chain) when default trust evaluation fails, and still rejects any chain
 //  issued by a different CA (corporate MITM proxies carry two or more
-//  certificates). Authenticity rests on the per-RouterInfo Ed25519 signature
-//  verification the netdb ingest performs on every entry — the same bar
-//  network-sourced RouterInfos already clear.
+//  certificates). Authenticity rests on the SU3 container signature and on the
+//  per-RouterInfo Ed25519 signature verification the netdb ingest performs on
+//  every entry — the same bar network-sourced RouterInfos already clear.
 //
 //  Reseed URL convention: every well-known reseed server serves its SU3
 //  archive at "<base>/i2pseeds.su3" — Java I2P's ReseedHandler and i2pd
@@ -71,6 +80,10 @@ import Security
 
 struct I2PReseedReport {
     let fetchedFrom: String
+    /// The SU3 signer whose bundled certificate verified the container, and
+    /// the signature type its header declared.
+    let signer: String
+    let signatureType: String
     let totalEntries: Int
     let ingested: Int
     let rejected: Int
@@ -88,6 +101,9 @@ enum I2PReseedError: Error {
     /// of being hammered into a longer limit.
     case rateLimited
     case invalidSU3(String)
+    /// The SU3 container's signature did not verify against its signer's
+    /// bundled certificate, or the signer is not in the trusted set.
+    case signatureRejected(String)
     case invalidZip(String)
 }
 
@@ -123,12 +139,21 @@ enum I2PReseedService {
         return URLSession(configuration: config, delegate: I2PReseedTrustDelegate(), delegateQueue: nil)
     }()
 
-    /// Fetches the first working reseed host, parses the SU3 container,
-    /// unpacks the RouterInfo entries and ingests them (signature verified)
-    /// into the netdb.
+    /// A mainnet-sized reseed snapshot: one host may serve a partial archive
+    /// (diva's run handed over 77 RouterInfos), so the sweep keeps going until
+    /// the netdb holds enough peers and floodfills to bootstrap and route.
+    static let targetRouterInfos = 200
+    static let targetFloodfills = 40
+
+    /// Fetches reseed archives until the netdb holds a mainnet-sized peer set,
+    /// parses each SU3 container, unpacks its RouterInfo entries and ingests
+    /// them (signature verified). Hosts are swept most-reliable first across
+    /// two passes; a host whose archive is too small does not end the run.
     static func reseed(into netDB: I2PNetworkDatabase, deferCount: Int = 2) async throws -> I2PReseedReport {
         var failures: [String] = []
         var rateLimited: Set<String> = []
+        var merged: I2PReseedReport?
+        var remainingDefer = deferCount
         // Two passes over the host list: cold-network TLS handshakes and
         // transit routes to these hosts frequently stall on the first attempt
         // and clear on the second, and a per-host retry would double the
@@ -149,8 +174,15 @@ enum I2PReseedService {
                 // request a third time.
                 let agent = pass == 1 ? userAgent : alternateAgent
                 do {
-                    return try await reseed(from: host, into: netDB, deferCount: deferCount,
-                                            userAgent: agent)
+                    let report = try await reseed(from: host, into: netDB, deferCount: remainingDefer,
+                                                  userAgent: agent)
+                    remainingDefer = max(0, remainingDefer - report.deferredHashes.count)
+                    merged = merge(merged, report)
+                    if let merged,
+                       merged.totalEntries >= targetRouterInfos || merged.floodfillCount >= targetFloodfills {
+                        return merged
+                    }
+                    failures.append("\(host) — archive carried \(report.totalEntries) entries; kept sweeping for a mainnet-sized peer set")
                 } catch I2PReseedError.rateLimited {
                     rateLimited.insert(host)
                     failures.append("\(host) — rate limited (HTTP 429)")
@@ -163,12 +195,46 @@ enum I2PReseedService {
                 }
             }
         }
+        // A partial sweep still bootstraps better than none: return what the
+        // hosts that answered carried, rather than discarding verified peers.
+        if let merged, merged.ingested > 0 {
+            return merged
+        }
         throw I2PMainnetFailure(message: "all \(hosts.count) reseed hosts failed over two passes: \(failures.joined(separator: "; "))")
+    }
+
+    /// Folds one host's archive report into the run's aggregate.
+    private static func merge(_ existing: I2PReseedReport?, _ next: I2PReseedReport) -> I2PReseedReport {
+        guard let existing else { return next }
+        return I2PReseedReport(
+            fetchedFrom: existing.fetchedFrom + ", " + next.fetchedFrom,
+            signer: next.signer,
+            signatureType: next.signatureType,
+            totalEntries: existing.totalEntries + next.totalEntries,
+            ingested: existing.ingested + next.ingested,
+            rejected: existing.rejected + next.rejected,
+            floodfillCount: next.floodfillCount,
+            deferredHashes: existing.deferredHashes + next.deferredHashes)
     }
 
     /// Collapses a host failure to its refusal mode: the URLError blob's
     /// security-relevant content is the code, not the trust-chain dump.
     static func summarize(_ error: Error) -> String {
+        if case I2PReseedError.signatureRejected(let message) = error {
+            return "SU3 signature rejected — \(message)"
+        }
+        if case I2PReseedError.invalidSU3(let message) = error {
+            // An HTTP refusal is the host's answer about the request, not a
+            // malformed container: name it as what it is, or a blocked host
+            // reads as a parse bug in the report.
+            if message.hasPrefix("reseed host returned HTTP status") {
+                return message
+            }
+            return "invalid SU3 — \(message)"
+        }
+        if case I2PReseedError.invalidZip(let message) = error {
+            return "invalid reseed archive — \(message)"
+        }
         if let urlError = error as? URLError {
             switch urlError.code {
             case .cannotConnectToHost: return "connection refused"
@@ -244,8 +310,8 @@ enum I2PReseedService {
                     body = Data(raw)
                 }
 
-                let zipData = try parseSU3(body)
-                let payloads = try routerInfoPayloads(fromZip: zipData)
+                let container = try verifyContainer(body)
+                let payloads = try routerInfoPayloads(fromZip: container.content)
                 guard !payloads.isEmpty else {
                     throw I2PReseedError.invalidZip("no routerInfo entries in the reseed archive")
                 }
@@ -274,6 +340,8 @@ enum I2PReseedService {
                 let floodfills = await netDB.floodfillCount()
                 return I2PReseedReport(
                     fetchedFrom: host,
+                    signer: container.signerID,
+                    signatureType: container.signatureType.name,
                     totalEntries: payloads.count,
                     ingested: ingested,
                     rejected: rejected,
@@ -329,46 +397,41 @@ enum I2PReseedService {
 
     // MARK: SU3 container
 
+    /// Parses and verifies a reseed SU3 container and returns its embedded
+    /// archive. The container signature is checked against the bundled reseed
+    /// signer certificates before any content is handed back.
     static func parseSU3(_ data: Data) throws -> Data {
-        let bytes = [UInt8](data)
-        guard bytes.count >= 33 else {
-            throw I2PReseedError.invalidSU3("truncated SU3 header")
+        try verifyContainer(data).content
+    }
+
+    /// Parses an `i2pseeds.su3` container, checks it really is a reseed zip as
+    /// the format requires, and verifies its signature. Throws
+    /// `invalidSU3`/`signatureRejected` — never a best-effort verdict.
+    static func verifyContainer(_ data: Data) throws -> I2PSU3Container {
+        let container: I2PSU3Container
+        do {
+            container = try I2PSU3Container.parse(data)
+        } catch {
+            throw I2PReseedError.invalidSU3(String(describing: error))
         }
-        let magic = Array("I2Psu3".utf8)
-        guard Array(bytes[0..<6]) == magic else {
-            // Surface what actually arrived: a server that answers the reseed
-            // path with an HTML page, a captive-portal block page, or garbage
-            // shows up here as the payload's first bytes, not a bare refusal.
-            let head = bytes.prefix(8).map { String(format: "%02x", $0) }.joined()
-            throw I2PReseedError.invalidSU3("bad SU3 magic (payload begins \(head))")
-        }
-        // SU3 header numeric fields are BIG-endian (I2P wire convention) — the
-        // little-endian helpers below belong to the ZIP container, whose fields
-        // are little-endian per the zip spec. Reading the SU3 lengths with the
-        // zip helpers byte-swapped every field: signature length 0x0040 (64)
-        // parsed as 0x4000, and the 8-byte content length became astronomically
-        // large — the exact "content length exceeds the file" failure real
-        // archives produced while synthetic round-trips stayed green (the test
-        // builder made the same byte swap, so parser and builder agreed).
-        let signatureLength = Int(be16(bytes, 10))
-        let paddingLength = Int(bytes[12])
-        let versionLength = Int(be16(bytes, 13))
-        let signerLength = Int(be16(bytes, 15))
-        let contentLength = Int(be64(bytes, 17))
-        let headerEnd = 33 + versionLength + signerLength
-        let contentStart = headerEnd
-        let contentEnd = contentStart + contentLength
-        guard contentLength > 0 else {
-            throw I2PReseedError.invalidSU3("empty SU3 content")
-        }
-        guard bytes.count >= contentEnd + signatureLength + paddingLength else {
-            // Name the arithmetic: the header promises this much content, the
-            // transfer delivered less. That is a cut-short response body, not
-            // garbage — the message says so and carries the received size.
+        guard container.fileType == 0 else {
             throw I2PReseedError.invalidSU3(
-                "content length \(contentLength) exceeds the file (received \(bytes.count) bytes — truncated transfer)")
+                "SU3 file type \(container.fileType) is not a zip archive")
         }
-        return Data(bytes[contentStart..<contentEnd])
+        guard container.contentType == 3 else {
+            throw I2PReseedError.invalidSU3(
+                "SU3 content type \(container.contentType) is not reseed data")
+        }
+        guard !I2PSU3TrustStore.bundled.signerIDs.isEmpty else {
+            throw I2PReseedError.signatureRejected(
+                "no reseed signer certificates are bundled with the app (Resources/reseed-certs)")
+        }
+        do {
+            try container.verify(using: .bundled)
+        } catch {
+            throw I2PReseedError.signatureRejected(String(describing: error))
+        }
+        return container
     }
 
     // MARK: Gzip
@@ -563,17 +626,6 @@ enum I2PReseedService {
         return out
     }
 
-    // SU3 header fields: big-endian, per the SU3 reseed spec.
-    private static func be16(_ bytes: [UInt8], _ offset: Int) -> UInt16 {
-        (UInt16(bytes[offset]) << 8) | UInt16(bytes[offset + 1])
-    }
-
-    private static func be64(_ bytes: [UInt8], _ offset: Int) -> UInt64 {
-        var value: UInt64 = 0
-        for i in 0..<8 { value = (value << 8) | UInt64(bytes[offset + i]) }
-        return value
-    }
-
     // ZIP container fields: little-endian, per the zip spec.
     private static func u16(_ bytes: [UInt8], _ offset: Int) -> UInt16 {
         UInt16(bytes[offset]) | (UInt16(bytes[offset + 1]) << 8)
@@ -608,8 +660,10 @@ enum I2PReseedService {
 ///      single-certificate chain: a self-signed leaf presents no issuer chain,
 ///      while any CA-issued chain (including a corporate MITM proxy) carries
 ///      two or more certificates and stays rejected.
-///   3. Authenticity rests downstream: every RouterInfo in the SU3 archive is
-///      Ed25519 signature-verified again at netdb ingest — the same bar
+///   3. Authenticity rests downstream: the SU3 container's signature is
+///      verified against a bundled reseed signer certificate before its
+///      archive is opened, and every RouterInfo inside is Ed25519
+///      signature-verified again at netdb ingest — the same bar
 ///      network-sourced RouterInfos already clear — so a tampered reseed
 ///      stream cannot poison the netdb, only fail to bootstrap it.
 final class I2PReseedTrustDelegate: NSObject, URLSessionDataDelegate {

@@ -120,13 +120,29 @@ struct I2PSAMFrame {
 
 /// Splits outbound bytes into garlic-sized chunks.
 enum I2PSAMChunker {
-    static func split(_ data: Data, size: Int = I2PSAMLimits.chunkSize) -> [Data] {
+    /// The largest serialized frame that still rides one tunnel message: the
+    /// tunnel's 1008-byte body minus the gateway/TunnelGateway I2NP headers,
+    /// the garlic envelope (three-section new-session worst case) and its
+    /// blocks. A frame that overflows the budget makes the tunnel layer reject
+    /// the whole message, so chunking has to respect it.
+    static let maxFrameBytes = 760
+
+    /// Splits `data` into chunks that fit the frame budget. `attachmentLength`
+    /// is the sender destination carried on the first chunk; it shrinks that
+    /// chunk so the first frame stays inside the budget too.
+    static func split(_ data: Data, attachmentLength: Int = 0,
+                      size: Int = I2PSAMLimits.chunkSize) -> [Data] {
+        let header = I2PSAMFrame.headerLength
+        var firstBudget = min(size, maxFrameBytes - header - attachmentLength)
+        let restBudget = min(size, maxFrameBytes - header)
+        if firstBudget <= 0 { firstBudget = min(size, max(1, restBudget)) }
         guard !data.isEmpty else { return [Data()] }
         let bytes = Array(data)
         var out: [Data] = []
         var index = 0
         while index < bytes.count {
-            let end = min(index + size, bytes.count)
+            let budget = out.isEmpty ? firstBudget : restBudget
+            let end = min(index + budget, bytes.count)
             out.append(Data(bytes[index..<end]))
             index = end
         }
@@ -262,25 +278,76 @@ final class I2PSAMSession {
     /// Track the latest peer destination's LeaseSet per reply path.
     private var replyLeases: [Data: I2PGarlicLease] = [:]
 
+    // MARK: Encrypted (b33) LeaseSet2 publication
+
+    /// When set, the session publishes its leases as a LeaseSet2 encrypted
+    /// under its destination's blinded b33 key instead of a plain LeaseSet —
+    /// no plain entry is stored under the destination hash.
+    let publishesEncryptedLeaseSet: Bool
+    /// Credentials the envelope is sealed to and the blinding reads: the
+    /// destination's Ed25519 signing seed plus its ECIES X25519 private key.
+    private let b33Credentials: I2PB33Credentials
+    /// The blinded key set derived from the destination credentials
+    /// (nil unless encrypted publication is enabled).
+    private let blindedKeys: I2PB33Blinding.BlindedKey?
+    /// The last published encrypted LeaseSet2 envelope.
+    private(set) var encryptedLeaseSet: I2PLeaseSet2?
+    /// Identifiers of the leases the published envelope carries, so a lease
+    /// rotation can be detected and re-published.
+    private var encryptedLeaseKeys: Set<String> = []
+    /// When the encrypted entry was last published (re-publish cadence).
+    private var lastEncryptedPublication = Date.distantPast
+
+    /// The session's own b33 address to hand out (nil unless encrypted
+    /// publication is enabled).
+    var b33Address: String? { blindedKeys?.b33Address }
+
+    /// The blinded netdb key the encrypted entry is stored under.
+    var blindedNetDBKey: Data? { blindedKeys?.netDBKey }
+
+    /// The b33 host this session publishes under, together with the
+    /// destination credentials that unlock it (nil unless encrypted
+    /// publication is enabled). Drives the b33 host book's resolvable rows.
+    var b33Host: (address: String, credentials: I2PB33Credentials)? {
+        guard let address = b33Address else { return nil }
+        return (address, b33Credentials)
+    }
+
     var destinationHash: Data { keys.destination.hash }
     var destinationBase64: String { keys.destination.raw.base64EncodedString() }
 
     init(nickname: String, style: I2PSAMStyle, keys: I2PSAMDestinationKeys,
-         pool: I2PTunnelPool, transport: I2PSAMGarlicTransport, delivery: I2PDeliveryTransport) {
+         pool: I2PTunnelPool, transport: I2PSAMGarlicTransport,
+         delivery: I2PDeliveryTransport, encryptedPublication: Bool = false) {
         self.nickname = nickname
         self.style = style
         self.keys = keys
         self.pool = pool
         self.transport = transport
+        self.publishesEncryptedLeaseSet = encryptedPublication
+        self.b33Credentials = I2PB33Credentials(
+            ed25519Seed: keys.signingSeed,
+            x25519PrivateKey: keys.encryptionKey.rawRepresentation)
+        self.blindedKeys = encryptedPublication
+            ? try? I2PB33Blinding.blind(
+                destinationSeed: keys.signingSeed,
+                encryptionPublicKey: keys.encryptionKey.publicKey.rawRepresentation)
+            : nil
         self.inboundManager = I2PGarlicInboundSessionManager(localKey: keys.encryptionKey)
         self.garlicHandler = I2PGarlicMessageHandler(sessionManager: inboundManager, deliveryTransport: delivery)
         self.assembler = I2PSAMInboundAssembler(ordered: style == .stream)
+        garlicHandler.onError = { [weak self] line in self?.event(line) }
+        garlicHandler.onMessage = { [weak self] line in self?.event(line) }
         assembler.onCompleted = { [weak self] completed in
             self?.routeInbound(completed)
         }
         garlicHandler.addLocalConsumer { [weak self] message, _ in
-            guard let self, message.type == .dataMessage, let frame = I2PSAMFrame.parse(message.payload) else { return }
-            assembler.ingest(frame)
+            guard let self, message.type == .dataMessage else { return }
+            guard let frame = I2PSAMFrame.parse(message.payload) else {
+                self.event("inbound frame unparseable (\(message.payload.count)B)")
+                return
+            }
+            self.assembler.ingest(frame)
         }
     }
 
@@ -315,17 +382,36 @@ final class I2PSAMSession {
 
     // MARK: LeaseSet publication
 
-    /// Publishes a LeaseSet under the session's destination (leases point at
-    /// this router's inbound tunnels). Renewal re-publishes on a cycle.
+    /// Lease lifetime the publication caps each entry at (10 minutes).
+    private static let leaseWindow: TimeInterval = 600
+    /// How long a published encrypted entry stands before it is re-published.
+    private static let encryptedRepublishInterval: TimeInterval = 300
+
+    /// The leases to publish: one per live inbound tunnel (its gateway hash
+    /// plus the tunnel ID the gateway routes to), expiring with the tunnel or
+    /// at most 10 minutes out.
+    private func currentLeases(now: Date = Date()) -> [I2PLease] {
+        pool.inboundTunnels
+            .filter { !$0.isExpired() }
+            .map { tunnel in
+                I2PLease(gatewayHash: tunnel.hops[0].routerHash,
+                         tunnelId: tunnel.gatewayTunnelID,
+                         expiration: min(tunnel.expiresAt,
+                                         now.addingTimeInterval(Self.leaseWindow)))
+            }
+    }
+
+    /// Publishes the session's leases: a plain LeaseSet under the session's
+    /// destination, or — when encrypted publication is enabled — a LeaseSet2
+    /// envelope stored under the destination's blinded b33 netdb key.
+    /// Renewal re-publishes on a cycle.
     @discardableResult
     func publishLeaseSet() async -> Bool {
-        let inbound = pool.inboundTunnels.filter { !$0.isExpired() }
-        guard !inbound.isEmpty else { return false }
         let now = Date()
-        let leases = inbound.map { tunnel in
-            I2PLease(gatewayHash: tunnel.hops[0].routerHash,
-                     tunnelId: tunnel.gatewayTunnelID,
-                     expiration: min(tunnel.expiresAt, now.addingTimeInterval(600)))
+        let leases = currentLeases(now: now)
+        guard !leases.isEmpty else { return false }
+        if publishesEncryptedLeaseSet {
+            return await publishEncryptedLeaseSet(leases: leases, now: now)
         }
         var leaseSet = I2PLeaseSet(destination: keys.destination, published: now, leases: leases)
         do { try leaseSet.sign(withSeed: keys.signingSeed) } catch { return false }
@@ -334,6 +420,64 @@ final class I2PSAMSession {
         self.leaseSet = leaseSet
         lock.unlock()
         return true
+    }
+
+    /// Keeps the encrypted (b33) entry current: re-publishes it when the leases
+    /// it carries have rotated (a tunnel expired or a new one joined) and on
+    /// the re-publish cadence. A no-op for sessions publishing a plain
+    /// LeaseSet.
+    @discardableResult
+    func refreshEncryptedPublication(now: Date = Date()) async -> Bool {
+        guard publishesEncryptedLeaseSet else { return false }
+        let leases = currentLeases(now: now)
+        guard !leases.isEmpty else { return false }
+        let identifiers = leaseIdentifiers(leases)
+        lock.lock()
+        let published = encryptedLeaseKeys
+        let lastPublished = lastEncryptedPublication
+        lock.unlock()
+        let rotated = !published.isEmpty && identifiers != published
+        let due = published.isEmpty
+            || now.timeIntervalSince(lastPublished) >= Self.encryptedRepublishInterval
+        guard rotated || due else { return false }
+        return await publishEncryptedLeaseSet(leases: leases, now: now)
+    }
+
+    /// Builds the encrypted LeaseSet2 for the given leases and stores it to the
+    /// floodfills under the destination's blinded netdb key: the inner plain
+    /// LeaseSet2 is sealed to the destination's ECIES key, the envelope carries
+    /// the blinded signing key (its hash is the blinded netdb key) and is signed
+    /// by the blinded private key derived from the destination credentials.
+    @discardableResult
+    func publishEncryptedLeaseSet(leases: [I2PLease], now: Date = Date()) async -> Bool {
+        guard publishesEncryptedLeaseSet, blindedKeys != nil, !leases.isEmpty else { return false }
+        do {
+            let inner = try I2PLeaseSet2.build(
+                storeType: .plain,
+                destination: keys.destination,
+                published: now,
+                expiresOffsetSeconds: UInt16(Self.leaseWindow),
+                leases: leases.map {
+                    I2PLease2(gatewayHash: $0.gatewayHash, tunnelId: $0.tunnelId,
+                              expiration: $0.expiration)
+                },
+                signingSeed: keys.signingSeed)
+            let envelope = try I2PB33Blinding.buildEncryptedLeaseSet2(
+                inner: inner, credentials: b33Credentials)
+            _ = await transport.core.netDB.publish(leaseSet2: envelope)
+            lock.lock()
+            encryptedLeaseSet = envelope
+            encryptedLeaseKeys = leaseIdentifiers(leases)
+            lastEncryptedPublication = now
+            lock.unlock()
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func leaseIdentifiers(_ leases: [I2PLease]) -> Set<String> {
+        Set(leases.map { "\($0.tunnelId):\($0.gatewayHash.hex)" })
     }
 
     // MARK: Inbound
@@ -345,11 +489,20 @@ final class I2PSAMSession {
         return try? I2PKeysAndCert.parse(&reader)
     }
 
+    /// Optional operational log hook (the SAM bridge's activity log), so a
+    /// stalled inbound frame says which stage it reached.
+    var onEvent: ((String) -> Void)?
+
+    private func event(_ line: String) {
+        onEvent?(line)
+    }
+
     private func routeInbound(_ completed: I2PSAMInboundAssembler.Completed) {
         lock.lock()
         bytesRx += completed.data.count
         let owner = self.owner
         lock.unlock()
+        event("inbound frame: \(completed.data.count)B flags=\(completed.flags.rawValue) stream=\(completed.streamID)")
         guard let owner else { return }
         if completed.flags.contains(.datagram) {
             let sender = Self.destination(fromAttached: completed.attached)
@@ -399,7 +552,7 @@ final class I2PSAMSession {
         lock.lock()
         let tx = bytesTx
         let rx = bytesRx
-        let published = leaseSet != nil
+        let published = leaseSet != nil || encryptedLeaseSet != nil
         lock.unlock()
         return I2PSAMSessionSummary(
             nickname: nickname,

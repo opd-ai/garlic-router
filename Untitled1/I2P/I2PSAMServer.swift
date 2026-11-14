@@ -118,6 +118,7 @@ final class I2PSAMServer {
         self.poolConfig = poolConfig
         self.transport = I2PSAMGarlicTransport(core: core)
         self.dispatcher = I2PSAMGarlicDispatcher()
+        self.transport.onEvent = { [weak self] line in self?.note(line) }
         // Inbound garlic for SAM destinations flows through the router's body
         // handlers; the dispatcher fans out to every session (only the right
         // destination key decrypts).
@@ -193,7 +194,12 @@ final class I2PSAMServer {
                 try? await Task.sleep(for: .seconds(300))
                 guard let self, !Task.isCancelled else { return }
                 for session in self.sessionSnapshot() {
-                    _ = await session.publishLeaseSet()
+                    if session.publishesEncryptedLeaseSet {
+                        // b33 entries re-publish as their leases rotate.
+                        await session.refreshEncryptedPublication()
+                    } else {
+                        _ = await session.publishLeaseSet()
+                    }
                 }
             }
         }
@@ -202,9 +208,12 @@ final class I2PSAMServer {
     // MARK: Sessions
 
     /// Creates a session: transient (or imported) destination keys, its own
-    /// tunnel pool, LeaseSet publication under the session identity.
+    /// tunnel pool, and LeaseSet publication under the session identity —
+    /// plain, or encrypted under the destination's blinded b33 key when the
+    /// session asked for encrypted publication.
     func createSession(nickname: String, style: I2PSAMStyle,
-                       keys: I2PSAMDestinationKeys) async throws -> I2PSAMSession {
+                       keys: I2PSAMDestinationKeys,
+                       encryptedPublication: Bool = false) async throws -> I2PSAMSession {
         guard dispatcher.hasSession(nickname) == false else { throw I2PSAMError.duplicatedID }
         let pool = I2PTunnelPool(localRouterHash: core.routerHash,
                                  participant: core.participant,
@@ -212,7 +221,9 @@ final class I2PSAMServer {
                                  peerProvider: core.peerProvider,
                                  config: poolConfig)
         let session = I2PSAMSession(nickname: nickname, style: style, keys: keys,
-                                    pool: pool, transport: transport, delivery: core.delivery)
+                                    pool: pool, transport: transport, delivery: core.delivery,
+                                    encryptedPublication: encryptedPublication)
+        session.onEvent = { [weak self] line in self?.note("\(nickname): \(line)") }
         dispatcher.register(session)
         pool.start()
         await pool.fillPools()
@@ -221,7 +232,8 @@ final class I2PSAMServer {
             transport.installInboundGlueIfNeeded(tunnel)
         }
         lock.lock(); sessions[nickname] = session; lock.unlock()
-        note("session \(nickname) (\(style.rawValue)) created · dest \(session.destinationHash.hex.prefix(8))")
+        let b33Note = session.b33Address.map { " · b33 \($0.prefix(12))…" } ?? ""
+        note("session \(nickname) (\(style.rawValue)) created · dest \(session.destinationHash.hex.prefix(8))\(b33Note)")
         onChange?()
         return session
     }
@@ -249,6 +261,27 @@ final class I2PSAMServer {
 
     func sessionSummaries() -> [I2PSAMSessionSummary] {
         sessionSnapshot().map { $0.summary() }
+    }
+
+    // MARK: b33 hosts
+
+    /// One live b33 host a session publishes under, with the destination
+    /// credentials that unlock its encrypted LeaseSet2.
+    struct I2PSAMB33Host {
+        let address: String
+        let nickname: String
+        let credentials: I2PB33Credentials
+    }
+
+    /// Every live encrypted-publication host this bridge holds credentials
+    /// for — the resolvable rows of the b33 host book.
+    func b33Hosts() -> [I2PSAMB33Host] {
+        sessionSnapshot().compactMap { session in
+            guard let host = session.b33Host else { return nil }
+            return I2PSAMB33Host(address: host.address,
+                                 nickname: session.nickname,
+                                 credentials: host.credentials)
+        }
     }
 
     func connectionClosed(_ connection: I2PSAMConnection, sessionNickname: String?) {
@@ -478,6 +511,18 @@ final class I2PSAMConnection {
         connection.send(content: Data((reply + "\n").utf8), completion: .contentProcessed { _ in })
     }
 
+    /// Sends a reply and then closes the stream gracefully: the final line must
+    /// reach the client before the FIN (a bare cancel can drop the last reply).
+    private func sendAndClose(reply: String) {
+        server.note("← \(reply.prefix(96))")
+        connection.send(content: Data((reply + "\n").utf8),
+                        contentContext: .finalMessage,
+                        isComplete: true,
+                        completion: .contentProcessed { [weak self] _ in
+                            self?.connection.cancel()
+                        })
+    }
+
     private func boundSession() -> I2PSAMSession? {
         lock.lock(); defer { lock.unlock() }
         return session
@@ -495,9 +540,12 @@ final class I2PSAMConnection {
                 let compatible = Self.versionCompatible(min: minVersion, max: maxVersion)
                 if compatible {
                     lock.lock(); phase = .operational; lock.unlock()
+                    send(reply: I2PSAMReply.hello(ok: true))
+                } else {
+                    // No common version ends the connection, but the client
+                    // still has to receive the NO_VERSION line first.
+                    sendAndClose(reply: I2PSAMReply.hello(ok: false))
                 }
-                send(reply: I2PSAMReply.hello(ok: compatible))
-                if !compatible { closeClient() }
             case .sessionCreate(let style, let id, let destinationSpec, let options):
                 try await createSession(style: style, id: id, destinationSpec: destinationSpec, options: options)
             case .sessionQuit:
@@ -556,6 +604,10 @@ final class I2PSAMConnection {
                 throw I2PSAMError.invalidCommand("unsupported_encryption_type_\(requested)")
             }
         }
+        // Encrypted (b33) LeaseSet2 publication: the session seals its leases
+        // to its own destination, stores the entry under the destination's
+        // blinded netdb key, and hands out its b33 address.
+        let encryptedPublication = options["ENCRYPTED_LEASESET"]?.lowercased() == "true"
         let keys: I2PSAMDestinationKeys
         let persistent = options["PERSISTENT"] == "true"
         if destinationSpec == "TRANSIENT" {
@@ -577,7 +629,8 @@ final class I2PSAMConnection {
         } else {
             throw I2PSAMError.invalidDestination
         }
-        let session = try await server.createSession(nickname: id, style: style, keys: keys)
+        let session = try await server.createSession(nickname: id, style: style, keys: keys,
+                                                     encryptedPublication: encryptedPublication)
         // One session per connection: replacing the binding tears down the
         // previous session (duplicate IDs are rejected before this point).
         lock.lock()
@@ -591,7 +644,9 @@ final class I2PSAMConnection {
         if let portText = options["PORT"], let port = UInt16(portText) {
             session.udpEndpoint = (options["HOST"] ?? "127.0.0.1", port)
         }
-        send(reply: I2PSAMReply.sessionStatus(result: "OK", destination: session.destinationBase64))
+        send(reply: I2PSAMReply.sessionStatus(result: "OK",
+                                             destination: session.destinationBase64,
+                                             b33: session.b33Address))
     }
 
     // MARK: Streams
@@ -608,7 +663,9 @@ final class I2PSAMConnection {
             }
             lock.unlock()
             let remote = try await server.resolveDestination(destinationSpec)
+            server.note("connect: destination \(remote.hash.hex.prefix(8))")
             let lease = try await session.transport.resolveLease(remote.hash)
+            server.note("connect: lease tunnel \(lease.tunnelID)")
             let context = I2PSAMStreamContext(localID: UInt32.random(in: 1...UInt32.max),
                                               remote: remote, lease: lease,
                                               garlic: try session.garlicSession(toward: remote))
@@ -620,9 +677,11 @@ final class I2PSAMConnection {
                                   fromPort: 0, toPort: 0, chunkIndex: 0, chunkCount: 1,
                                   chunk: Data(), attached: session.keys.destination.raw)
             try await session.send(syn, to: lease, remote: remote)
+            server.note("connect: SYN sent")
             startConnectTimeout()
         } catch {
             lock.lock(); streamPhase = .idle; lock.unlock()
+            server.note("stream connect failed: \(error)")
             if silent {
                 closeClient()
             } else {
@@ -664,6 +723,7 @@ final class I2PSAMConnection {
         switch phase {
         case .accepting:
             guard flags.contains(.syn), let sender else { return }
+            server.note("accept: inbound SYN from \(sender.hash.hex.prefix(8))")
             completeAccept(streamID: streamID, sender: sender)
         case .connecting(let context):
             guard streamID == context.localID else { return }
@@ -698,6 +758,7 @@ final class I2PSAMConnection {
                                       fromPort: 0, toPort: 0, chunkIndex: 0, chunkCount: 1,
                                       chunk: Data(), attached: session.keys.destination.raw)
                 try await session.send(syn, to: lease, remote: sender)
+                server.note("accept: SYN-ACK sent")
                 self.lock.lock()
                 self.streamPhase = .established(context)
                 let reply = self.pendingAcceptReply
@@ -723,6 +784,7 @@ final class I2PSAMConnection {
         let reply = pendingConnectReply
         pendingConnectReply = nil
         lock.unlock()
+        server.note("connect: established")
         connectTimeoutTask?.cancel()
         if let reply, !reply.silent {
             send(reply: I2PSAMReply.streamStatus(result: "OK", id: reply.id))
@@ -798,17 +860,38 @@ final class I2PSAMConnection {
         }
         lock.unlock()
         let chunks = I2PSAMChunker.split(data)
+        // One write is one framed message: every chunk of it carries the same
+        // sequence number and a distinct chunk index. The receiver reassembles
+        // by (stream, sequence) and waits for all `chunkCount` chunks of that
+        // message before delivering it; numbering the chunks as separate
+        // messages left each one waiting for chunks that never came, so any
+        // client write larger than one chunk (the load test's 8 KiB bulk
+        // transfer) stalled forever.
+        let sequence = context.nextSequence()
         for (index, chunk) in chunks.enumerated() {
-            let sequence = context.nextSequence()
             let frame = I2PSAMFrame(streamID: context.localID, flags: [], sequence: sequence,
                                     fromPort: 0, toPort: 0,
                                     chunkIndex: UInt16(index), chunkCount: UInt16(chunks.count),
                                     chunk: chunk, attached: Data())
             Task { [weak self] in
                 guard let self, let session = self.boundSession() else { return }
-                try? await session.send(frame, to: context.lease, remote: context.remote)
+                do {
+                    try await session.send(frame, to: context.lease, remote: context.remote)
+                } catch {
+                    // A dropped chunk leaves a permanent sequence gap, so the
+                    // peer would hold every later frame forever. Fail the
+                    // stream loudly instead of hanging.
+                    self.abortStream("send of \(chunk.count)B chunk \(index)/\(chunks.count) failed: \(error)")
+                }
             }
         }
+    }
+
+    /// Tears the connection down after a transport failure, so the peer's
+    /// ordered reassembly does not wait on a frame that will never arrive.
+    private func abortStream(_ reason: String) {
+        server.note("stream aborted: \(reason)")
+        closeClient()
     }
 
     // MARK: Datagrams
@@ -842,7 +925,11 @@ final class I2PSAMConnection {
             }
             let remote = try await server.resolveDestination(destinationSpec)
             let lease = try await session.transport.resolveLease(remote.hash)
-            let chunks = I2PSAMChunker.split(payload)
+            // Anonymous (RAW) datagrams carry no return address, so no
+            // destination attachment is added to the first chunk.
+            let attachment = session.style != .raw && !payload.isEmpty
+                ? session.keys.destination.raw.count : 0
+            let chunks = I2PSAMChunker.split(payload, attachmentLength: attachment)
             let messageID = UInt32.random(in: 1...UInt32.max)
             for (index, chunk) in chunks.enumerated() {
                 // Anonymous (RAW) datagrams carry no return address.
@@ -851,15 +938,17 @@ final class I2PSAMConnection {
                                         sequence: messageID, fromPort: 0, toPort: 0,
                                         chunkIndex: UInt16(index), chunkCount: UInt16(chunks.count),
                                         chunk: chunk, attached: attached)
+                server.note("datagram chunk \(index)/\(chunks.count): \(chunk.count)B + \(attached.count)B attach")
                 try await session.send(frame, to: lease, remote: remote)
             }
         } catch {
-            server.note("datagram send failed: \(I2PSAMReply.resultCode(for: error))")
+            server.note("datagram send failed: \(I2PSAMReply.resultCode(for: error)) — \(error)")
         }
     }
 
     /// Inbound datagram delivery: UDP endpoint per SAM v3, TCP line fallback.
     func deliverDatagram(sender: I2PDestination?, payload: Data) {
+        server.note("datagram received: \(payload.count)B from \(sender.map { $0.hash.hex.prefix(8) } ?? "anonymous")")
         guard let session = boundSession() else { return }
         if session.udpEndpoint != nil {
             let data: Data
@@ -971,16 +1060,25 @@ final class I2PSAMConnection {
         closed = true
         let phase = streamPhase
         let nickname = session?.nickname
+        let boundAtClose = session
         session?.pendingAccept = nil
         lock.unlock()
-        if case .established(let context) = phase {
+        if case .established(let context) = phase, let boundAtClose {
             let fin = I2PSAMFrame(streamID: context.localID, flags: [.fin], sequence: context.nextSequence(),
                                   fromPort: 0, toPort: 0, chunkIndex: 0, chunkCount: 1,
                                   chunk: Data(), attached: Data())
+            // The FIN must leave through the session's tunnels BEFORE the
+            // session is torn down: closing the session here first (the
+            // transport-close path of a one-stream-per-connection bridge)
+            // raced the send and dropped the FIN, so the peer never saw the
+            // stream end.
             Task { [weak self] in
-                guard let self, let session = self.boundSession() else { return }
-                try? await session.send(fin, to: context.lease, remote: context.remote)
+                try? await boundAtClose.send(fin, to: context.lease, remote: context.remote)
+                guard let self else { return }
+                self.server.connectionClosed(self, sessionNickname: nickname)
+                self.connection.cancel()
             }
+            return
         }
         server.connectionClosed(self, sessionNickname: nickname)
         connection.cancel()

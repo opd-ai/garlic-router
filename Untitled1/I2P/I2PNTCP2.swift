@@ -32,8 +32,16 @@ final class NTCP2Session: NSObject {
     private let connection: NWConnection
     private let role: Role
     private let localStaticKey: Curve25519.KeyAgreement.PrivateKey
+    /// Canonical RFC 7748 wire form of `localStaticKey`'s public key. It must
+    /// be the exact byte string published as the RouterAddress "s" option:
+    /// responders compare the two and drop the session on any mismatch.
+    private let localStaticPublicKey: Data
     private let localRouterInfoData: Data
+    private let localRouterHash: Data
+    private let localIV: Data?
     private let remoteStaticKey: Data?
+    private let expectedRemoteRouterHash: Data?
+    private let expectedRemoteIV: Data?
     private let queue: DispatchQueue
 
     private var initiator: NTCP2InitiatorHandshake?
@@ -46,20 +54,39 @@ final class NTCP2Session: NSObject {
     private(set) var establishedAt: Date?
     private(set) var bytesIn = 0
     private(set) var bytesOut = 0
+    /// Why this session ended, for the transport's diagnostics.
+    private(set) var closeReason: String?
+    private var terminationReason: UInt8?
+    /// Raw TCP byte counts for the handshake phase. Peers that reject a
+    /// handshake close without a Termination block, so the only evidence of how
+    /// far the exchange got is how much was written and read before the EOF.
+    private var handshakeBytesIn = 0
+    private var handshakeBytesOut = 0
+    private var sessionCreatedReceived = false
 
     var isEstablished: Bool { state == .established }
 
     init(role: Role,
          connection: NWConnection,
          localStaticKey: Curve25519.KeyAgreement.PrivateKey,
+         localStaticPublicKey: Data,
          localRouterInfoData: Data,
+         localRouterHash: Data,
+         localIV: Data?,
          remoteStaticKey: Data?,
+         remoteRouterHash: Data?,
+         remoteIV: Data?,
          queue: DispatchQueue) {
         self.connection = connection
         self.role = role
         self.localStaticKey = localStaticKey
+        self.localStaticPublicKey = localStaticPublicKey
         self.localRouterInfoData = localRouterInfoData
+        self.localRouterHash = localRouterHash
+        self.localIV = localIV
         self.remoteStaticKey = remoteStaticKey
+        self.expectedRemoteRouterHash = remoteRouterHash
+        self.expectedRemoteIV = remoteIV
         self.queue = queue
     }
 
@@ -70,6 +97,12 @@ final class NTCP2Session: NSObject {
             case .ready:
                 self.beginHandshakeIfNeeded()
                 self.receiveNext()
+            case .waiting(let pending):
+                // Network framework retries a waiting connection on its own;
+                // record why it is stalled (no route, DNS, policy) so a probe
+                // run can report the reason rather than a bare timeout.
+                I2PSecurityAuditLog.append(category: "transport",
+                                           detail: "ntcp2 \(self.role) connection waiting: \(pending)")
             case .failed(let connectionError):
                 self.finish(error: connectionError)
             case .cancelled:
@@ -79,6 +112,12 @@ final class NTCP2Session: NSObject {
             }
         }
         connection.start(queue: queue)
+        // A peer that accepts TCP and then never answers would otherwise hold a
+        // session slot indefinitely: bound the handshake phase.
+        queue.asyncAfter(deadline: .now() + 20) { [weak self] in
+            guard let self, self.state == .handshaking else { return }
+            self.finish(error: NTCP2Error.handshakeFailed("handshake did not complete within 20s"))
+        }
     }
 
     // MARK: - Handshake
@@ -89,8 +128,16 @@ final class NTCP2Session: NSObject {
             finish(error: NTCP2Error.handshakeFailed("initiator without remote static key"))
             return
         }
+        guard let remoteRouterHash = expectedRemoteRouterHash, let remoteIV = expectedRemoteIV else {
+            finish(error: NTCP2Error.handshakeFailed("peer RouterInfo publishes no NTCP2 'i' obfuscation IV"))
+            return
+        }
         do {
-            let engine = try NTCP2InitiatorHandshake(localStaticKey: localStaticKey, remoteStaticKey: remoteStaticKey)
+            let engine = try NTCP2InitiatorHandshake(localStaticKey: localStaticKey,
+                                                     localStaticPublicKey: localStaticPublicKey,
+                                                     remoteStaticKey: remoteStaticKey,
+                                                     remoteRouterHash: remoteRouterHash,
+                                                     remoteIV: remoteIV)
             initiator = engine
             let request = try engine.makeSessionRequest(routerInfo: localRouterInfoData)
             sendRaw(request)
@@ -108,13 +155,20 @@ final class NTCP2Session: NSObject {
             }
             let result = try engine.processSessionCreated(rxBuffer)
             rxBuffer = Data(rxBuffer.dropFirst(result.consumed))
+            sessionCreatedReceived = true
             sendRaw(result.message)
             try establish(asInitiator: true)
             return true
 
         case .responder:
             if responder == nil {
-                responder = NTCP2ResponderHandshake(localStaticKey: localStaticKey)
+                guard let localIV else {
+                    throw NTCP2Error.handshakeFailed("this router publishes no NTCP2 'i' option — peers cannot obfuscate their ephemeral key")
+                }
+                responder = try NTCP2ResponderHandshake(localStaticKey: localStaticKey,
+                                                       localStaticPublicKey: localStaticPublicKey,
+                                                       localRouterHash: localRouterHash,
+                                                       localIV: localIV)
             }
             guard let engine = responder else { return false }
             switch engine.stage {
@@ -146,7 +200,14 @@ final class NTCP2Session: NSObject {
         state = .established
         if establishedAt == nil { establishedAt = Date() }
 
-        if !asInitiator {
+        if asInitiator {
+            // The peer's router hash is known from the RouterInfo we dialed
+            // from. Bob's RouterInfo block in the data phase is optional per
+            // spec, so the session must be registered under the expected hash
+            // now rather than waiting for a block that may never arrive.
+            if remoteRouterHash == nil { remoteRouterHash = expectedRemoteRouterHash }
+            notifyEstablishedIfNeeded()
+        } else {
             // Responder announces its RouterInfo in the first data-phase frame.
             var payload = try NTCP2Block.encode([.routerInfo(localRouterInfoData), .time(Date())])
             payload = NTCP2Block.aligned(payload)
@@ -174,6 +235,7 @@ final class NTCP2Session: NSObject {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
             guard let self else { return }
             if let data, !data.isEmpty {
+                if self.state == .handshaking { self.handshakeBytesIn += data.count }
                 self.rxBuffer += data
                 self.drainBuffer()
             }
@@ -227,12 +289,15 @@ final class NTCP2Session: NSObject {
                 break
             case .routerInfo(let data):
                 if let parsed = try? I2PRouterInfo.parse(data) {
+                    // An established session may refresh the peer's RouterInfo,
+                    // but its identity cannot change mid-session.
+                    if let known = remoteRouterHash, known != parsed.identity.hash {
+                        finish(error: NTCP2Error.handshakeFailed("peer RouterInfo identity changed mid-session"))
+                        return
+                    }
                     remoteRouterInfo = parsed
                     remoteRouterHash = parsed.identity.hash
-                    if role == .initiator {
-                        // Initiator learns the responder's RouterInfo from this block.
-                        notifyEstablishedIfNeeded()
-                    }
+                    notifyEstablishedIfNeeded()
                 } else {
                     finish(error: NTCP2Error.handshakeFailed("invalid remote RouterInfo"))
                     return
@@ -247,8 +312,12 @@ final class NTCP2Session: NSObject {
                 } else {
                     delegate?.session(self, didReceiveData: data)
                 }
-            case .termination:
-                // Graceful close requested by the peer.
+            case .termination(let reason, let frames):
+                // Graceful close requested by the peer; the reason code says
+                // which check this router failed on the peer's side.
+                terminationReason = reason
+                I2PSecurityAuditLog.append(category: "transport",
+                                           detail: "ntcp2 \(role) peer sent termination reason \(reason) after \(frames) valid frame(s)")
                 finish(error: nil)
                 return
             }
@@ -281,6 +350,7 @@ final class NTCP2Session: NSObject {
     }
 
     private func sendRaw(_ data: Data) {
+        if state == .handshaking { handshakeBytesOut += data.count }
         connection.send(content: data, completion: .contentProcessed { [weak self] error in
             if let error { self?.finish(error: error) }
         })
@@ -293,7 +363,8 @@ final class NTCP2Session: NSObject {
             return
         }
         state = .closing
-        let payload = (try? NTCP2Block.encode([.termination(reason: reason, validTime: Date())])) ?? Data()
+        let payload = (try? NTCP2Block.encode([.termination(reason: reason,
+                                                            validFrames: recvCodec?.counter ?? 0)])) ?? Data()
         let frame = (try? codec.frame(NTCP2Block.aligned(payload))) ?? Data()
         connection.send(content: frame, completion: .contentProcessed { [weak self] _ in
             self?.connection.cancel()
@@ -311,17 +382,61 @@ final class NTCP2Session: NSObject {
 
     private func finish(error: Error?) {
         guard state != .closed else { return }
+        let wasHandshaking = state == .handshaking
         state = .closed
         connection.cancel()
+        if let error {
+            closeReason = "\(error)"
+            // Peer-session failures are the interesting part of a transport
+            // audit: record the reason (and the traffic that preceded it) so a
+            // failed handshake can be diagnosed rather than merely counted.
+            I2PSecurityAuditLog.append(category: "transport",
+                                       detail: "ntcp2 \(role) session closed: \(error) after \(bytesIn) bytes in / \(bytesOut) bytes out")
+        } else if wasHandshaking {
+            // A peer that rejects our handshake closes without a Termination
+            // block, so name the phase it died in from the traffic exchanged:
+            // nothing sent/received is a connect-level failure, no
+            // SessionCreated means message 1 was refused, and a close after
+            // message 3 means the peer rejected our RouterInfo or key.
+            let phase: String
+            switch role {
+            case .initiator:
+                if sessionCreatedReceived {
+                    phase = "after SessionConfirmed"
+                } else if handshakeBytesOut > 0 {
+                    phase = "after SessionRequest (no SessionCreated)"
+                } else {
+                    phase = "before SessionRequest"
+                }
+            case .responder:
+                if responder?.stage == .awaitingConfirm {
+                    phase = "after SessionCreated (no SessionConfirmed)"
+                } else if responder?.stage == .established {
+                    phase = "after SessionConfirmed"
+                } else {
+                    phase = "before SessionRequest"
+                }
+            }
+            closeReason = "peer closed during the handshake \(phase) — \(handshakeBytesOut) B sent, \(handshakeBytesIn) B received"
+            I2PSecurityAuditLog.append(category: "transport",
+                                       detail: "ntcp2 \(role) peer hung up mid-handshake \(phase) after \(handshakeBytesIn) bytes in / \(handshakeBytesOut) bytes out")
+        } else {
+            closeReason = terminationReason.map { "peer terminated: reason \($0)" } ?? "peer closed the session"
+        }
         delegate?.session(self, didClose: error)
     }
 }
 
-/// A peer endpoint taken from an NTCP2 RouterAddress ("s" static key option).
+/// A peer endpoint taken from an NTCP2 RouterAddress ("s" static key option,
+/// "i" handshake-obfuscation IV).
 struct NTCP2PeerEndpoint {
     let host: String
     let port: UInt16
     let staticKey: Data
+    /// The `i` option: the 16-byte AES IV the peer publishes for handshake
+    /// obfuscation. Every mainnet NTCP2 address carries one; without it the
+    /// SessionRequest's ephemeral key cannot be obfuscated.
+    let iv: Data?
 
     init?(routerAddress: I2PRouterAddress) {
         guard routerAddress.transportStyle == "NTCP2" else { return nil }
@@ -332,14 +447,28 @@ struct NTCP2PeerEndpoint {
         host = routerAddress.options["host"] ?? "127.0.0.1"
         self.port = port
         staticKey = key
+        if let encodedIV = routerAddress.options["i"],
+           let decodedIV = Self.base64Decode(encodedIV),
+           decodedIV.count == 16 {
+            iv = decodedIV
+        } else {
+            iv = nil
+        }
     }
 
     static func base64Decode(_ text: String) -> Data? {
-        var sanitized = text
-            .replacingOccurrences(of: "-", with: "+")
-            .replacingOccurrences(of: "_", with: "/")
-        while sanitized.count % 4 != 0 { sanitized += "=" }
-        return Data(base64Encoded: sanitized)
+        I2PCrypto.i2pBase64Decode(text)
+    }
+
+    /// The endpoint to dial out of a peer's RouterInfo: a published IPv4 NTCP2
+    /// address carrying the handshake IV first, then any IV-bearing address,
+    /// then anything dialable. Preferring IPv4 matters on cellular, where an
+    /// IPv6-only candidate can never be reached.
+    static func preferred(from addresses: [I2PRouterAddress]) -> NTCP2PeerEndpoint? {
+        let endpoints = addresses.compactMap { NTCP2PeerEndpoint(routerAddress: $0) }
+        return endpoints.first(where: { $0.iv != nil && !$0.host.contains(":") })
+            ?? endpoints.first(where: { $0.iv != nil })
+            ?? endpoints.first
     }
 }
 
@@ -354,18 +483,87 @@ protocol NTCP2TransportDelegate: AnyObject {
 final class NTCP2Transport {
     weak var delegate: NTCP2TransportDelegate?
 
-    private let localRouterInfo: I2PRouterInfo
+    private var localRouterInfo: I2PRouterInfo
+    private var localRouterInfoData: Data
     private let localStaticKey: Curve25519.KeyAgreement.PrivateKey
+    /// Canonical public key for `localStaticKey` — the bytes the RouterInfo
+    /// publishes as "s" and message 3 part 1 must carry verbatim.
+    private let localStaticPublicKey: Data
+    private let localRouterHash: Data
+    private var localIV: Data?
     private let queue = DispatchQueue(label: "i2p.ntcp2.transport")
     private let lock = NSLock()
     private var listener: NWListener?
     private var sessions: [NTCP2Session] = []
     private var sessionsByHash: [Data: NTCP2Session] = [:]
+    private var recentCloseReasons: [String] = []
     private let sessionLedger = I2PResourceLedger()
 
-    init(localRouterInfo: I2PRouterInfo, staticKey: Curve25519.KeyAgreement.PrivateKey) {
+    init(localRouterInfo: I2PRouterInfo, staticKey: Curve25519.KeyAgreement.PrivateKey,
+         localStaticPublicKey: Data? = nil) {
         self.localRouterInfo = localRouterInfo
+        self.localRouterInfoData = localRouterInfo.serialize()
         self.localStaticKey = staticKey
+        // The 32 static-key bytes message 3 part 1 carries must be identical to
+        // the RouterInfo's "s" option: reference routers follow SessionConfirmed
+        // with `memcmp(staticKeyFromMessage3, address.s)` and silently close the
+        // session when the two differ. CryptoKit's raw public key may carry the
+        // X25519 u-coordinate's top bit, while "s" must have it cleared (i2pd
+        // rejects a non-canonical "s" outright), so both sides are normalized
+        // here — the two encodings are the same curve point.
+        let canonical = I2PCrypto.canonicalX25519PublicKey(staticKey.publicKey.rawRepresentation)
+        let requested = localStaticPublicKey.map(I2PCrypto.canonicalX25519PublicKey) ?? canonical
+        if let published = Self.publishedStaticKey(localRouterInfo), published != requested {
+            I2PSecurityAuditLog.append(
+                category: "transport",
+                detail: "ntcp2 local static key differs from the RouterInfo 's' option — peers reject message 3; using \(requested.hex.prefix(8)) vs published \(published.hex.prefix(8))")
+        }
+        self.localStaticPublicKey = requested
+        localRouterHash = localRouterInfo.identity.hash
+        localIV = NTCP2Transport.publishedIV(localRouterInfo)
+    }
+
+    /// The static key a RouterInfo publishes for its NTCP2 addresses.
+    private static func publishedStaticKey(_ info: I2PRouterInfo) -> Data? {
+        for address in info.addresses where address.transportStyle == "NTCP2" {
+            guard let text = address.options["s"],
+                  let key = NTCP2PeerEndpoint.base64Decode(text),
+                  key.count == 32 else { continue }
+            return key
+        }
+        return nil
+    }
+
+    /// Replaces the RouterInfo presented to peers in message 3 after the router
+    /// re-signs with its reachable address. Without this the handshake keeps
+    /// advertising the bootstrap address (loopback, port 0) and peers that
+    /// compare the observed endpoint against it drop the session right after
+    /// message 3. Established sessions keep their negotiated state.
+    func updateLocalRouterInfo(_ info: I2PRouterInfo) {
+        lock.lock()
+        defer { lock.unlock() }
+        localRouterInfo = info
+        localRouterInfoData = info.serialize()
+        localIV = NTCP2Transport.publishedIV(info)
+    }
+
+    /// The RouterInfo to advertise in a new session's message 3.
+    private func currentRouterInfo() -> (data: Data, iv: Data?) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (localRouterInfoData, localIV)
+    }
+
+    /// The AES IV this router publishes for handshake obfuscation: the `i`
+    /// option of its own NTCP2 RouterAddress.
+    private static func publishedIV(_ info: I2PRouterInfo) -> Data? {
+        for address in info.addresses where address.transportStyle == "NTCP2" {
+            guard let text = address.options["i"],
+                  let iv = NTCP2PeerEndpoint.base64Decode(text),
+                  iv.count == 16 else { continue }
+            return iv
+        }
+        return nil
     }
 
     /// Starts the TCP listener; `port` 0 binds an ephemeral port.
@@ -379,11 +577,17 @@ final class NTCP2Transport {
         let nwListener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: port) ?? .any)
         nwListener.newConnectionHandler = { [weak self] connection in
             guard let self else { return }
+            let advertised = self.currentRouterInfo()
             let session = NTCP2Session(role: .responder,
                                        connection: connection,
                                        localStaticKey: self.localStaticKey,
-                                       localRouterInfoData: self.localRouterInfo.serialize(),
+                                       localStaticPublicKey: self.localStaticPublicKey,
+                                       localRouterInfoData: advertised.data,
+                                       localRouterHash: self.localRouterHash,
+                                       localIV: advertised.iv,
                                        remoteStaticKey: nil,
+                                       remoteRouterHash: nil,
+                                       remoteIV: nil,
                                        queue: self.queue)
             session.delegate = self
             self.register(session)
@@ -400,7 +604,8 @@ final class NTCP2Transport {
         return listener?.port?.rawValue
     }
 
-    func connect(host: String, port: UInt16, remoteStaticKey: Data) {
+    func connect(host: String, port: UInt16, remoteRouterHash: Data,
+                 remoteStaticKey: Data, remoteIV: Data?) {
         lock.lock()
         defer { lock.unlock() }
         guard let nwPort = NWEndpoint.Port(rawValue: port) else { return }
@@ -408,8 +613,13 @@ final class NTCP2Transport {
         let session = NTCP2Session(role: .initiator,
                                    connection: connection,
                                    localStaticKey: localStaticKey,
-                                   localRouterInfoData: localRouterInfo.serialize(),
+                                   localStaticPublicKey: localStaticPublicKey,
+                                   localRouterInfoData: localRouterInfoData,
+                                   localRouterHash: localRouterHash,
+                                   localIV: localIV,
                                    remoteStaticKey: remoteStaticKey,
+                                   remoteRouterHash: remoteRouterHash,
+                                   remoteIV: remoteIV,
                                    queue: queue)
         session.delegate = self
         register(session)
@@ -443,6 +653,14 @@ final class NTCP2Transport {
         lock.lock()
         defer { lock.unlock() }
         return sessionsByHash[routerHash] != nil
+    }
+
+    /// The last few session endings, newest last: hash prefix and reason. Live
+    /// audits append these so a failed handshake row names its cause.
+    func recentCloses(limit: Int = 5) -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return Array(recentCloseReasons.suffix(limit))
     }
 
     func send(to routerHash: Data, data: Data) throws {
@@ -505,6 +723,13 @@ extension NTCP2Transport: NTCP2SessionDelegate {
     }
 
     func session(_ session: NTCP2Session, didClose error: Error?) {
+        lock.lock()
+        let label = session.remoteRouterHash.map { String($0.hex.prefix(12)) } ?? "unknown"
+        recentCloseReasons.append("\(label): \(session.closeReason ?? "closed")")
+        if recentCloseReasons.count > 10 {
+            recentCloseReasons.removeFirst(recentCloseReasons.count - 10)
+        }
+        lock.unlock()
         remove(session)
         delegate?.transport(self, sessionDidClose: session)
     }

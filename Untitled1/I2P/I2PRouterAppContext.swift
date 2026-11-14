@@ -27,6 +27,8 @@ final class I2PRouterAppContext {
     private let tunnelParticipant: I2PTunnelParticipant
     private let tunnelPeerProvider: I2PMainnetTunnelPeerProvider
     private(set) var mainnetRouterInfo: I2PRouterInfo
+    /// When our RouterInfo was last (re-)published with the current caps.
+    private(set) var lastRouterInfoPublishedAt: Date?
     private(set) var lifecycleState: LifecycleState = .suspended
     private var started = false
     private var startedNetDBMaintenance = false
@@ -54,9 +56,10 @@ final class I2PRouterAppContext {
         case suspended
     }
 
-    /// The SAMv3.3 API socket bound to this router (port 7656 by default).
-    lazy var samServer: I2PSAMServer = {
-        let core = I2PSAMRouterCore(
+    /// The router surface the app's local clients build their sessions on:
+    /// the SAMv3.3 bridge and the in-app eepsite browser.
+    lazy var routerCore: I2PSAMRouterCore = {
+        I2PSAMRouterCore(
             routerHash: self.routerHash,
             netDB: self.netDB,
             participant: self.tunnelParticipant,
@@ -69,7 +72,27 @@ final class I2PRouterAppContext {
                 return self.i2npRouter
             }
         )
-        return I2PSAMServer(core: core, port: 7656)
+    }()
+
+    /// The SAMv3.3 API socket bound to this router (port 7656 by default).
+    lazy var samServer: I2PSAMServer = {
+        I2PSAMServer(core: self.routerCore, port: 7656)
+    }()
+
+    /// The eepsite browser's client destination (created on its first fetch):
+    /// its own tunnel pool, published leases and the garlic stream machinery.
+    /// Credentialled b33 hosts and address-book names come from the SAM bridge,
+    /// which is where those destinations live.
+    lazy var eepsiteBrowser: I2PEepsiteClient = {
+        I2PEepsiteClient(
+            core: self.routerCore,
+            credentials: { [weak self] address in
+                self?.samServer.b33Hosts().first { $0.address == address }?.credentials
+            },
+            addressBook: { [weak self] name in
+                self?.samServer.addressbook[name]
+            }
+        )
     }()
 
     /// Live-network verification handles for the CI mainnet suite.
@@ -148,15 +171,29 @@ final class I2PRouterAppContext {
 
         engine = I2PRouterStatusEngine(localRouterHash: routerHash)
 
+        // Persisted participation controls apply before anything is published:
+        // the bandwidth governor starts enforcing the saved caps, and the
+        // RouterInfo carries the saved floodfill capability.
+        let participation = I2PParticipationSettings.shared
+        participation.applyBandwidthCaps()
+
         // NTCP2 transport with a signed RouterInfo; the delivery adapter
         // carries I2NP envelopes over established sessions and counts bytes.
+        // One static key encoding end to end: the RouterInfo "s" option, the
+        // static key inside SessionConfirmed part 1, and the key peers derive
+        // from this router's identity must all be the same 32 bytes (peers
+        // memcmp them, and i2pd rejects a RouterAddress whose "s" has the
+        // X25519 top bit set).
+        let publishedStaticKey = I2PCrypto.canonicalX25519PublicKey(encryptionKey.publicKey.rawRepresentation)
         let routerInfo = try! Self.makeRouterInfo(
             identity: identity,
-            encryptionPublicKey: encryptionKey.publicKey.rawRepresentation,
-            signingSeed: signingSeed
+            encryptionPublicKey: publishedStaticKey,
+            signingSeed: signingSeed,
+            floodfill: participation.floodfillEnabled
         )
         mainnetRouterInfo = routerInfo
-        let transport = NTCP2Transport(localRouterInfo: routerInfo, staticKey: encryptionKey)
+        let transport = NTCP2Transport(localRouterInfo: routerInfo, staticKey: encryptionKey,
+                                        localStaticPublicKey: publishedStaticKey)
         ntcp2 = transport
         deliveryTransport = I2PNTCP2DeliveryTransport(ntcp2: transport)
         deliveryTransport.onSent = { [weak engine] bytes in
@@ -168,11 +205,17 @@ final class I2PRouterAppContext {
         i2npRouter.deliveryTransport = deliveryTransport
         let netdbAdapter = I2PNetDBI2NPAdapter(delivery: deliveryTransport)
         let storage = try! I2PNetDBStorage()
-        netDB = I2PNetworkDatabase(
+        let database = I2PNetworkDatabase(
             localRouterHash: routerHash,
             transport: netdbAdapter,
             storage: storage
         )
+        netDB = database
+        // The netdb floodfill role is actor state: apply the persisted setting
+        // as soon as the database exists.
+        Task {
+            await database.configureLocalFloodfill(participation.floodfillEnabled)
+        }
         i2npRouter.addBodyHandler { [weak netDB] message, _ in
             guard let netDB, let netdbMessage = I2PNetDBI2NPBridge.inbound(message) else { return }
             Task { await netDB.handleIncoming(netdbMessage) }
@@ -208,6 +251,33 @@ final class I2PRouterAppContext {
             peerProvider: netdbPeerProvider
         )
         engine.attach(tunnelPool: tunnelPool)
+        // The pool's own outbound builds need the same two things the live build
+        // row had to add by hand: a reply route for the endpoint (an existing
+        // inbound tunnel of ours, or our own router with a registered endpoint),
+        // and a gateway handler for every endpoint this router owns — without
+        // them a build reply has nowhere to land and every pool build times out.
+        let pool = tunnelPool
+        pool.replyRouteProvider = { [weak pool] in
+            guard let pool,
+                  let inbound = pool.inboundTunnels.first,
+                  let gateway = inbound.hops.first?.routerHash else { return nil }
+            return (gateway: gateway, tunnelID: inbound.gatewayTunnelID)
+        }
+        pool.installLocalEndpoint = { [weak router = i2npRouter] endpoint in
+            router?.registerGateway(tunnelID: endpoint) { message, source in
+                // Deliver the inner message back through the router so build
+                // replies reach the participants' pending builds.
+                Task { await router?.handleIncoming(message, from: source) }
+            }
+        }
+        // Participation controls: the status engine reads live hop states for
+        // the share reading, and the share ratio caps the tunnels we carry.
+        participant.setTransitBudget(
+            I2PTunnelParticipant.transitTunnelBudget(forSharePercent: participation.tunnelSharePercent)
+        )
+        engine.attach(participant: participant)
+        engine.recordFloodfillAdvertisement(advertised: participation.floodfillEnabled,
+                                           publishedAt: nil)
         // The dashboard and peer inspector read session counts and per-peer
         // readings through the status engine — it must observe the transport.
         engine.attach(ntcp2: transport)
@@ -220,6 +290,14 @@ final class I2PRouterAppContext {
         deliveryTransport.dialPeer = { [weak self] hash in
             guard let self else { return false }
             return await self.dial(routerHash: hash)
+        }
+        // Let netdb lookups prefer floodfills we already have a session to, so
+        // a cold DHT round trip does not burn its whole window on demand-dials.
+        let sessionProbe = transport
+        Task {
+            await database.installReachabilityProbe { hash in
+                sessionProbe.hasSession(for: hash)
+            }
         }
         buildTransport.dialPeer = { [weak self] hash in
             guard let self else { return false }
@@ -259,6 +337,9 @@ final class I2PRouterAppContext {
         tunnelPool.start()
         engine.start()
         samServer.start()
+        // Re-apply the persisted participation controls (caps, share, netdb
+        // role) so a resumed router matches what the screen shows.
+        Task { await applyParticipationSettings() }
     }
 
     /// Clean shutdown for app termination or background suspension: stops the
@@ -284,6 +365,61 @@ final class I2PRouterAppContext {
         start()
     }
 
+    // MARK: Participation controls
+
+    /// Pushes the persisted participation controls onto the running router:
+    /// the bandwidth caps into the governor, the tunnel-share ratio into the
+    /// participating-tunnel budget, and the floodfill role into the netdb.
+    /// The caps and the budget gate traffic immediately; the netdb role is
+    /// effective the moment the actor applies it.
+    func applyParticipationSettings() async {
+        let settings = I2PParticipationSettings.shared
+        settings.applyBandwidthCaps()
+        tunnelParticipant.setTransitBudget(
+            I2PTunnelParticipant.transitTunnelBudget(forSharePercent: settings.tunnelSharePercent)
+        )
+        await netDB.configureLocalFloodfill(settings.floodfillEnabled)
+    }
+
+    /// Turns the local netdb floodfill role on or off and re-publishes our
+    /// RouterInfo carrying (or dropping) the floodfill capability, so peers
+    /// learn the new role from the netdb rather than an out-of-band hint.
+    func setFloodfillEnabled(_ enabled: Bool) async {
+        I2PParticipationSettings.shared.floodfillEnabled = enabled
+        await netDB.configureLocalFloodfill(enabled)
+        await republishRouterInfo(floodfill: enabled)
+    }
+
+    /// Re-signs our RouterInfo with the currently advertised addresses and the
+    /// given floodfill capability, then publishes it to the floodfills.
+    func republishRouterInfo(floodfill: Bool) async {
+        var options = mainnetRouterInfo.options
+        options["caps"] = floodfill ? "f" : ""
+        var advertised = I2PRouterInfo(
+            identity: identity,
+            published: Date(),
+            addresses: mainnetRouterInfo.addresses,
+            options: options
+        )
+        guard (try? advertised.sign(withSeed: signingSeed)) != nil else { return }
+        mainnetRouterInfo = advertised
+        lastRouterInfoPublishedAt = Date()
+        engine.recordFloodfillAdvertisement(advertised: floodfill,
+                                           publishedAt: lastRouterInfoPublishedAt)
+        // Sessions must present the freshly signed address in message 3.
+        ntcp2.updateLocalRouterInfo(advertised)
+        _ = await netDB.publish(routerInfo: advertised)
+    }
+
+    /// Publishes our reachable address now instead of waiting for the next
+    /// bootstrap cycle. Live-network checks call this before dialing: the
+    /// handshake's message 3 carries the RouterInfo, and peers that compare the
+    /// observed endpoint against the published address drop the session when it
+    /// is still the bootstrap placeholder.
+    func ensureReachableAddress() async {
+        await advertiseReachableAddress()
+    }
+
     /// Binds the NTCP2 listener, discovers our public IPv4 address over
     /// clearnet HTTPS, re-signs the RouterInfo with that address and
     /// re-publishes it to the floodfills. A no-op when the listener, the
@@ -292,14 +428,24 @@ final class I2PRouterAppContext {
         try? await Task.sleep(for: .seconds(2))
         guard let port = ntcp2.listenerPort, port > 0 else { return }
         guard let address = try? await I2PExternalAddressDiscovery.publicIPv4Address() else { return }
+        let floodfill = I2PParticipationSettings.shared.floodfillEnabled
         guard let advertised = try? Self.makeRouterInfo(
             identity: identity,
-            encryptionPublicKey: identity.encryptionPublicKey,
+            // Use the exact key the transport handshakes with, so the "s"
+            // option matches the static key in message 3 part 1.
+            encryptionPublicKey: encryptionKey.publicKey.rawRepresentation,
             signingSeed: signingSeed,
             ntcp2Host: address,
-            ntcp2Port: port
+            ntcp2Port: port,
+            floodfill: floodfill
         ) else { return }
         mainnetRouterInfo = advertised
+        lastRouterInfoPublishedAt = Date()
+        engine.recordFloodfillAdvertisement(advertised: floodfill,
+                                           publishedAt: lastRouterInfoPublishedAt)
+        // From here on every handshake advertises the reachable address, so
+        // peers that compare the observed endpoint against it keep the session.
+        ntcp2.updateLocalRouterInfo(advertised)
         _ = await netDB.publish(routerInfo: advertised)
     }
 
@@ -316,7 +462,8 @@ final class I2PRouterAppContext {
     }
 
     /// One live bootstrap cycle, in dependency order:
-    /// reseed (floodfill RouterInfos, Ed25519-verified) → dial NTCP2 sessions
+    /// reseed (SU3 container verified against a bundled signer certificate,
+    /// floodfill RouterInfos Ed25519-verified) → dial NTCP2 sessions
     /// to the closest floodfills → advertise our external address (a store
     /// needs reachable floodfill targets) → iterative DHT exploration through
     /// the established sessions → refresh tunnel-hop candidates.
@@ -330,19 +477,25 @@ final class I2PRouterAppContext {
                 lastReseedAt = now
             }
         }
-        await dialFloodfills(targetSessions: 4)
+        // Advertise our reachable address before dialing: the handshake's
+        // message 3 carries this RouterInfo, and peers drop sessions whose
+        // published address does not match the endpoint they observe.
         await advertiseReachableAddress()
+        await dialFloodfills(targetSessions: 8)
         let seeds = await netDB.selectFloodfills(for: routerHash, count: 8)
         _ = await netDB.bootstrap(seedFloodfills: seeds, targetPeers: 32, maxRounds: 4)
-        await tunnelPeerProvider.refreshCandidates(limit: 12)
+        await tunnelPeerProvider.refreshCandidates()
     }
 
     /// Dials NTCP2 sessions to the closest known floodfills until
     /// `targetSessions` are established, so netdb traffic has live transports.
+    /// A deeper session set matters for the DHT: a lookup asks the floodfills
+    /// closest to the *target key*, and only the peers we already hold sessions
+    /// with can be queried without a cold demand-dial.
     /// Every candidate's RouterInfo is already in the netdb cache (reseeded),
     /// so endpoint resolution is cache-first and never recurses into a lookup.
     private func dialFloodfills(targetSessions: Int) async {
-        let candidates = await netDB.selectFloodfills(for: routerHash, count: 24)
+        let candidates = await netDB.selectFloodfills(for: routerHash, count: 24).prefix(16)
         for hash in candidates {
             guard !ntcp2.hasSession(for: hash) else { continue }
             _ = await dial(routerHash: hash)
@@ -367,38 +520,84 @@ final class I2PRouterAppContext {
             Task { await dialTracker.release(routerHash) }
         }
         guard let info = await netDB.lookupRouterInfo(routerHash, timeoutPerRound: 1, maxRounds: 1),
-              let endpoint = info.addresses.compactMap({ NTCP2PeerEndpoint(routerAddress: $0) }).first else {
+              let endpoint = NTCP2PeerEndpoint.preferred(from: info.addresses) else {
             return false
         }
         guard !ntcp2.hasSession(for: routerHash) else { return true }
-        ntcp2.connect(host: endpoint.host, port: endpoint.port, remoteStaticKey: endpoint.staticKey)
+        ntcp2.connect(host: endpoint.host, port: endpoint.port,
+                      remoteRouterHash: info.identity.hash,
+                      remoteStaticKey: endpoint.staticKey,
+                      remoteIV: endpoint.iv)
         return true
     }
 
-    /// A signed RouterInfo for our own identity (real key material).
+    /// A signed RouterInfo for our own identity (real key material). The
+    /// `floodfill` capability follows the participation setting so every
+    /// re-publication keeps the advertised role.
     private static func makeRouterInfo(identity: I2PRouterIdentity,
                                        encryptionPublicKey: Data,
                                        signingSeed: Data,
                                        ntcp2Host: String = "127.0.0.1",
-                                       ntcp2Port: UInt16 = 0) throws -> I2PRouterInfo {
+                                       ntcp2Port: UInt16 = 0,
+                                       floodfill: Bool = false) throws -> I2PRouterInfo {
+        // NTCP2 §Published Router Info: a dialable address carries host, port,
+        // the static key "s", the handshake IV "i" and v=2. A router that is not
+        // listening yet publishes the spec's "unpublished" form instead — "s"
+        // and "v" only — because advertising a host/port it does not serve makes
+        // peers compare the observed endpoint against it and ban the router
+        // right after message 3.
+        let staticKey = I2PCrypto.canonicalX25519PublicKey(encryptionPublicKey)
+        var options: [String: String] = [
+            // "s" and "i" use the I2P base64 alphabet: '-' for '+' and '~' for
+            // '/'. The trailing '=' padding is part of the wire form: reference
+            // routers decode these options with EVP_DecodeBlock (i2pd), which
+            // rejects unpadded input and then marks the whole RouterAddress
+            // invalid — the address disappears and peers silently drop every
+            // session right after SessionConfirmed.
+            "s": I2PCrypto.i2pBase64(staticKey),
+            "v": "2"
+        ]
+        let published = ntcp2Port != 0 && !Self.isLoopback(ntcp2Host)
+        if published {
+            options["host"] = ntcp2Host
+            options["port"] = String(ntcp2Port)
+            // The 16-byte AES IV peers obfuscate their ephemeral key with
+            // (§SessionRequest). Derived from our router hash so it is stable
+            // across restarts — a peer that cached an earlier RouterInfo still
+            // de-obfuscates our inbound sessions.
+            options["i"] = I2PCrypto.i2pBase64(Data(I2PCrypto.sha256(identity.hash).prefix(16)))
+        }
         let address = I2PRouterAddress(
-            cost: 5,
+            cost: published ? 5 : 14,
             transportStyle: "NTCP2",
             expiration: nil,
-            options: [
-                "host": ntcp2Host,
-                "port": String(ntcp2Port),
-                "s": Self.urlSafeBase64(encryptionPublicKey)
-            ]
+            options: options
         )
         var routerInfo = I2PRouterInfo(
             identity: identity,
             published: Date(),
             addresses: [address],
-            options: ["caps": ""]
+            options: [
+                // Peers compare this against their minimum supported router
+                // version and drop (or ban) anything older that does not also
+                // advertise a high-bandwidth capability tier.
+                "router.version": "0.9.70",
+                // Required by reference routers: i2pd marks a RouterInfo that
+                // carries no `netId` option unreachable (its ReadFromBuffer
+                // `!isNetId` check) and then terminates the session right after
+                // SessionConfirmed with no reason — the silent post-message-3
+                // close that kept every mainnet handshake from surviving.
+                "netId": String(NTCP2Handshake.networkID),
+                "caps": floodfill ? "fO" : "O"
+            ]
         )
         try routerInfo.sign(withSeed: signingSeed)
         return routerInfo
+    }
+
+    private static func isLoopback(_ host: String) -> Bool {
+        host.isEmpty || host == "127.0.0.1" || host == "0.0.0.0"
+            || host == "::1" || host.hasPrefix("127.")
     }
 
     private static func urlSafeBase64(_ data: Data) -> String {
@@ -423,7 +622,12 @@ private final class NTCP2I2NPBridge: NTCP2TransportDelegate {
         // Data blocks carry one short-header I2NP message (converted to the
         // full internal framing by the session) or raw test payloads.
         if let message = try? I2NPMessage.parse(data) {
-            Task { await router.handleIncoming(message, from: source) }
+            Task {
+                // Inbound bandwidth cap: the message waits for its tokens, so
+                // a lowered cap slows ingress immediately.
+                await I2PBandwidthGovernor.shared.admitInbound(bytes: data.count)
+                await router.handleIncoming(message, from: source)
+            }
         }
     }
 

@@ -164,10 +164,15 @@ enum Keccak {
     }
 
     /// A streaming SHAKE-128 expandable-output function (SampleNTT's XOF).
-    /// `next(_:)` must be called with rate-sized (168-byte) requests.
+    /// Each squeezed block advances the sponge, so successive calls return
+    /// successive output rather than the same block again (a receiver that
+    /// re-read block 0 would rejection-sample from only its first 112
+    /// candidates, which never yields a valid 256-coefficient polynomial).
+    /// `next(_:)` may be called with any length.
     struct XOF {
         private var state: [UInt64]
         private let rate: Int
+        private var pending: [UInt8] = []
 
         init(input: Data) {
             rate = Mode.shake128.rate
@@ -175,7 +180,19 @@ enum Keccak {
         }
 
         mutating func next(_ count: Int) -> [UInt8] {
-            Keccak.squeeze(state: &state, rate: rate, count: count)
+            while pending.count < count {
+                var block: [UInt8] = []
+                block.reserveCapacity(rate)
+                for i in 0..<(rate / 8) {
+                    var lane = state[i].littleEndian
+                    withUnsafeBytes(of: &lane) { block.append(contentsOf: $0) }
+                }
+                Keccak.permute(&state)
+                pending.append(contentsOf: block)
+            }
+            let out = Array(pending.prefix(count))
+            pending.removeFirst(count)
+            return out
         }
     }
 }
@@ -486,7 +503,11 @@ enum MLKEM {
 
     /// K-PKE.KeyGen + ML-KEM key wrapping from explicit (d, z) seeds.
     static func keyGen(d: [UInt8], z: [UInt8], parameters p: Parameters) -> KeyPair {
-        let g = [UInt8](Keccak.sha3_512(Data(d)))
+        // FIPS 203 §7.1: (ρ, σ) ← G(d ‖ k), where k is the module rank as one
+        // byte. The k suffix is the spec's domain separation across parameter
+        // sets; omitting it yields a key pair no reference implementation
+        // reproduces.
+        let g = [UInt8](Keccak.sha3_512(Data(d) + Data([UInt8(p.k)])))
         let rho = Array(g[0..<32])
         let sigma = Array(g[32..<64])
 
@@ -506,20 +527,24 @@ enum MLKEM {
             e.append(samplePolyCBD(prf(sigma, p.eta1, counter), eta: p.eta1))
             counter += 1
         }
-        // t = Â·ŝ + e
-        var t = [Poly]()
+        // t̂ = Â·ŝ + ê — every term stays in the NTT domain, which is what
+        // ByteEncode12 writes into the encapsulation key and what
+        // K-PKE.Encrypt/Decrypt multiply against. Adding ê in the coefficient
+        // domain (an inverse NTT first) leaves the recipient's v − ŝᵀû unable
+        // to cancel, so decapsulation never recovered the message.
+        var tHat: [Poly] = []
         for i in 0..<p.k {
             var accHat = Poly(repeating: 0, count: n)
             for j in 0..<p.k {
                 let prod = multiplyNTTs(matrix[i][j], sHat[j])
                 for c in 0..<n { accHat[c] = (accHat[c] + prod[c]) % q }
             }
-            var ti = inverseNTT(accHat)
-            for c in 0..<n { ti[c] = (ti[c] + e[i][c]) % q }
-            t.append(ti)
+            let eHat = ntt(e[i])
+            for c in 0..<n { accHat[c] = (accHat[c] + eHat[c]) % q }
+            tHat.append(accHat)
         }
         var ek = Data()
-        for i in 0..<p.k { ek.append(contentsOf: encode12(t[i])) }
+        for i in 0..<p.k { ek.append(contentsOf: encode12(tHat[i])) }
         ek.append(contentsOf: rho)
         return KeyPair(parameters: p, ek: ek, sHat: sHat, z: z)
     }
@@ -575,9 +600,12 @@ enum MLKEM {
             return implicitRejection(c)
         }
 
+        /// FIPS 203 implicit rejection: K̄ ← J(z ‖ c), one 32-byte SHAKE-256
+        /// over the rejection seed followed by the ciphertext. (Hashing a
+        /// SHAKE-256(z) intermediate through SHA3-256 is not J and produced a
+        /// key no reference implementation computes.)
         private func implicitRejection(_ c: [UInt8]) -> Data {
-            let jz = [UInt8](Keccak.shake256(Data(z), outputLength: 32))
-            return Keccak.sha3_256(Data(jz) + Data(c))
+            Keccak.shake256(Data(z) + Data(c), outputLength: 32)
         }
 
         /// K-PKE.Decrypt: m′ = Compress_1(v′ − ŝᵀ·û′).

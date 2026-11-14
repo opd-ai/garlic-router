@@ -109,9 +109,16 @@ actor I2PNetworkDatabase {
     private var outgoingLookupTokens: Set<UInt32> = []
     private var pendingStoreAcks: [UInt32: Int] = [:]
     private var pendingLookupResults: [Data: StoredEntry] = [:]
+    /// Keys with an outstanding lookup: a direct DatabaseStore answer carries
+    /// the key and no reply token, so it is matched here.
+    private var pendingLookupKeys: Set<Data> = []
     private var pendingSearchReplies: [Data: [I2PDatabaseSearchReply]] = [:]
     private var recentlyReplicated: [Data: Date] = [:]
     private var recentlyEchoedTokens: [UInt32: Date] = [:]
+    /// Recent inbound DatabaseStores that failed to parse or verify, as
+    /// "entryType error" strings. A live run reads this to separate "no peer
+    /// answered" from "an answer arrived and we rejected it".
+    private(set) var storeRejections: [String] = []
     private var maintenanceTask: Task<Void, Never>?
 
     init(localRouterHash: Data, transport: any I2PNetDBTransport, storage: I2PNetDBStorage) {
@@ -137,9 +144,19 @@ actor I2PNetworkDatabase {
     /// than replaces: live stores that arrive while the restore is running
     /// (the router is published and reachable within seconds of launch) must
     /// survive the adoption.
+    ///
+    /// The restored RouterInfos also re-populate the routing indexes. A router
+    /// that keeps its netdb on disk (as reference routers do) boots with a full
+    /// peer table, so the floodfill set — the thing every lookup, publish and
+    /// dial is addressed to — must be rebuilt from the persisted identities.
+    /// Without it the cache held hundreds of verified RouterInfos while
+    /// `knownFloodfills` stayed empty, and every DHT operation found "no peers".
     private func adoptRestored(_ restored: [Data: StoredEntry]) {
         for (key, entry) in restored where entries[key] == nil {
             entries[key] = entry
+            if let routerInfo = entry.routerInfo {
+                learn(from: routerInfo)
+            }
         }
     }
 
@@ -178,8 +195,83 @@ actor I2PNetworkDatabase {
         )
     }
 
+    /// Optional transport reachability probe installed by the running router
+    /// (an NTCP2/SSU2 session to this peer exists right now). A lookup consults
+    /// it so a query can go out over peers we can send to immediately instead
+    /// of waiting on a cold demand-dial to the closest floodfill.
+    private(set) var peerIsReachable: ((Data) -> Bool)?
+
+    /// Installs the reachability probe the running router wires to its live
+    /// session table.
+    func installReachabilityProbe(_ probe: @escaping (Data) -> Bool) {
+        peerIsReachable = probe
+    }
+
+    /// The peers a lookup should query: the closest floodfills, plus — when the
+    /// closest ones are not reachable — the nearest floodfills we do hold
+    /// sessions with. All of them are queried at once, so the answer comes from
+    /// whichever replies first.
+    ///
+    /// The reachable set is drawn from *every* known floodfill, not from the
+    /// nearest few: on mainnet the floodfills closest to an arbitrary key are
+    /// almost never the peers this router happens to hold sessions with, and a
+    /// cold demand-dial to them can be refused outright (a peer that has gone
+    /// away still looks like a known floodfill). Asking the closest peers we can
+    /// actually reach keeps the round trip alive.
+    private func lookupCandidates(for key: Data, kind: I2PLookupKind = .routerInfo,
+                                  excluding queried: Set<Data>) -> [Data] {
+        // A LeaseSet is held by the floodfills closest to *its* key, which live in
+        // a different region of the keyspace from the peers this router keeps
+        // sessions with (those are chosen relative to our own hash). Ask more of
+        // the closest peers for an LS lookup, and every reachable one beyond them.
+        let closestCount = kind == .leaseSet ? 8 : Self.lookupFloodfillCount
+        var candidates = selectFloodfills(for: key, count: closestCount)
+            .filter { !queried.contains($0) }
+        guard let reachable = peerIsReachable else { return candidates }
+        let liveFanOut = kind == .leaseSet ? 32 : Self.lookupFloodfillCount * 2
+        if candidates.contains(where: { !reachable($0) }) {
+            let live = knownFloodfills
+                .filter { $0 != localRouterHash && !queried.contains($0) && reachable($0) }
+                .sorted { Self.isCloser($0, than: $1, to: key) }
+                .prefix(liveFanOut)
+            candidates = Array(Set(candidates + live))
+                .sorted { Self.isCloser($0, than: $1, to: key) }
+        }
+        return candidates
+    }
+
+    /// Sends netdb messages without letting one slow peer delay the rest: a
+    /// demand-dial to a floodfill with no session can take seconds, and awaiting
+    /// it inline kept a lookup from ever leaving before its round deadline.
+    private func broadcast(_ message: I2PNetDBMessage, to targets: [Data]) {
+        guard !targets.isEmpty else { return }
+        let transport = self.transport
+        for target in targets {
+            Task {
+                try? await transport.send(to: target, message: message)
+            }
+        }
+    }
+
     func configureLocalFloodfill(_ enabled: Bool) {
         isFloodfillRouter = enabled
+    }
+
+    func localFloodfillRole() -> Bool {
+        isFloodfillRouter
+    }
+
+    /// A one-line summary of inbound stores this router rejected, for live
+    /// diagnostics; empty when nothing was rejected.
+    func storeRejectionSummary() -> String {
+        guard !storeRejections.isEmpty else { return "" }
+        var counts: [String: Int] = [:]
+        for line in storeRejections { counts[line, default: 0] += 1 }
+        let detail = counts.sorted { $0.value > $1.value }
+            .prefix(3)
+            .map { "\($0.value)× \($0.key)" }
+            .joined(separator: "; ")
+        return "\(storeRejections.count) inbound store(s) rejected: \(detail)"
     }
 
     func registerFloodfill(_ hash: Data) {
@@ -231,7 +323,14 @@ actor I2PNetworkDatabase {
         case .store(let s): await handleStore(s)
         case .lookup(let l): await handleLookup(l)
         case .searchReply(let r): handleSearchReply(r)
+        case .deliveryStatus(let id, _): handleDeliveryStatus(messageID: id)
         }
+    }
+
+    /// A DeliveryStatus with our store's reply token acknowledges the publish.
+    private func handleDeliveryStatus(messageID: UInt32) {
+        guard outgoingStoreTokens.contains(messageID) else { return }
+        pendingStoreAcks[messageID, default: 0] += 1
     }
 
     private func handleStore(_ s: I2PDatabaseStore) async {
@@ -240,13 +339,36 @@ actor I2PNetworkDatabase {
         do {
             entry = try Self.ingest(s.payload, entryType: s.entryType)
         } catch {
+            // A store we could not parse or verify is not silently equivalent to
+            // "nothing arrived": keep a short tally so a live run can tell a
+            // rejected answer (a codec/verification defect) from a lookup no peer
+            // bothered to answer.
+            //
+            // Name the real cause when the entry's own destination signs with a
+            // type this router does not implement: that is a modern-only policy
+            // boundary, not a codec bug, and saying so stops the next run from
+            // looking like a regression.
+            var reason = "\(error)"
+            if s.entryType != .routerInfo,
+               let code = I2PKeysAndCert.declaredSignatureTypeCode(in: s.payload),
+               I2PSigType(rawValue: code) == nil {
+                reason = "legacy destination identity (SigType \(code), which this router's modern-only verifier does not implement)"
+            }
+            storeRejections.append("\(s.entryType) \(reason)")
+            if storeRejections.count > 50 { storeRejections.removeFirst() }
             return // unverifiable entry rejected
         }
         if let routerInfo = entry.routerInfo {
             learn(from: routerInfo)
         }
         guard !entry.isExpired() else { return }
-        let key = s.key
+        // The cache is keyed by the *verified* identity hash, never by the key
+        // field the store arrived with: a peer that ships a valid RouterInfo (or
+        // LeaseSet) under a different key must not be able to plant an entry at
+        // that key — netdb poisoning. The store's own key is only used to
+        // correlate an answer with the lookup that asked for it.
+        let key = entry.key
+        let answeredKey = s.key
         let now = Date()
         let existing = entries[key]
         let isDuplicate: Bool
@@ -256,7 +378,15 @@ actor I2PNetworkDatabase {
             isDuplicate = false
         }
 
-        // 2. Token bookkeeping (acks for our own publishes, results for our own lookups).
+        // 2. Correlation: a direct DatabaseStore answer to one of our lookups
+        // carries the queried key and no reply token, so match it by key.
+        // (A token-bound store is honored too for our own loopback path.)
+        if pendingLookupKeys.contains(answeredKey) || pendingLookupKeys.contains(key) {
+            pendingLookupKeys.remove(answeredKey)
+            pendingLookupKeys.remove(key)
+            pendingLookupResults[answeredKey] = entry
+            if answeredKey != key { pendingLookupResults[key] = entry }
+        }
         if s.replyToken > 0 {
             if outgoingStoreTokens.contains(s.replyToken) {
                 pendingStoreAcks[s.replyToken, default: 0] += 1
@@ -284,25 +414,29 @@ actor I2PNetworkDatabase {
             }
         }
 
-        // 4. Acknowledge store requests addressed to someone else.
-        if s.replyToken > 0, s.replyGateway != localRouterHash, !recentlyEchoed(s.replyToken) {
+        // 4. A store carrying a reply token asks for a DeliveryStatus
+        // acknowledgment with the token as the message ID. Tunnel-routed acks
+        // would need the reply tunnel; direct ones go to the reply gateway.
+        if s.replyToken > 0, s.replyTunnelId == 0,
+           !s.replyGateway.isEmpty, s.replyGateway != localRouterHash,
+           !recentlyEchoed(s.replyToken) {
             recentlyEchoedTokens[s.replyToken] = now
-            let ack = I2PDatabaseStore(
-                key: key,
-                entryType: s.entryType,
-                replyToken: s.replyToken,
-                replyTunnelId: s.replyTunnelId,
-                replyGateway: s.replyGateway,
-                payload: s.payload
-            )
-            try? await transport.send(to: s.replyGateway, message: .store(ack))
+            try? await transport.send(to: s.replyGateway,
+                                      message: .deliveryStatus(messageID: s.replyToken,
+                                                               timestamp: now))
         }
 
         // 5. Floodfill replication: gossip to the next floodfills farther from the key.
-        if isFloodfillRouter, !gossipedRecently(key, now: now) {
-            recentlyReplicated[key] = now
+        if isFloodfillRouter {
             let gossip = I2PDatabaseStore(key: key, entryType: s.entryType, replyToken: 0, payload: s.payload)
             for target in gossipTargets(for: key) {
+                // Dedup per (entry, target), not per entry: a floodfill that
+                // received the entry directly must still ripple it outward to
+                // peers farther from the key, or the gossip wave dies after one
+                // hop and the farthest floodfills never converge.
+                let token = Self.gossipToken(key: key, target: target)
+                guard !gossipedRecently(token, now: now) else { continue }
+                recentlyReplicated[token] = now
                 try? await transport.send(to: target, message: .store(gossip))
             }
         }
@@ -310,17 +444,19 @@ actor I2PNetworkDatabase {
 
     private func handleLookup(_ l: I2PDatabaseLookup) async {
         guard l.fromHash != localRouterHash else { return }
-        guard l.replyToken > 0 else { return }
-        let replyTarget = l.replyGateway.isEmpty ? l.fromHash : l.replyGateway
+        // A direct reply carries the entry back to `from`. Tunnel-routed and
+        // encrypted replies need the reply tunnel/key we do not operate here.
+        guard l.replyTunnelId == 0, !l.encryptedReplyRequested else { return }
+        let replyTarget = l.fromHash
 
         if let entry = entries[l.queryKey], !entry.isExpired() {
-            // Answer with the entry itself.
+            // Answer with the entry itself; the reply is a plain store.
             let reply = I2PDatabaseStore(
                 key: l.queryKey,
                 entryType: entry.entryType,
-                replyToken: l.replyToken,
-                replyTunnelId: l.replyTunnelId,
-                replyGateway: replyTarget,
+                replyToken: 0,
+                replyTunnelId: 0,
+                replyGateway: Data(),
                 payload: entry.raw
             )
             try? await transport.send(to: replyTarget, message: .store(reply))
@@ -390,6 +526,33 @@ actor I2PNetworkDatabase {
         return await storeToNetDB(key: entry.key, entryType: .leaseSet, payload: payload, floodfillCount: floodfillCount)
     }
 
+    /// Publishes a signed LeaseSet2-family entry under the netdb key its own
+    /// destination derives: for a plain LS2 that is the destination hash, and
+    /// for an encrypted (b33) LS2 the envelope destination carries the blinded
+    /// signing key — so its hash, the blinded netdb key, is the key the store
+    /// rides. Returns the number of floodfill acknowledgments.
+    @discardableResult
+    func publish(leaseSet2: I2PLeaseSet2, floodfillCount: Int = 5) async -> Int {
+        let entryType: I2PDatabaseEntryType
+        switch leaseSet2.storeType {
+        case .plain: entryType = .leaseSet2
+        case .encrypted: entryType = .encryptedLeaseSet2
+        case .meta: entryType = .metaLeaseSet2
+        }
+        let payload = leaseSet2.serialize()
+        guard let entry = try? Self.ingest(payload, entryType: entryType) else { return 0 }
+        enforceCacheQuota(for: entry.key)
+        entries[entry.key] = entry
+        try? storage.persist(key: entry.key, record: I2PNetDBStorage.Record(
+            entryType: entryType.rawValue,
+            storedAt: Date(),
+            expiresAt: entry.expiresAt,
+            payload: payload
+        ))
+        return await storeToNetDB(key: entry.key, entryType: entryType,
+                                  payload: payload, floodfillCount: floodfillCount)
+    }
+
     /// Ingests a verified RouterInfo payload into the local database (no networking).
     func ingestRouterInfo(_ payload: Data) throws {
         let entry = try Self.ingest(payload, entryType: .routerInfo)
@@ -456,7 +619,9 @@ actor I2PNetworkDatabase {
                 replyGateway: localRouterHash,
                 payload: payload
             )
-            try? await transport.send(to: target, message: .store(message))
+            // Concurrent: a floodfill with no session demand-dials in its own
+            // send task instead of delaying the rest of the store.
+            broadcast(.store(message), to: [target])
         }
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
@@ -470,22 +635,58 @@ actor I2PNetworkDatabase {
 
     // MARK: Lookup
 
-    /// Looks up an entry: cache first, then iterative querying of the closest
-    /// floodfills. Search replies are harvested to discover new floodfill candidates.
-    func lookup(_ key: Data, timeoutPerRound: TimeInterval = 1.5, maxRounds: Int = 2) async -> StoredEntry? {
+    /// Looks up an entry: cache first, then an iterative query of the closest
+    /// known peers. A search reply names the peers a floodfill considers closest
+    /// to the key — the spec has the requester ask *those* next, whether or not
+    /// they are floodfills ("The returned peer hashes are not necessarily closer
+    /// to the key than the router being queried"), so the next round draws on
+    /// them rather than re-deriving a candidate set from the floodfill index.
+    ///
+    /// The round's lookups go out concurrently (a peer without a session
+    /// demand-dials in its own send task), and the per-key answer slots live for
+    /// the whole lookup, so an answer that lands between rounds is still
+    /// correlated instead of discarded.
+    func lookup(_ key: Data, kind: I2PLookupKind = .routerInfo,
+                timeoutPerRound: TimeInterval = 1.5, maxRounds: Int = 2) async -> StoredEntry? {
+        await lookupAnswering(key, kind: kind,
+                              timeoutPerRound: timeoutPerRound, maxRounds: maxRounds).entry
+    }
+
+    /// The lookup plus whether anybody answered it at all. A DatabaseSearchReply
+    /// is a spec answer too (it names the peers the floodfill considers closest),
+    /// so a caller measuring a round trip can tell "no peer replied" apart from
+    /// "the network answered, but the entry is not stored there".
+    func lookupAnswering(_ key: Data, kind: I2PLookupKind = .routerInfo,
+                         timeoutPerRound: TimeInterval = 1.5, maxRounds: Int = 2) async
+        -> (entry: StoredEntry?, answered: Bool) {
         precondition(key.count == 32)
         if let entry = entries[key], !entry.isExpired() {
-            return entry
+            return (entry, true)
         }
+        var answered = false
         var queried: Set<Data> = []
+        /// Peers a search reply pointed at, for the next round.
+        var queue: [Data] = []
+        pendingLookupKeys.insert(key)
+        // Clear the per-key answer slots once for the whole lookup. They used to
+        // be reset at the start of every round, which discarded a reply that
+        // arrived while the gap between rounds was fetching the peers a search
+        // reply named — the answer was there and the lookup still timed out.
+        pendingLookupResults.removeValue(forKey: key)
+        pendingSearchReplies[key] = []
+        defer {
+            pendingLookupKeys.remove(key)
+            pendingLookupResults.removeValue(forKey: key)
+            pendingSearchReplies.removeValue(forKey: key)
+        }
         for _ in 0..<maxRounds {
-            let candidates = selectFloodfills(for: key, count: Self.lookupFloodfillCount)
-                .filter { !queried.contains($0) }
+            let candidates = (queue.isEmpty
+                                ? lookupCandidates(for: key, kind: kind, excluding: queried)
+                                : queue.filter { !queried.contains($0) })
+            queue = []
             guard !candidates.isEmpty else { break }
             let token = Self.newToken()
             outgoingLookupTokens.insert(token)
-            pendingLookupResults.removeValue(forKey: key)
-            pendingSearchReplies[key] = []
             let excluded = Array(candidates.dropFirst().prefix(3))
             for floodfill in candidates {
                 queried.insert(floodfill)
@@ -496,25 +697,27 @@ actor I2PNetworkDatabase {
                     replyTunnels: [],
                     replyToken: token,
                     replyTunnelId: 0,
-                    replyGateway: localRouterHash
+                    replyGateway: localRouterHash,
+                    lookupType: kind
                 )
-                try? await transport.send(to: floodfill, message: .lookup(message))
+                // Fire-and-forget: a peer with no session demand-dials in its
+                // own send task, so the wait below still starts on time.
+                broadcast(.lookup(message), to: [floodfill])
             }
             let deadline = Date().addingTimeInterval(timeoutPerRound)
             var discovered: Set<Data> = []
             while Date() < deadline {
                 if Task.isCancelled {
                     outgoingLookupTokens.remove(token)
-                    pendingLookupResults.removeValue(forKey: key)
-                    pendingSearchReplies.removeValue(forKey: key)
-                    return nil
+                    return (nil, answered)
                 }
                 if let found = pendingLookupResults.removeValue(forKey: key) {
                     outgoingLookupTokens.remove(token)
-                    return found
+                    return (found, true)
                 }
                 let replies = pendingSearchReplies[key] ?? []
                 pendingSearchReplies[key] = []
+                if !replies.isEmpty { answered = true }
                 for reply in replies {
                     for peer in reply.peerHashes
                     where !knownFloodfills.contains(peer) && !queried.contains(peer) {
@@ -526,28 +729,85 @@ actor I2PNetworkDatabase {
                     try await Task.sleep(for: .milliseconds(50))
                 } catch {
                     outgoingLookupTokens.remove(token)
-                    pendingLookupResults.removeValue(forKey: key)
-                    pendingSearchReplies.removeValue(forKey: key)
-                    return nil
+                    return (nil, answered)
                 }
             }
             outgoingLookupTokens.remove(token)
-            // Iterative discovery: fetch RouterInfos for newly discovered peers to
-            // learn whether they are floodfills, then query them in the next round.
+            // Iterative discovery: fetch RouterInfos for the newly named peers
+            // (cache-first, so a peer we already know costs nothing) and query
+            // them in the next round, nearest first. The prefetch runs
+            // concurrently and with a short per-peer budget: doing it one peer
+            // at a time between rounds could eat the whole lookup's time.
             if maxRounds >= 2, !discovered.isEmpty {
-                for peer in discovered {
-                    if entries[peer] == nil {
-                        _ = await lookup(peer, timeoutPerRound: timeoutPerRound, maxRounds: 1)
+                let nearest = discovered.sorted { Self.isCloser($0, than: $1, to: key) }.prefix(3)
+                let prefetchBudget = min(1.5, timeoutPerRound)
+                await withTaskGroup(of: Void.self) { group in
+                    for peer in nearest where entries[peer] == nil {
+                        group.addTask {
+                            _ = await self.lookup(peer, kind: .routerInfo,
+                                                  timeoutPerRound: prefetchBudget, maxRounds: 1)
+                        }
                     }
+                    await group.waitForAll()
                 }
+                queue = discovered.sorted { Self.isCloser($0, than: $1, to: key) }
             }
         }
-        return nil
+        return (nil, answered)
     }
 
     /// Looks up a router's RouterInfo by its identity hash.
     func lookupRouterInfo(_ routerHash: Data, timeoutPerRound: TimeInterval = 1.5, maxRounds: Int = 2) async -> I2PRouterInfo? {
-        await lookup(routerHash, timeoutPerRound: timeoutPerRound, maxRounds: maxRounds)?.routerInfo
+        await lookup(routerHash, kind: .routerInfo,
+                     timeoutPerRound: timeoutPerRound, maxRounds: maxRounds)?.routerInfo
+    }
+
+    /// One live DHT round trip that needs no cached entry: query a key the local
+    /// cache cannot answer and report whether any floodfill replied. Both spec
+    /// answers count — the entry itself (a DatabaseStore) or the closest peers
+    /// the floodfill knows (a DatabaseSearchReply). A miss-answer proves the
+    /// DatabaseLookup body parsed, the floodfill set is reachable over live
+    /// sessions and the reply path works, which is what the live suite's DHT row
+    /// measures. Without this, that row could only run immediately after a
+    /// reseed (it needed a deferred hash to exist), so a router with a healthy
+    /// persisted netdb reported the DHT as broken.
+    func probeLookup(_ key: Data, timeoutPerRound: TimeInterval = 3) async
+        -> (answered: Bool, servedEntry: Bool, peers: Int) {
+        precondition(key.count == 32)
+        let candidates = lookupCandidates(for: key, excluding: [])
+        guard !candidates.isEmpty else { return (false, false, 0) }
+        let token = Self.newToken()
+        outgoingLookupTokens.insert(token)
+        pendingLookupKeys.insert(key)
+        pendingLookupResults.removeValue(forKey: key)
+        pendingSearchReplies[key] = []
+        defer {
+            pendingLookupKeys.remove(key)
+            outgoingLookupTokens.remove(token)
+            pendingLookupResults.removeValue(forKey: key)
+            pendingSearchReplies.removeValue(forKey: key)
+        }
+        let excluded = Array(candidates.dropFirst().prefix(3))
+        for floodfill in candidates {
+            let message = I2PDatabaseLookup(queryKey: key,
+                                            fromHash: localRouterHash,
+                                            excludedPeers: excluded,
+                                            replyTunnels: [],
+                                            replyToken: token,
+                                            lookupType: .exploration)
+            broadcast(.lookup(message), to: [floodfill])
+        }
+        let deadline = Date().addingTimeInterval(timeoutPerRound)
+        while Date() < deadline {
+            if Task.isCancelled { return (false, false, 0) }
+            if pendingLookupResults[key] != nil { return (true, true, 0) }
+            if let replies = pendingSearchReplies[key], !replies.isEmpty {
+                let peers = replies.reduce(0) { $0 + $1.peerHashes.count }
+                if peers > 0 { return (true, false, peers) }
+            }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        return (false, false, 0)
     }
 
     /// Resolves a destination (hash of the destination keys-and-certificate, or
@@ -555,7 +815,8 @@ actor I2PNetworkDatabase {
     /// LeaseSet2 over the cache-first DHT path — the mainnet ECIES eepsite
     /// resolution path (proposal 123 store types 2/3/5).
     func lookupLeaseSet2(_ key: Data, timeoutPerRound: TimeInterval = 1.5, maxRounds: Int = 2) async -> I2PLeaseSet2? {
-        await lookup(key, timeoutPerRound: timeoutPerRound, maxRounds: maxRounds)?.leaseSet2
+        await lookup(key, kind: .leaseSet,
+                     timeoutPerRound: timeoutPerRound, maxRounds: maxRounds)?.leaseSet2
     }
 
     // MARK: Encrypted LeaseSet2 (b33) resolution
@@ -581,6 +842,7 @@ actor I2PNetworkDatabase {
             return nil
         }
         guard let entry = await lookup(blinded.netDBKey,
+                                       kind: .leaseSet,
                                        timeoutPerRound: timeoutPerRound,
                                        maxRounds: maxRounds),
               let encrypted = entry.leaseSet2,
@@ -657,6 +919,14 @@ actor I2PNetworkDatabase {
         for (key, entry) in entries where entry.isExpired(now) {
             entries.removeValue(forKey: key)
             storage.remove(key: key)
+            // An expired RouterInfo no longer vouches for its peer: drop the
+            // identity from the routing indexes too, or lookups keep being
+            // addressed to floodfills whose netdb entry (and transport
+            // address) is an hour stale.
+            if entry.routerInfo != nil {
+                knownPeers.remove(key)
+                knownFloodfills.remove(key)
+            }
             removed += 1
         }
         recentlyReplicated = recentlyReplicated.filter { now.timeIntervalSince($0.value) < Self.replicationDedupWindow }
@@ -691,6 +961,21 @@ actor I2PNetworkDatabase {
     }
 
     // MARK: Introspection
+
+    /// The signature-verified RouterInfos currently live in the cache — the
+    /// candidate pool tunnel hop selection draws on (the Java I2P analogue of
+    /// the netdb RouterInfo set the ProfileManager scores). Cache-only: no
+    /// network round trip, so selection never blocks on the DHT.
+    func cachedRouterInfos(limit: Int = 512) -> [(hash: Data, info: I2PRouterInfo)] {
+        let now = Date()
+        var result: [(hash: Data, info: I2PRouterInfo)] = []
+        for (key, entry) in entries where entry.entryType == .routerInfo {
+            guard let info = entry.routerInfo, !entry.isExpired(now) else { continue }
+            result.append((key, info))
+            if result.count >= limit { break }
+        }
+        return result
+    }
 
     func entryCount() -> Int { entries.count }
     func hasEntry(_ key: Data) -> Bool { entries[key] != nil }
@@ -729,7 +1014,7 @@ actor I2PNetworkDatabase {
             _ = (0..<32).map { index in
                 randomKey[index] = UInt8.random(in: 0...255)
             }
-            _ = await lookup(randomKey, timeoutPerRound: 1.5, maxRounds: 2)
+            _ = await lookup(randomKey, kind: .exploration, timeoutPerRound: 1.5, maxRounds: 2)
             // Fetch RouterInfos for any discovered peers we don't have yet.
             let unknown = knownPeers.filter { entries[$0] == nil }
             for peer in unknown.prefix(4) {
@@ -769,9 +1054,13 @@ actor I2PNetworkDatabase {
                                latestLease.addingTimeInterval(Self.leaseGracePeriod))
             )
         case .leaseSet2, .encryptedLeaseSet2, .metaLeaseSet2:
-            // LeaseSet2 (proposal 123): parse verifies the delegation block and
-            // the body signature over type+length+data before acceptance.
-            let leaseSet2 = try I2PLeaseSet2.parse(payload, expectedType: UInt16(entryType.rawValue))
+            // LeaseSet2 (proposal 123): the payload does not repeat the store
+            // type — the DatabaseStore type byte (3/5/7) *is* the type, and the
+            // body signature is prepended with it.
+            guard let storeType = I2PLeaseSet2Type(rawValue: UInt16(entryType.rawValue)) else {
+                throw I2PWireError.unsupportedAlgorithm
+            }
+            let leaseSet2 = try I2PLeaseSet2.parse(payload, expectedType: storeType)
             let latestLease = leaseSet2.resolvedLeaseSet()?.leases.map(\.expiration).max()
             let expiryCandidate = latestLease ?? leaseSet2.expiresAt
             return StoredEntry(
@@ -853,9 +1142,14 @@ actor I2PNetworkDatabase {
         )
     }
 
-    private func gossipedRecently(_ key: Data, now: Date) -> Bool {
-        guard let last = recentlyReplicated[key] else { return false }
+    private func gossipedRecently(_ token: Data, now: Date) -> Bool {
+        guard let last = recentlyReplicated[token] else { return false }
         return now.timeIntervalSince(last) < Self.replicationDedupWindow
+    }
+
+    /// Per (entry, target) dedup key for the replication memo.
+    private static func gossipToken(key: Data, target: Data) -> Data {
+        I2PCrypto.sha256(key + target)
     }
 
     private func recentlyEchoed(_ token: UInt32) -> Bool {
