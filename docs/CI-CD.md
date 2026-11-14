@@ -56,16 +56,19 @@ non-secret). Both are optional.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `XCODE_VERSION` | `27.1` | The Xcode version both workflows select on the runner (e.g. `27.1`, `26.2`). Set this to a version present on the runner image if the default is not. Check with `ls /Applications \| grep Xcode` on a failed run's log, or the runner image README. |
-| `APP_BUNDLE_ID` | `com.organizationName.Untitled1` | The app's bundle identifier. Used as the `provisioningProfiles` key in `ExportOptions.plist` and passed to the archive as `PRODUCT_BUNDLE_IDENTIFIER`, so the profile and the binary agree. Must match the App ID the provisioning profile was created for. |
+| `APP_BUNDLE_ID` | `ai.opd.garlicrouter` | The app's bundle identifier. Used as the `provisioningProfiles` key in `ExportOptions.plist` and passed to the archive as `PRODUCT_BUNDLE_IDENTIFIER`, so the profile and the binary agree. Must match the App ID the provisioning profile was created for. |
 
 ## Manual setup that cannot be automated here
 
-1. **Change the bundle identifier.** The Xcode project still uses the template
-   placeholder `com.organizationName.Untitled1`. Code signing cannot succeed with
-   it. Set the real identifier in the project (the app target's
-   `PRODUCT_BUNDLE_IDENTIFIER`) — or just set the `APP_BUNDLE_ID` variable, which
-   the archive step passes through — and make sure it matches an App ID with a
-   provisioning profile.
+1. **Register the bundle identifier.** The app builds as `ai.opd.garlicrouter`
+   (the test bundles are `ai.opd.garlicrouter.tests` and
+   `ai.opd.garlicrouter.uitests`). Register `ai.opd.garlicrouter` as an App ID in
+   the Apple Developer portal (**Certificates, Identifiers & Profiles →
+   Identifiers**) under the team the workflow signs with, so a provisioning
+   profile can be issued for it. If the app should ship under a different
+   reverse-DNS namespace, change the bundle ID in Xcode (the app target's
+   `PRODUCT_BUNDLE_IDENTIFIER`) and set the `APP_BUNDLE_ID` variable to the same
+   value — the two must always agree.
 2. **Create the App Store Connect app record.** App Store Connect → **Apps → +**
    → new app for that bundle ID. TestFlight uploads are rejected until the app
    record exists.
