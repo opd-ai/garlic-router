@@ -22,6 +22,33 @@ enum NTCP2Error: Error {
     case noSession(forHash: Data)
 }
 
+/// NTCP2 §Termination reason codes. Reference routers send a Termination
+/// block on the data phase for anything short of a handshake failure (which
+/// closes silently instead), so the reason names which check failed on the
+/// peer's side — the live suite's session-endings line reads these.
+enum NTCP2TerminationReason: UInt8 {
+    case normalOrUnspecified = 0
+    case terminationReceived = 1
+    /// The peer had neither sent nor received anything for its idle budget and
+    /// expired the connection (Java I2P / i2pd: ~11 minutes, adaptive).
+    case idleTimeout = 2
+    case routerShutdown = 3
+    case dataPhaseAEADFailure = 4
+    case incompatibleOptions = 5
+    case incompatibleSignatureType = 6
+    case clockSkew = 7
+    case paddingViolation = 8
+    case aeadFramingError = 9
+    case payloadFormatError = 10
+    case message1Error = 11
+    case message2Error = 12
+    case message3Error = 13
+    case intraFrameReadTimeout = 14
+    case routerInfoSignatureFailure = 15
+    case staticKeyMismatch = 16
+    case banned = 17
+}
+
 /// Constant handshake fields of the NTCP2 protocol.
 enum NTCP2Handshake {
     /// Network ID (spec §SessionRequest options block: "currently 2, except for
@@ -439,6 +466,15 @@ enum NTCP2Block {
     case termination(reason: UInt8, validFrames: UInt64)
     /// Type 254: opaque padding, last block of the frame when present.
     case padding(Int)
+
+    /// The payload blocks of a data-phase frame. A keepalive frame carries
+    /// just the datetime block; a real send carries the I2NP block (the
+    /// datetime added beside it is optional traffic noise) — both count as a
+    /// valid frame for the peer's "valid data frames received" and both feed
+    /// its idle timer.
+    static func keepalive(at date: Date) -> [NTCP2Block] {
+        [.time(date)]
+    }
 
     static func encode(_ blocks: [NTCP2Block]) throws -> Data {
         var writer = I2PWriter()

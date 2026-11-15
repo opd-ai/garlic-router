@@ -332,6 +332,23 @@ final class I2PNTCP2TunnelBuildTransport: I2PTunnelBuildTransport {
         sendAfterDial(envelope.serialize(), to: routerHash)
     }
 
+    /// The NTCP2 transport carries tunnel data, so an outbound endpoint's reply
+    /// can ride the creator's inbound tunnel: the OutboundTunnelBuildReply is
+    /// wrapped in a TunnelGateway addressed to the reply route's tunnel ID and
+    /// delivered to that tunnel's gateway. Without this a creator behind NAT can
+    /// never receive the reply a remote OBEP sends to its reply route.
+    let supportsTunnelBuildReplies = true
+
+    func sendBuildReply(_ body: Data, throughTunnel tunnelID: UInt32, to gatewayRouterHash: Data) {
+        let inner = I2NPMessage(type: .tunnelBuildReply,
+                                expiration: Date().addingTimeInterval(60),
+                                payload: body)
+        let gateway = I2PTunnelGatewayPayload(gatewayID: tunnelID,
+                                              message: inner.serialize())
+        let envelope = I2NPMessage(type: .tunnelGateway, payload: gateway.serialize())
+        sendAfterDial(envelope.serialize(), to: gatewayRouterHash)
+    }
+
     /// Sends immediately over an established session; otherwise dials and
     /// retries inside the dial window so a fresh handshake can carry the build.
     private func sendAfterDial(_ i2npBytes: Data, to routerHash: Data) {
@@ -375,6 +392,13 @@ final class I2PMainnetTunnelPeerProvider: I2PTunnelPeerProvider {
     private var candidates: [(hash: Data, info: I2PRouterInfo)] = []
     private var lastRefresh = Date.distantPast
     private var refreshing = false
+
+    /// Whether this router holds a live session to a peer; forwarded to the
+    /// selector so connected peers outrank cold ones as hops.
+    var isConnected: ((Data) -> Bool)? {
+        get { selector.isConnected }
+        set { selector.isConnected = newValue }
+    }
 
     init(netDB: I2PNetworkDatabase, selector: I2PTunnelPeerSelector = I2PTunnelPeerSelector()) {
         self.netDB = netDB

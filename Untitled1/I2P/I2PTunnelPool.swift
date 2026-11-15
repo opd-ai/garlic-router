@@ -7,6 +7,20 @@
 
 import Foundation
 
+/// One tunnel build attempt's outcome, kept for the tunnel health screen.
+struct I2PTunnelBuildRecord: Identifiable {
+    let id: UInt64
+    let startedAt: Date
+    let direction: I2PTunnel.Direction
+    let hopCount: Int
+    /// Measured from build send to build reply; nil when no reply arrived.
+    let latency: TimeInterval?
+    /// ShortTunnelBuild return code the rejecting hop answered with; nil for a
+    /// build that timed out, which has no verdict at all.
+    let returnCode: UInt8?
+    let succeeded: Bool
+}
+
 final class I2PTunnelPool {
     struct Config {
         /// Pool targets (I2P spec: 3-5 tunnels per direction).
@@ -48,6 +62,15 @@ final class I2PTunnelPool {
     private var maintenanceTask: Task<Void, Never>?
     private var filling = false
 
+    /// Build outcomes kept for the tunnel health screen, oldest first.
+    private var buildRecords: [I2PTunnelBuildRecord] = []
+    private var nextBuildRecordID: UInt64 = 1
+    /// Builds in flight per direction, so the pools can say "1 building".
+    private var buildingCounts: [I2PTunnel.Direction: Int] = [:]
+
+    /// The window the tunnel health screen's success rate covers.
+    static let buildHistoryWindow: TimeInterval = 3600
+
     /// Where an outbound build's endpoint sends its build reply ("Reply through
     /// existing inbound D-E-F"). A live inbound tunnel of ours when one exists;
     /// otherwise the pool registers a local endpoint and addresses the reply to
@@ -79,7 +102,7 @@ final class I2PTunnelPool {
         )
     }
 
-    private func targetCount(_ direction: I2PTunnel.Direction) -> Int {
+    func targetCount(_ direction: I2PTunnel.Direction) -> Int {
         direction == .outbound ? config.outboundTarget : config.inboundTarget
     }
 
@@ -165,6 +188,16 @@ final class I2PTunnelPool {
     /// the reply route its endpoint needs, and an inbound tunnel's endpoint is
     /// registered locally so a message delivered to it reaches this router.
     private func buildOne(_ direction: I2PTunnel.Direction) async {
+        // An outbound build is addressed through `outboundReplyRoute()`: one of our
+        // inbound tunnels when the pool holds one ("Reply through existing inbound
+        // D-E-F"), otherwise this router's own hash with a freshly registered local
+        // endpoint. The second form is not a dead route — a remote outbound endpoint
+        // sends its reply as a TunnelGateway addressed to this router over the
+        // NTCP2 session it already holds with us, and sessions are bidirectional, so
+        // the connection this router opened carries the answer back. Skipping the
+        // attempt instead (as an earlier revision did) left the pool at
+        // 0 outbound + 0 inbound and made an unreachable host indistinguishable from
+        // a build defect.
         var peers = hopCandidates()
         if peers.isEmpty {
             // A pool that runs out of hops must ask the provider to refresh
@@ -173,8 +206,9 @@ final class I2PTunnelPool {
             peers = hopCandidates()
         }
         guard !peers.isEmpty else { return }
-        recordBuildStart()
         let started = Date()
+        recordBuildStart()
+        beginBuilding(direction)
         let replyRoute = direction == .outbound ? outboundReplyRoute() : nil
         do {
             let tunnel = try await builder.buildTunnel(
@@ -189,13 +223,37 @@ final class I2PTunnelPool {
                 succeeded: true,
                 latency: Date().timeIntervalSince(started)))
             adopt(tunnel)
+            finishBuilding(direction,
+                           hopCount: peers.count,
+                           started: started,
+                           latency: Date().timeIntervalSince(started),
+                           returnCode: I2PTunnelBuildReturnCode.accepted.rawValue,
+                           succeeded: true)
             if tunnel.direction == .inbound {
                 // The end of our own inbound tunnel is this router: every payload
                 // it delivers (including a build reply that rode it) must land on
                 // a gateway handler or the router drops it as an unknown tunnel.
+                // A payload that rode a reply route carries the *gateway's* tunnel
+                // ID inside its TunnelGateway wrapper — that is the ID a remote
+                // outbound endpoint was told to address — so both IDs resolve here.
                 installLocalEndpoint?(tunnel.endpointTunnelID)
+                if tunnel.gatewayTunnelID != tunnel.endpointTunnelID {
+                    installLocalEndpoint?(tunnel.gatewayTunnelID)
+                }
             }
         } catch {
+            // A rejection carries the hop's own verdict; a timeout carries none.
+            var returnCode: UInt8?
+            if let buildError = error as? I2PTunnelBuildError,
+               case .rejected(let rejected) = buildError {
+                returnCode = rejected
+            }
+            finishBuilding(direction,
+                           hopCount: peers.count,
+                           started: started,
+                           latency: Date().timeIntervalSince(started),
+                           returnCode: returnCode,
+                           succeeded: false)
             // Failed builds feed the hop profiles, so the next selection avoids
             // the hops that just failed instead of retrying them forever.
             peerProvider.recordBuildOutcome(I2PTunnelPeerBuildOutcome(
@@ -243,6 +301,54 @@ final class I2PTunnelPool {
         lock.unlock()
     }
 
+    /// Builds currently in flight for one direction ("1 building" in the pool).
+    func buildingCount(_ direction: I2PTunnel.Direction) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return buildingCounts[direction] ?? 0
+    }
+
+    /// Build outcomes inside `window`, oldest first.
+    func buildHistory(within window: TimeInterval = buildHistoryWindow,
+                      now: Date = Date()) -> [I2PTunnelBuildRecord] {
+        lock.lock()
+        defer { lock.unlock() }
+        let cutoff = now.addingTimeInterval(-window)
+        return buildRecords.filter { $0.startedAt >= cutoff }
+    }
+
+    private func beginBuilding(_ direction: I2PTunnel.Direction) {
+        lock.lock()
+        buildingCounts[direction, default: 0] += 1
+        lock.unlock()
+    }
+
+    private func finishBuilding(_ direction: I2PTunnel.Direction,
+                                hopCount: Int,
+                                started: Date,
+                                latency: TimeInterval?,
+                                returnCode: UInt8?,
+                                succeeded: Bool) {
+        lock.lock()
+        buildingCounts[direction] = max(0, (buildingCounts[direction] ?? 1) - 1)
+        buildRecords.append(I2PTunnelBuildRecord(
+            id: nextBuildRecordID,
+            startedAt: started,
+            direction: direction,
+            hopCount: hopCount,
+            latency: latency,
+            returnCode: returnCode,
+            succeeded: succeeded))
+        nextBuildRecordID += 1
+        // The screen reads an hour; drop anything older so a long-running
+        // router does not grow the list without bound.
+        let cutoff = Date().addingTimeInterval(-Self.buildHistoryWindow)
+        if buildRecords.count > 240 || (buildRecords.first?.startedAt ?? cutoff) < cutoff {
+            buildRecords.removeAll { $0.startedAt < cutoff }
+        }
+        lock.unlock()
+    }
+
     /// Builds tunnels until both pools meet their targets, staggering
     /// consecutive builds so pool creation is spread out — including the
     /// hand-off from the outbound to the inbound pool, which otherwise fires
@@ -251,7 +357,10 @@ final class I2PTunnelPool {
         guard beginFilling() else { return }
         defer { endFilling() }
         var builtAny = false
-        for direction in [I2PTunnel.Direction.outbound, .inbound] {
+        // Inbound first: the pool's outbound builds take one of these tunnels as
+        // their reply route ("Reply through existing inbound D-E-F"), so outbound
+        // first would leave every reply with nowhere to land.
+        for direction in [I2PTunnel.Direction.inbound, .outbound] {
             // A failed build benched its hops, so the next attempt draws a fresh
             // path: retry a few times instead of giving up on the direction at
             // the first unreachable hop (which left the live pool at zero).
@@ -276,7 +385,9 @@ final class I2PTunnelPool {
     /// tunnels nearing expiration so the pool never drains.
     func maintain() async {
         pruneExpired()
-        for direction in [I2PTunnel.Direction.outbound, .inbound] {
+        // Inbound first, then outbound: a replacement outbound tunnel needs a
+        // live inbound tunnel to answer through, and one may have just expired.
+        for direction in [I2PTunnel.Direction.inbound, .outbound] {
             let active = activeCount(direction)
             let expiring = expiringCount(direction)
             let needed = min(2, max(0, targetCount(direction) + expiring - active))

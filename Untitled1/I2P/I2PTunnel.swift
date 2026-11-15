@@ -104,6 +104,29 @@ extension I2PTunnelPeerProvider {
 protocol I2PTunnelBuildTransport: AnyObject {
     func sendBuild(_ message: I2PTunnelBuildMessage, to routerHash: Data)
     func sendBuildReply(_ body: Data, to routerHash: Data)
+
+    /// Delivers a build reply to the end of the creator's reply tunnel: the
+    /// tunnel-creation spec's "Reply through existing inbound D-E-F", where an
+    /// outbound endpoint cannot dial a creator behind NAT and therefore answers
+    /// the reply route the creator named in its record (flags bit 6).
+    func sendBuildReply(_ body: Data, throughTunnel tunnelID: UInt32, to gatewayRouterHash: Data)
+
+    /// Whether a reply addressed to a tunnel ID really reaches that tunnel's
+    /// endpoint. Default false: a transport that cannot carry tunnel traffic
+    /// (the loopback hub) must never be handed a tunnel reply route, because the
+    /// reply would be lost inside a tunnel nothing forwards.
+    var supportsTunnelBuildReplies: Bool { get }
+}
+
+extension I2PTunnelBuildTransport {
+    var supportsTunnelBuildReplies: Bool { false }
+
+    /// A transport without tunnel delivery falls back to the direct send, which
+    /// is what its reply route means in that case (the caller checks
+    /// `supportsTunnelBuildReplies` before choosing a tunnel route).
+    func sendBuildReply(_ body: Data, throughTunnel tunnelID: UInt32, to gatewayRouterHash: Data) {
+        sendBuildReply(body, to: gatewayRouterHash)
+    }
 }
 
 /// Test/development message bus connecting participants directly.
@@ -291,12 +314,14 @@ final class I2PTunnelParticipant {
 
         let code = acceptanceCode(for: record)
         if code != I2PTunnelBuildReturnCode.accepted.rawValue {
-            // Reject: reply immediately with our record; do not forward.
+            // Reject: reply immediately with our record; do not forward. The
+            // rejection travels the same route an acceptance would, so a creator
+            // behind NAT learns why its build failed.
             initiateReply(recordCount: message.records.count,
                           recordIndex: UInt8(match.index),
                           material: match.material,
                           code: code,
-                          to: source)
+                          route: replyRoute(for: record, source: source))
             return
         }
 
@@ -331,10 +356,30 @@ final class I2PTunnelParticipant {
                           recordIndex: UInt8(match.index),
                           material: match.material,
                           code: I2PTunnelBuildReturnCode.accepted.rawValue,
-                          to: source)
+                          route: replyRoute(for: record, source: source))
         } else {
             transport.sendBuild(message, to: record.nextHopHash)
         }
+    }
+
+    /// Where this hop's build reply goes.
+    ///
+    /// A transit hop and an inbound gateway answer the router the build came
+    /// from, so the reply walks back along the message path and every hop adds
+    /// its own record. An outbound endpoint does not: flags bit 6 means "send
+    /// the reply to the specified next hop in a Tunnel Build Reply Message", and
+    /// that next hop is the creator's reply route — normally one of its inbound
+    /// tunnels — because an outbound endpoint cannot dial a creator behind NAT.
+    /// Answering the previous hop instead left the creator waiting for a reply
+    /// that the reply tunnel never carried, so every tunnel another router built
+    /// through this one looked rejected to its creator.
+    private func replyRoute(for record: I2PTunnelBuildRequestRecord,
+                            source: Data) -> (gateway: Data, tunnelID: UInt32) {
+        guard record.flags & I2PTunnelBuildRequestRecord.flagOutboundEndpoint != 0,
+              !record.nextHopHash.allSatisfy({ $0 == 0 }) else {
+            return (gateway: source, tunnelID: 0)
+        }
+        return (gateway: record.nextHopHash, tunnelID: record.nextTunnelID)
     }
 
     /// Receives a reply body on the build's way back: re-encrypts the other
@@ -442,7 +487,7 @@ final class I2PTunnelParticipant {
                                recordIndex: UInt8,
                                material: I2PTunnelBuildReplyMaterial,
                                code: UInt8,
-                               to target: Data) {
+                               route: (gateway: Data, tunnelID: UInt32)) {
         guard let own = try? I2PTunnelBuildCrypto.encryptReplyRecord(
             I2PTunnelBuildReplyRecord(receiveTunnelID: 0, returnCode: code),
             material: material,
@@ -452,7 +497,15 @@ final class I2PTunnelParticipant {
         }
         if records.count > Int(recordIndex) { records[Int(recordIndex)] = own }
         let reply = I2PTunnelBuildReply(encryptedRecords: records)
-        transport.sendBuildReply(reply.serialize(), to: target)
+        let body = reply.serialize()
+        // A reply route with a tunnel ID is the creator's inbound tunnel: the
+        // reply has to be carried through it, not addressed to the gateway as a
+        // standalone message.
+        if route.tunnelID != 0, transport.supportsTunnelBuildReplies {
+            transport.sendBuildReply(body, throughTunnel: route.tunnelID, to: route.gateway)
+        } else {
+            transport.sendBuildReply(body, to: route.gateway)
+        }
     }
 }
 
@@ -680,26 +733,65 @@ final class I2PTunnelBuilder {
         results[messageID] = nil
         return result
     }
-    /// Peels the reply one hop layer at a time and maps per-hop accept/reject
-    /// codes. Every hop on the way back re-encrypts the later slots with its own
-    /// reply key, so the creator unwraps slot n+1... with hop n's key before
-    /// opening slot n.
+    /// Opens one reply slot in either shape a reply can arrive in.
+    ///
+    /// A rejection walks back along the build path, so every hop before the
+    /// reporting one has already XORed its ChaCha20 keystream over the later
+    /// slots; undoing those layers recovers the record (XOR is commutative, so
+    /// the order the hops applied them in does not matter). An acceptance that
+    /// came through the creator's reply tunnel has no such layers — only the
+    /// endpoint wrote a record — and opens as it arrived.
+    private static func openReplySlot(_ records: [Data],
+                                      index: Int,
+                                      materials: [I2PTunnelBuildReplyMaterial]) -> I2PTunnelBuildReplyRecord? {
+        guard index < records.count, index < materials.count else { return nil }
+        let material = materials[index]
+        let recordIndex = UInt8(index)
+        if let record = try? I2PTunnelBuildCrypto.decryptReplyRecord(
+            records[index], material: material, recordIndex: recordIndex) {
+            return record
+        }
+        var peeled = records[index]
+        for earlier in 0..<index {
+            peeled = I2PTunnelBuildCrypto.reencryptReplyRecord(
+                peeled, material: materials[earlier], recordIndex: recordIndex)
+        }
+        return try? I2PTunnelBuildCrypto.decryptReplyRecord(
+            peeled, material: material, recordIndex: recordIndex)
+    }
+
+    /// Peels the reply and maps per-hop accept/reject codes.
+    ///
+    /// Two reply shapes reach the creator and both must be readable:
+    ///  * a rejection comes back along the *build* path, so every hop up to the
+    ///    one that refused has re-encrypted the later slots with its own reply
+    ///    key and installed its own record — the creator unwraps slot n+1... with
+    ///    hop n's key before opening slot n;
+    ///  * an acceptance comes back through the creator's reply tunnel (the spec's
+    ///    "Reply through existing inbound D-E-F"), so only the outbound endpoint's
+    ///    record was ever written and the remaining slots are the random filler it
+    ///    sent. Treating an unfilled slot as corruption rejected every build whose
+    ///    reply took a tunnel — the only route a creator behind NAT can offer.
+    ///
+    /// The endpoint's record is what success requires: a reply whose last slot
+    /// does not open never authenticated the build. A record that opens and
+    /// refuses fails the build whatever the other slots hold.
     private func consume(_ reply: I2PTunnelBuildReply) {
         lock.lock()
         var matched: (id: UInt32, context: BuildContext)?
         for (id, context) in contexts
         where context.replyMaterials.count == reply.encryptedRecords.count {
-            let first = context.replyMaterials.first
-            let decodes = first.map { material in
-                (try? I2PTunnelBuildCrypto.decryptReplyRecord(
-                    reply.encryptedRecords[0],
-                    material: material,
-                    recordIndex: 0)) != nil
-            } ?? false
-            if decodes {
-                matched = (id, context)
-                break
+            // Any slot can carry this context's record: the reply's author is the
+            // endpoint (last slot) on an acceptance and the refusing hop on a
+            // rejection, and only the AEAD decides which slot belongs to us.
+            for index in 0..<context.replyMaterials.count {
+                if Self.openReplySlot(reply.encryptedRecords, index: index,
+                                      materials: context.replyMaterials) != nil {
+                    matched = (id, context)
+                    break
+                }
             }
+            if matched != nil { break }
         }
         guard let matched else {
             lock.unlock()
@@ -708,25 +800,29 @@ final class I2PTunnelBuilder {
         contexts[matched.id] = nil
         lock.unlock()
 
-        var records = reply.encryptedRecords
-        for (hopIndex, material) in matched.context.replyMaterials.enumerated() {
-            if hopIndex + 1 < records.count {
-                for slot in (hopIndex + 1)..<records.count {
-                    records[slot] = I2PTunnelBuildCrypto.reencryptReplyRecord(
-                        records[slot], material: material, recordIndex: UInt8(slot))
-                }
+        var rejection: UInt8?
+        var endpointAccepted = false
+        let lastIndex = matched.context.replyMaterials.count - 1
+        for index in 0..<matched.context.replyMaterials.count {
+            guard let record = Self.openReplySlot(reply.encryptedRecords,
+                                                  index: index,
+                                                  materials: matched.context.replyMaterials) else {
+                continue // filler: this hop never wrote a reply into the slot
             }
-            do {
-                let record = try I2PTunnelBuildCrypto.decryptReplyRecord(
-                    records[hopIndex], material: material, recordIndex: UInt8(hopIndex))
-                if record.returnCode != I2PTunnelBuildReturnCode.accepted.rawValue {
-                    storeResult(matched.id, .failed(code: record.returnCode))
-                    return
-                }
-            } catch {
-                storeResult(matched.id, .failed(code: 255))
-                return
+            if record.returnCode != I2PTunnelBuildReturnCode.accepted.rawValue {
+                rejection = record.returnCode
+                break
             }
+            if index == lastIndex { endpointAccepted = true }
+        }
+        if let rejection {
+            storeResult(matched.id, .failed(code: rejection))
+            return
+        }
+        guard endpointAccepted else {
+            // No endpoint record: nothing authenticated this build's acceptance.
+            storeResult(matched.id, .failed(code: 255))
+            return
         }
         let completedAt = Date()
         let tunnel = makeTunnel(matched.context, completedAt: completedAt)

@@ -64,6 +64,78 @@ final class NTCP2Session: NSObject {
     private var handshakeBytesOut = 0
     private var sessionCreatedReceived = false
 
+    // MARK: - Idle/keepalive bookkeeping (NTCP2 §Data Phase)
+
+    /// How long a session may stay silent before this router sends a keepalive
+    /// frame. Reference routers expire an idle connection with a Termination
+    /// block (reason 2) once *their* budget runs out, and Java I2P's budget is
+    /// adaptive — it can shrink to about two minutes under connection pressure —
+    /// so waiting for the nominal ~11 minute ceiling gets the session killed by
+    /// the peer first. A minute of silence is well under any implementation's
+    /// minimum budget and costs one small frame.
+    static let keepaliveQuietInterval: TimeInterval = 60
+
+    /// The last time this session sent or received anything.
+    private var lastActivity = Date()
+    /// The last time this session **sent** something. The peer's idle timer runs
+    /// on bytes it *receives*, so a session that only hears from the peer still
+    /// has to send its own keepalive — counting received traffic as activity
+    /// leaves both sides waiting on each other until the peer expires us.
+    private var lastSent = Date()
+    /// Pending keepalive timer.
+    private var keepaliveTask: Task<Void, Never>?
+
+    /// Stops the keepalive timer (handshake failure, termination, close).
+    private func stopKeepalive() {
+        keepaliveTask?.cancel()
+        keepaliveTask = nil
+    }
+
+    /// Arms a repeating timer that sends a datetime-block keepalive frame
+    /// whenever this session has not *sent* anything for
+    /// `keepaliveQuietInterval`. Received traffic does not postpone it: the
+    /// peer's idle clock counts the bytes it receives from us, so only our own
+    /// sends keep the session alive in its view.
+    private func armKeepalive() {
+        stopKeepalive()
+        keepaliveTask = Task { [weak self] in
+            while let self, !Task.isCancelled {
+                let quiet = Date().timeIntervalSince(self.lastSent)
+                let next = max(Self.keepaliveQuietInterval - quiet, 5)
+                try? await Task.sleep(for: .seconds(next))
+                guard !Task.isCancelled, self.state == .established else { break }
+                guard Date().timeIntervalSince(self.lastSent) >= Self.keepaliveQuietInterval - 5 else {
+                    continue
+                }
+                self.sendKeepalive()
+            }
+        }
+    }
+
+    /// Sends a data-phase frame carrying only the datetime block: the spec's
+    /// time-sync block is exactly what reference routers exchange when they
+    /// have nothing else to send (Java I2P's NTCP2Payload.DateTimeBlock), and it
+    /// is what keeps a quiet session from being expired by the peer.
+    private func sendKeepalive() {
+        guard state == .established, let codec = sendCodec else { return }
+        do {
+            var payload = try NTCP2Block.encode(NTCP2Block.keepalive(at: Date()))
+            payload = NTCP2Block.aligned(payload)
+            let frame = try codec.frame(payload)
+            lastSent = Date()
+            lastActivity = Date()
+            connection.send(content: frame, completion: .contentProcessed { [weak self] error in
+                if let error {
+                    // The keepalive failing is a transport failure like any
+                    // other: close with its cause instead of timing out blind.
+                    self?.finish(error: error)
+                }
+            })
+        } catch {
+            finish(error: error)
+        }
+    }
+
     var isEstablished: Bool { state == .established }
 
     init(role: Role,
@@ -87,6 +159,10 @@ final class NTCP2Session: NSObject {
         self.remoteStaticKey = remoteStaticKey
         self.expectedRemoteRouterHash = remoteRouterHash
         self.expectedRemoteIV = remoteIV
+        // The initiator knows the peer it dialed before any handshake byte:
+        // naming it in a session ending (rather than "unknown") is what the
+        // live audit's session-endings line reads.
+        if role == .initiator { self.remoteRouterHash = remoteRouterHash }
         self.queue = queue
     }
 
@@ -112,10 +188,21 @@ final class NTCP2Session: NSObject {
             }
         }
         connection.start(queue: queue)
-        // A peer that accepts TCP and then never answers would otherwise hold a
-        // session slot indefinitely: bound the handshake phase.
-        queue.asyncAfter(deadline: .now() + 20) { [weak self] in
+        // A dead endpoint must not hold a session slot for the whole handshake
+        // budget: bound the *connect* phase here, and start the handshake clock
+        // only when message 1 actually goes out (see beginHandshakeIfNeeded).
+        // Peers that accept TCP and then never answer look identical to dead
+        // addresses otherwise, and a rota of candidates stalls behind them.
+        queue.asyncAfter(deadline: .now() + 8) { [weak self] in
             guard let self, self.state == .handshaking else { return }
+            if self.role == .initiator, self.initiator == nil {
+                self.finish(error: NTCP2Error.handshakeFailed("peer did not accept the TCP connection within 8s"))
+            }
+        }
+        // A responder session is bounded from accept: the initiator must send
+        // message 1 promptly, so a silent socket is dropped there too.
+        queue.asyncAfter(deadline: .now() + 20) { [weak self] in
+            guard let self, self.role == .responder, self.state == .handshaking else { return }
             self.finish(error: NTCP2Error.handshakeFailed("handshake did not complete within 20s"))
         }
     }
@@ -141,6 +228,12 @@ final class NTCP2Session: NSObject {
             initiator = engine
             let request = try engine.makeSessionRequest(routerInfo: localRouterInfoData)
             sendRaw(request)
+            // Message 1 is out: the handshake clock starts here, so the budget
+            // measures the peer's SessionCreated rather than our TCP connect.
+            queue.asyncAfter(deadline: .now() + 20) { [weak self] in
+                guard let self, self.state == .handshaking else { return }
+                self.finish(error: NTCP2Error.handshakeFailed("handshake did not complete within 20s"))
+            }
         } catch {
             finish(error: error)
         }
@@ -199,6 +292,10 @@ final class NTCP2Session: NSObject {
         recvCodec = NTCP2FrameCodec(directionKeys: keys.recvKeys)
         state = .established
         if establishedAt == nil { establishedAt = Date() }
+        // Start the idle/keepalive clock now, from the handshake's last
+        // exchange: reference routers count idle time the same way.
+        lastActivity = Date()
+        armKeepalive()
 
         if asInitiator {
             // The peer's router hash is known from the RouterInfo we dialed
@@ -207,8 +304,7 @@ final class NTCP2Session: NSObject {
             // now rather than waiting for a block that may never arrive.
             if remoteRouterHash == nil { remoteRouterHash = expectedRemoteRouterHash }
             notifyEstablishedIfNeeded()
-        } else {
-            // Responder announces its RouterInfo in the first data-phase frame.
+        } else {            // Responder announces its RouterInfo in the first data-phase frame.
             var payload = try NTCP2Block.encode([.routerInfo(localRouterInfoData), .time(Date())])
             payload = NTCP2Block.aligned(payload)
             if let codec = sendCodec {
@@ -237,6 +333,9 @@ final class NTCP2Session: NSObject {
             if let data, !data.isEmpty {
                 if self.state == .handshaking { self.handshakeBytesIn += data.count }
                 self.rxBuffer += data
+                // Any inbound bytes feed the idle timer, exactly as they do for
+                // reference routers' connections.
+                self.lastActivity = Date()
                 self.drainBuffer()
             }
             if isComplete || error != nil {
@@ -286,6 +385,10 @@ final class NTCP2Session: NSObject {
         for block in blocks {
             switch block {
             case .padding, .options, .time:
+                // A datetime block is the keepalive reference routers send
+                // when they have nothing else to say (their own traffic shape
+                // across idle windows); the receive hook above already fed
+                // the idle timer with the frame's bytes.
                 break
             case .routerInfo(let data):
                 if let parsed = try? I2PRouterInfo.parse(data) {
@@ -317,7 +420,7 @@ final class NTCP2Session: NSObject {
                 // which check this router failed on the peer's side.
                 terminationReason = reason
                 I2PSecurityAuditLog.append(category: "transport",
-                                           detail: "ntcp2 \(role) peer sent termination reason \(reason) after \(frames) valid frame(s)")
+                                           detail: "ntcp2 \(role) peer sent termination reason \(reason) (\(NTCP2TerminationReason(rawValue: reason).map(String.init(describing:)) ?? "unknown")) after \(frames) valid frame(s)")
                 finish(error: nil)
                 return
             }
@@ -344,6 +447,7 @@ final class NTCP2Session: NSObject {
             throw NTCP2Error.notEstablished
         }
         bytesOut += shortMessage.count
+        lastActivity = Date()
         var payload = try NTCP2Block.encode([.data(shortMessage), .time(Date())])
         payload = NTCP2Block.aligned(payload)
         sendRaw(try codec.frame(payload))
@@ -351,6 +455,7 @@ final class NTCP2Session: NSObject {
 
     private func sendRaw(_ data: Data) {
         if state == .handshaking { handshakeBytesOut += data.count }
+        lastSent = Date()
         connection.send(content: data, completion: .contentProcessed { [weak self] error in
             if let error { self?.finish(error: error) }
         })
@@ -382,6 +487,7 @@ final class NTCP2Session: NSObject {
 
     private func finish(error: Error?) {
         guard state != .closed else { return }
+        stopKeepalive()
         let wasHandshaking = state == .handshaking
         state = .closed
         connection.cancel()
@@ -421,7 +527,28 @@ final class NTCP2Session: NSObject {
             I2PSecurityAuditLog.append(category: "transport",
                                        detail: "ntcp2 \(role) peer hung up mid-handshake \(phase) after \(handshakeBytesIn) bytes in / \(handshakeBytesOut) bytes out")
         } else {
-            closeReason = terminationReason.map { "peer terminated: reason \($0)" } ?? "peer closed the session"
+            // A Termination block names which check the peer failed (the
+            // spec's reason codes); a peer close without one is just a hangup.
+            if let reason = terminationReason {
+                // The reason code's name is what the live audit reads, so the
+                // lookup is shared by the close line and the audit entry.
+                let named = NTCP2TerminationReason(rawValue: reason)
+                var line = "peer terminated: reason \(reason)"
+                if let named {
+                    line += " (\(String(describing: named)))"
+                }
+                closeReason = line
+                // Every termination is recorded with the session's traffic and
+                // the reference reason code's name: an idle-timeout
+                // termination is a router-management close, not a failure of
+                // ours, and the transport keeps the dialable peer in its
+                // candidate set either way.
+                let reasonName = named.map { String(describing: $0) } ?? "unknown"
+                I2PSecurityAuditLog.append(category: "transport",
+                                           detail: "ntcp2 \(role) peer sent termination reason \(reason) (\(reasonName)) after \(bytesIn) bytes in / \(bytesOut) bytes out")
+            } else {
+                closeReason = "peer closed the session"
+            }
         }
         delegate?.session(self, didClose: error)
     }
@@ -498,6 +625,19 @@ final class NTCP2Transport {
     private var sessionsByHash: [Data: NTCP2Session] = [:]
     private var recentCloseReasons: [String] = []
     private let sessionLedger = I2PResourceLedger()
+    /// TCP connections the listener has accepted since launch. Peers can only
+    /// hand us a tunnel build over a new inbound connection (the first build of
+    /// any tunnel arrives that way), so a count that stays at zero while we
+    /// advertise an address is what a NAT or firewall looks like from here —
+    /// and a count above zero with no builds is a real selection finding.
+    private var acceptedInboundConnections = 0
+
+    /// TCP connections the listener has accepted since launch.
+    var inboundConnectionCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return acceptedInboundConnections
+    }
 
     init(localRouterInfo: I2PRouterInfo, staticKey: Curve25519.KeyAgreement.PrivateKey,
          localStaticPublicKey: Data? = nil) {
@@ -577,6 +717,9 @@ final class NTCP2Transport {
         let nwListener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: port) ?? .any)
         nwListener.newConnectionHandler = { [weak self] connection in
             guard let self else { return }
+            self.lock.lock()
+            self.acceptedInboundConnections += 1
+            self.lock.unlock()
             let advertised = self.currentRouterInfo()
             let session = NTCP2Session(role: .responder,
                                        connection: connection,

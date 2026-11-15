@@ -328,11 +328,33 @@ struct RouterDashboardView: View {
     // MARK: - Tunnels
 
     private func tunnelsCard(_ snapshot: I2PRouterStatusSnapshot) -> some View {
-        card(title: "Tunnel Pools") {
+        VStack(alignment: .leading, spacing: 10) {
+            NavigationLink {
+                TunnelHealthView()
+            } label: {
+                HStack(spacing: 6) {
+                    Text("Tunnel Pools")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .textCase(.uppercase)
+                    Spacer(minLength: 6)
+                    Text("Health")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(accent)
+                    Image(systemName: "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
             ForEach(snapshot.pools, id: \.direction) { pool in
                 poolSection(pool)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 18))
     }
 
     @ViewBuilder

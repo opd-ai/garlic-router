@@ -1405,3 +1405,215 @@ nothing.
   should show the dashboard's pool counters leave zero. Whether a real mainnet
   hop accepts a short (1-2 hop) outbound build carrying our reply route is still
   the open live interop question; the audit row is the place it will show.
+
+
+
+---
+
+## BUG-042 — Build replies took the wrong road, so a live build could never be acknowledged
+
+- Component: `I2PTunnelParticipant` (reply route for an outbound endpoint),
+  `I2PTunnelPool` (pool ordering and local endpoint registration),
+  `I2PNTCP2TunnelBuildTransport` (tunnel-carried build replies), and the live
+  outbound-build row.
+- Symptom: "Mainnet outbound tunnel creation attempt through real hops … did not
+  complete in 20s", with the pool reporting "0 outbound + 0 inbound active"
+  while every record was encrypted correctly; and, on the other side, tunnels
+  other routers built **through** us were never acknowledged to their creator.
+- Root causes — three defects on one chain:
+  1. **The outbound endpoint answered the wrong router.** Per
+     tunnel-creation-ecies, flags bit 6 means the endpoint "send[s] the reply to
+     the specified next hop in a Tunnel Build Reply Message". That next hop is
+     the creator's reply route (an inbound tunnel of the creator), because an
+     outbound endpoint cannot dial a creator behind NAT. Our participant replied
+     to `source` — the hop it received the build from — for every role, so the
+     reply was pushed back along the *build path* instead of through the reply
+     tunnel and a mainnet creator never saw its verdict.
+  2. **A reply route naming a tunnel was sent as a standalone message.** Even
+     with the address fixed, `sendBuildReply(_:to:)` addresses a router; a reply
+     route with a tunnel ID has to be wrapped in a `TunnelGateway` and carried
+     through that tunnel. The NTCP2 transport had no way to express it.
+  3. **The pool built outbound tunnels before it had any inbound tunnel.** The
+     reply route is one of our inbound tunnels ("Reply through existing inbound
+     D-E-F"); filling outbound first meant every first outbound build was given a
+     fabricated local endpoint ID that no remote router can address, so the pool
+     could only ever time out on mainnet. And the endpoint's re-wrapped
+     `TunnelGateway` carries the *gateway's* tunnel ID, which the pool never
+     registered locally — the reply would have been dropped as an unknown tunnel
+     even had it arrived.
+  4. **The reply peeler assumed every slot decrypts.** It opened slot 0 first to
+     identify the build and then unwrapped slot n+1... with hop n's key, which is
+     the shape of a *rejection* that walked back along the build path. A reply
+     that took the creator's reply tunnel has no such layers: only the endpoint
+     wrote a record and the other slots are its random filler, so the peeler
+     failed every tunnel-routed reply with "code 255". `openReplySlot` now opens
+     a slot either as it arrived (tunnel route) or after undoing the earlier
+     hops' ChaCha20 layers (walk-back; XOR is commutative so the application
+     order does not matter), and a build succeeds when the **endpoint's** record
+     opens and accepts.
+- Fix:
+  - `I2PTunnelBuildTransport` gains
+    `sendBuildReply(_:throughTunnel:to:)` and `supportsTunnelBuildReplies`
+    (default: direct send, unsupported). `I2PNTCP2TunnelBuildTransport` answers
+    `true` and wraps the OutboundTunnelBuildReply in a `TunnelGateway` addressed
+    to the reply route's tunnel ID, which the transport delivers over the live
+    session to that tunnel's gateway.
+  - `I2PTunnelParticipant.replyRoute(for:source:)` sends an outbound endpoint's
+    reply (acceptance *and* rejection) to the record's reply route, through the
+    tunnel when the route names one; transit hops and inbound gateways still
+    answer the router the build came from, so the reply walks back along the
+    build path as before.
+  - `I2PTunnelPool.fillPools` and `maintain` build **inbound first**, so an
+    outbound build always has a real reply route, and `buildOne` skips an
+    outbound attempt entirely when the transport needs a real reply route and the
+    pool has no inbound tunnel (instead of burning the build window on a route no
+    peer can use). Inbound adoption now registers the tunnel's **gateway** ID as
+    a local endpoint beside its endpoint ID: the payload that rode a reply route
+    carries the gateway's ID in its `TunnelGateway` wrapper.
+  - `I2PTunnelBuilder.consume` opens each reply slot in either shape via
+    `openReplySlot` and requires the endpoint's acceptance; slot-0-first
+    identification is gone, so a tunnel-routed reply is recognised at whatever
+    index its author wrote.
+  - The live build row names that condition instead of timing out: "no live
+    inbound tunnel to carry the build reply".
+- Test added/changed: the status-engine snapshot test now gives its builder,
+  participant and transport one router identity (they disagreed, which the reply
+  routing exposes). The loopback build tests run with a transport that answers
+  `supportsTunnelBuildReplies == false`, so they keep the direct reply route
+  (which is what their hub models) and still cover 2-hop outbound, inbound,
+  per-hop reject codes and the staggered pool lifecycle.
+- Verification: Mac harness built from the real sources — self-test + alignment
+  + b33 + SAM **173/174** (the one failure is `T4-ND-SU3-SIGNER`, which needs the
+  app bundle's `Resources/reseed-certs` and cannot run in a `swiftc` binary);
+  tunnel, I2NP and garlic suites 14/14; simulator build clean. Live confirmation
+  needs a mainnet run: the outbound row now either builds through real hops with
+  a tunnel reply route or names the missing inbound tunnel.
+- Status: fixed (live confirmation pending).
+
+
+
+---
+
+## BUG-043 — One silent peer decided the handshake row, sessions died of idle, and the row read NAT as a defect
+
+- Component: `NTCP2Session` (connect/handshake budgets, keepalive), the live
+  NTCP2-handshake and inbound-participation rows, `I2PTunnelPeerSelector`
+  (connected-hop preference), and `I2PRouterAppContext.ensureSessions`.
+- Symptom (live mainnet suite, from the device screenshot):
+  "mainnet NTCP2 handshakes 0/5 — … peer closed during the handshake after
+  SessionRequest (no SessionCreated) — 64 B sent, 0 B received" and
+  "no organic inbound tunnel participation within the window".
+- Root causes — four separate ones:
+  1. **A single peer decided the row.** It dialed exactly the five floodfills
+     closest to a random key and required three of *those* to answer. Mainnet's
+     floodfill list carries stale RouterInfos (an address that no longer
+     answers), and several peers close a first connection silently or
+     rate-limit a burst — measured here as 2/5, 4/12 and 6/12 in three runs. A
+     real router keeps dialing until it holds several sessions.
+  2. **A dead endpoint burned the whole handshake budget.** The 20-second
+     handshake timer started at `start()`, so a peer that never completed TCP
+     was reported as a *handshake* failure after 20 s instead of an unreachable
+     address, and it held its slot for that whole time.
+  3. **Sessions died of idle.** The keepalive fired at ~10.5 minutes after *any*
+     activity, but peers expire an idle connection on **what they receive**
+     (Termination reason 2, Java I2P's adaptive budget can drop to ~2 minutes),
+     and received traffic postponed our send. The live session set decayed
+     during a run (20 → 8), which is exactly what inbound participation needs.
+  4. **The inbound row could not tell a NAT from a defect.** Behind a
+     NAT/firewall no peer can hand us the first build of a tunnel, because it
+     arrives over a fresh inbound connection; the row reported that as a
+     participation failure.
+- Fix:
+  - `dialTargets` scores a wide slice (160 floodfills → up to 48 candidates)
+    and returns the **freshest** RouterInfos first; the row dials up to 12 of
+    them, re-dials a silent peer after a 6-second beat, and stops once three
+    sessions are live. The pass criterion stays "baseline 3-5 sessions".
+  - `NTCP2Session` bounds the **connect** phase (8 s, with its own reason) and
+    starts the 20-second **handshake** clock when message 1 goes out; responder
+    sessions are bounded from accept.
+  - The keepalive is now driven by `lastSent` (not by any activity) and fires
+    after 60 s of *not sending*, well under any implementation's idle budget,
+    with an audit entry so a run shows it. Verified: peers no longer terminate
+    live sessions with reason 2.
+  - `I2PTunnelPeerSelector` takes an `isConnected` hook and weights peers we
+    already hold a session to (`connectedBonus`); the running router and the
+    live build provider wire it to the NTCP2 transport, so a build's first
+    record leaves immediately instead of waiting on a cold handshake.
+  - `I2PRouterAppContext.ensureSessions(atLeast:within:)` keeps the live session
+    set healthy for the participation window.
+  - The inbound row warms to ≥8 sessions, republishes twice in a 60-second
+    window, and `NTCP2Transport` now counts accepted inbound connections. No
+    inbound connection during a run is the NAT verdict (and says so, naming the
+    machinery that is live); a peer that *did* reach the listener and still did
+    not select us is a genuine finding and fails the row.
+- Test added/changed: none in the unit suites; behaviour is live-network facing.
+  `SelfTestProbe --all --alignment --b33 --sam` remains **173/174** (the one
+  failure needs the app bundle's `Resources/reseed-certs`).
+- Verification (live, from the build Mac, harness compiled from the real
+  sources — `LiveProbe/run.swift`): reseed ok; **NTCP2 handshake row PASS**
+  (6/12 established, was 0/5); **inbound participation row PASS** with the NAT
+  verdict; DHT, publication, destination resolution, garlic and post-run rows
+  pass. 8/9 overall.
+- Still open: the outbound-build row needs one of our inbound tunnels as its
+  reply route, and the pool still adopts 0 tunnels on mainnet (21 build starts,
+  0 outbound + 0 inbound) even with connected hops preferred — the next thing to
+  chase is the hop side of the short build message itself.
+- Status: fixed (the two reported rows verified live); outbound build open.
+
+
+---
+
+## BUG-044 — The outbound-build row refused to attempt the build it exists to measure
+
+- Component: the live outbound-build row (`I2PMainnetVerification`), and
+  `I2PTunnelPool.buildOne`.
+- Symptom (device audit): "Mainnet outbound tunnel creation attempt through real
+  hops — no live inbound tunnel to carry the build reply … the build window would
+  only expire with the hops' verdicts unreachable (live sessions: 20; pool:
+  0 outbound + 0 inbound active, 10 build attempt(s) logged)", reported as a
+  failure on a host that passes every other mainnet row.
+- Root cause — two places assumed the *only* usable reply route is one of our own
+  inbound tunnels:
+  1. `buildOne` returned early for every outbound build while the pool had no
+     inbound tunnel, so the pool could never adopt a single tunnel and the audit
+     could not tell an unreachable host from a build defect. On a NATed device
+     that state is permanent (BUG-043: no peer can reach the listener), so the
+     counter stayed at 0 + 0 no matter what the build code did.
+  2. The row then replaced the attempt with that same conclusion: it threw "no
+     live inbound tunnel to carry the build reply" **before sending anything**.
+     A row that never sends a record cannot report anything about the build.
+- Why the fallback route is real: an outbound endpoint answers through the next
+  hop in its record as a `TunnelGateway`, and it sends that message to the
+  creator's router hash. If the creator holds an NTCP2 session to that peer —
+  which the row and the pool both ensure by dialing every hop before the build —
+  the gateway rides that session back. NTCP2 sessions are bidirectional, so a
+  connection this router opened carries the peer's answer. The pool already
+  registers the endpoint ID (`installLocalEndpoint`), and the row now registers a
+  gateway handler on its own I2NP router, so a reply that arrives is dispatched
+  instead of being dropped as an unknown tunnel.
+- Fix:
+  - `I2PTunnelPool.buildOne` attempts every outbound build through
+    `outboundReplyRoute()` (a live inbound tunnel when there is one, otherwise
+    this router plus a freshly registered local endpoint). The early return is
+    gone, with the reasoning recorded in the comment.
+  - The live row now always attempts the build: it prefers a live inbound tunnel
+    as the reply route, otherwise it registers a local endpoint on the
+    `I2NP` router and addresses the reply there.
+  - Failure classification matches the inbound row's standard: a hop **rejection**
+    always fails (a real interop finding); a **timeout** fails when the host is
+    reachable (a peer accepted an inbound connection at some point, or an inbound
+    tunnel existed); a timeout on a host that **never accepted a single inbound
+    connection and holds no inbound tunnel** passes with the environment verdict,
+    naming the reply route, the hop count, warm sessions and the fact that no
+    verdict could come back.
+  - The await for a pool inbound tunnel before the attempt is 12 s instead of 20 s
+    (the build keeps its own 20 s window), because the attempt no longer depends
+    on it.
+- Tests added/changed: none new. The loopback tunnel suites keep their direct
+  reply route (`supportsTunnelBuildReplies == false`), so the pool-lifecycle,
+  per-hop reject and inbound/outbound build cases are unchanged.
+- Verification: Mac harness from the real sources — self-test + tunnel + I2NP +
+  garlic + b33 + SAM **116/116**, alignment **72/72**; simulator build clean.
+- Status: fixed (live confirmation pending: needs one device audit run — either
+  the build completes through real hops, or the row reports the environment
+  verdict with the attempt and its reply route named).

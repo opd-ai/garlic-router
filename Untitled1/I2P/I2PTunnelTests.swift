@@ -339,6 +339,27 @@ private static func rejectTest() async throws -> String {
             throw I2PTunnelTestFailure(
                 "fillPools reached \(pool.outboundCount) outbound / \(pool.inboundCount) inbound, expected 2 / 2")
         }
+        // Tunnel-health telemetry: every attempt is recorded with its outcome so
+        // the screen can compute a success rate, latencies and failure codes.
+        let history = pool.buildHistory()
+        guard !history.isEmpty, history.count == pool.buildStartTimes.count else {
+            throw I2PTunnelTestFailure(
+                "build history recorded \(history.count) attempts for \(pool.buildStartTimes.count) starts")
+        }
+        guard history.allSatisfy({
+            $0.succeeded
+                && $0.returnCode == I2PTunnelBuildReturnCode.accepted.rawValue
+                && ($0.latency ?? -1) >= 0
+        }) else {
+            throw I2PTunnelTestFailure("a loopback build was not recorded as accepted with a latency")
+        }
+        guard pool.buildingCount(.outbound) == 0, pool.buildingCount(.inbound) == 0 else {
+            throw I2PTunnelTestFailure("the pool still reports builds in flight after fillPools returned")
+        }
+        guard history.contains(where: { $0.direction == .inbound }),
+              history.contains(where: { $0.direction == .outbound }) else {
+            throw I2PTunnelTestFailure("build history does not cover both directions")
+        }
         // Builds must be staggered: consecutive build starts are spread out.
         let starts = pool.buildStartTimes.map { $0.timeIntervalSince(fillStarted) }
         guard starts.count == 4 else {

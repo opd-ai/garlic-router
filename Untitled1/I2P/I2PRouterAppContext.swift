@@ -243,6 +243,13 @@ final class I2PRouterAppContext {
         // peers are known (the placeholder provider returned zero candidates
         // forever — "no tunnels yet" was structural, not a bootstrap timing issue).
         let netdbPeerProvider = I2PMainnetTunnelPeerProvider(netDB: netDB)
+        // Prefer hops this router already holds a session to: the first build
+        // record has to reach its hop now, and demand-dialing a cold RouterInfo
+        // spends the build window on a handshake that often stalls — which is
+        // why the live pool logged attempts and adopted nothing.
+        netdbPeerProvider.isConnected = { [weak transport] hash in
+            transport?.hasSession(for: hash) ?? false
+        }
         tunnelPeerProvider = netdbPeerProvider
         tunnelPool = I2PTunnelPool(
             localRouterHash: routerHash,
@@ -337,6 +344,7 @@ final class I2PRouterAppContext {
         tunnelPool.start()
         engine.start()
         samServer.start()
+        startRepublishLoop()
         // Re-apply the persisted participation controls (caps, share, netdb
         // role) so a resumed router matches what the screen shows.
         Task { await applyParticipationSettings() }
@@ -353,6 +361,8 @@ final class I2PRouterAppContext {
         lifecycleState = .suspended
         bootstrapTask?.cancel()
         bootstrapTask = nil
+        republishTask?.cancel()
+        republishTask = nil
         ntcp2.shutdown()
         tunnelPool.stop()
         samServer.stop()
@@ -395,6 +405,10 @@ final class I2PRouterAppContext {
     func republishRouterInfo(floodfill: Bool) async {
         var options = mainnetRouterInfo.options
         options["caps"] = floodfill ? "f" : ""
+        // The republish cadence must be at most ~10 minutes: reference
+        // routers republish every 10 minutes, and a RouterInfo entry expires
+        // from the netdb after an hour of no republishes.
+        republishInterval = min(60 * 10, republishInterval)
         var advertised = I2PRouterInfo(
             identity: identity,
             published: Date(),
@@ -447,6 +461,30 @@ final class I2PRouterAppContext {
         // peers that compare the observed endpoint against it keep the session.
         ntcp2.updateLocalRouterInfo(advertised)
         _ = await netDB.publish(routerInfo: advertised)
+    }
+
+    /// The RouterInfo republish cadence (reference routers republish on a
+    /// ~10-minute cycle; the live pool's inbound tunnel re-publish rides the
+    /// same hook). Set by `advertiseReachableAddress` and the cycle.
+    private var republishInterval: TimeInterval = 60 * 10
+    /// The periodic republish/keepalive loop.
+    private var republishTask: Task<Void, Never>?
+
+    /// Starts the periodic republish loop (the router's publication
+    /// heartbeat): a re-signed RouterInfo goes out on the cadence
+    /// `republishInterval`, so a live netdb never holds a stale RouterInfo
+    /// for us — the one prerequisite inbound tunnel participation and
+    /// inbound handshakes have that nothing else supplies.
+    private func startRepublishLoop() {
+        guard republishTask == nil else { return }
+        republishTask = Task { [weak self] in
+            while let self, !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(self.republishInterval))
+                guard !Task.isCancelled else { break }
+                await self.republishRouterInfo(
+                    floodfill: I2PParticipationSettings.shared.floodfillEnabled)
+            }
+        }
     }
 
     // MARK: Live bootstrap
@@ -505,6 +543,32 @@ final class I2PRouterAppContext {
             }
             if ntcp2.sessionCount() >= targetSessions { break }
         }
+    }
+
+    /// Dials the closest floodfills until at least `target` NTCP2 sessions are
+    /// live or `within` seconds pass (best effort; returns the live count).
+    ///
+    /// Organic participation — a peer forwarding a tunnel build to us — rides a
+    /// live session in either direction, because an NTCP2 session is
+    /// bidirectional. The size of the live session set is what a participation
+    /// window's chance rests on, so this keeps dialing candidates until the set
+    /// is healthy instead of accepting whatever an earlier row left behind.
+    @discardableResult
+    func ensureSessions(atLeast target: Int, within: TimeInterval) async -> Int {
+        let deadline = Date().addingTimeInterval(within)
+        var attempted: Set<Data> = []
+        while Date() < deadline, ntcp2.sessionCount() < target {
+            let candidates = await netDB.selectFloodfills(for: routerHash, count: 32)
+            for hash in candidates {
+                guard ntcp2.sessionCount() < target else { break }
+                guard !ntcp2.hasSession(for: hash), !attempted.contains(hash) else { continue }
+                attempted.insert(hash)
+                _ = await dial(routerHash: hash)
+            }
+            if ntcp2.sessionCount() >= target { break }
+            try? await Task.sleep(for: .milliseconds(500))
+        }
+        return ntcp2.sessionCount()
     }
 
     /// Resolves a peer's NTCP2 endpoint from the netdb (cache-first) and

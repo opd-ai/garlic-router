@@ -17,12 +17,17 @@ struct I2PRouterStatusSnapshot {
         let id: String
         let direction: String
         let hopCount: Int
+        let createdAt: Date
         let expiresAt: Date
+        /// Gateway router identity, hex — the hop the outside world sends to.
+        let gatewayHashHex: String
         let buildLatency: TimeInterval?
     }
 
     struct PoolSummary {
         let direction: String
+        let targetCount: Int
+        let buildingCount: Int
         let tunnels: [TunnelSummary]
     }
 
@@ -41,6 +46,8 @@ struct I2PRouterStatusSnapshot {
     let uptime: TimeInterval
     // Tunnels
     let pools: [PoolSummary]
+    /// Build attempts inside the last hour, oldest first (tunnel health).
+    let tunnelBuilds: [I2PTunnelBuildRecord]
     // Message throughput
     let messagesIn: Int
     let messagesOut: Int
@@ -335,22 +342,32 @@ final class I2PRouterStatusEngine {
         if let netDB { netDBStatus = await netDB.status() }
 
         var pools: [I2PRouterStatusSnapshot.PoolSummary] = []
+        var tunnelBuilds: [I2PTunnelBuildRecord] = []
         if let tunnelPool {
-            for (direction, tunnels) in [
-                ("outbound", tunnelPool.outboundTunnels),
-                ("inbound", tunnelPool.inboundTunnels)
+            for (name, direction) in [
+                ("outbound", I2PTunnel.Direction.outbound),
+                ("inbound", I2PTunnel.Direction.inbound)
             ] {
+                let tunnels = direction == .outbound
+                    ? tunnelPool.outboundTunnels
+                    : tunnelPool.inboundTunnels
                 let summaries = tunnels.enumerated().map { index, tunnel in
                     I2PRouterStatusSnapshot.TunnelSummary(
-                        id: "\(direction)-\(index)",
-                        direction: direction,
+                        id: "\(name)-\(index)",
+                        direction: name,
                         hopCount: tunnel.hops.count,
+                        createdAt: tunnel.createdAt,
                         expiresAt: tunnel.expiresAt,
+                        gatewayHashHex: tunnel.hops.first.map { Self.hex($0.routerHash) } ?? "",
                         buildLatency: tunnel.buildLatency
                     )
                 }
-                pools.append(.init(direction: direction, tunnels: summaries))
+                pools.append(.init(direction: name,
+                                   targetCount: tunnelPool.targetCount(direction),
+                                   buildingCount: tunnelPool.buildingCount(direction),
+                                   tunnels: summaries))
             }
+            tunnelBuilds = tunnelPool.buildHistory()
         }
 
         let peers = await peerSummaries(tunnelPool: tunnelPool)
@@ -358,6 +375,7 @@ final class I2PRouterStatusEngine {
         return sample(netDBStatus: netDBStatus,
                       ntcp2SessionCount: ntcp2?.sessionCount() ?? 0,
                       pools: pools,
+                      tunnelBuilds: tunnelBuilds,
                       peers: peers)
     }
 
@@ -423,6 +441,7 @@ final class I2PRouterStatusEngine {
     private func sample(netDBStatus: I2PNetDBStatus?,
                         ntcp2SessionCount: Int,
                         pools: [I2PRouterStatusSnapshot.PoolSummary],
+                        tunnelBuilds: [I2PTunnelBuildRecord],
                         peers: [I2PPeerSummary]) -> I2PRouterStatusSnapshot {
         // The tunnel participant owns its own lock; read it before taking ours
         // so the lock order stays one-way.
@@ -449,6 +468,7 @@ final class I2PRouterStatusEngine {
             leaseSetCount: netDBStatus?.leaseSetCount ?? 0,
             uptime: now.timeIntervalSince(startedAt),
             pools: pools,
+            tunnelBuilds: tunnelBuilds,
             messagesIn: messagesIn,
             messagesOut: messagesOut,
             bytesIn: bytesIn,
@@ -595,15 +615,19 @@ enum I2PRouterStatusSelfTest {
         let localNode = StatusTestNode(hub: buildHub)
         let hop1 = StatusTestNode(hub: buildHub)
         let hop2 = StatusTestNode(hub: buildHub)
+        // The builder, its participant and its transport are one node: they must
+        // agree on this router's hash, or the endpoint's reply route (this router,
+        // as the creator of a build with no inbound tunnel) names a router the
+        // hub cannot deliver to.
         let pool = I2PTunnelPool(
-            localRouterHash: localHash,
+            localRouterHash: localNode.routerHash,
             participant: localNode.participant,
             transport: localNode.transport,
             peerProvider: EmptyTunnelPeerProvider()
         )
         engine.attach(tunnelPool: pool)
         let builder = I2PTunnelBuilder(
-            localRouterHash: localHash,
+            localRouterHash: localNode.routerHash,
             participant: localNode.participant,
             transport: localNode.transport
         )
@@ -630,6 +654,13 @@ enum I2PRouterStatusSelfTest {
 
         let outbound = snapshot.pools.first { $0.direction == "outbound" }
         guard let outbound, outbound.tunnels.count == 1, outbound.tunnels[0].hopCount == 2 else {
+            throw I2PWireError.invalidFormat
+        }
+        // The tunnel health screen reads these from the same snapshot.
+        guard outbound.tunnels[0].createdAt < outbound.tunnels[0].expiresAt,
+              !outbound.tunnels[0].gatewayHashHex.isEmpty,
+              outbound.targetCount == 3,
+              outbound.buildingCount == 0 else {
             throw I2PWireError.invalidFormat
         }
         return "1 RI, 1 floodfill, \(snapshot.messagesIn) routed msgs, outbound pool 2 hops; stream emitted \(received)"

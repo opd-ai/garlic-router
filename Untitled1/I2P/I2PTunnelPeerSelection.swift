@@ -76,6 +76,12 @@ final class I2PTunnelPeerSelector {
         var selectionJitter = 0.35
         /// Bounded profile storage (bounded like the netdb cache itself).
         var maxProfiles = 5000
+        /// Multiplier for a candidate this router already holds a live session
+        /// to. A build's first record has to reach its hop now: over an existing
+        /// session it leaves immediately, while a cold hop depends on a
+        /// handshake that can stall or be refused. Demand-dialing every hop is
+        /// how a pool ends up logging build attempts and adopting nothing.
+        var connectedBonus = 4.0
 
         init() {}
     }
@@ -83,6 +89,10 @@ final class I2PTunnelPeerSelector {
     private let config: Config
     private let lock = NSLock()
     private var profiles: [Data: I2PTunnelPeerProfile] = [:]
+
+    /// Whether this router currently holds a live session to a peer. Set by the
+    /// running router; nil (no preference) elsewhere, such as test harnesses.
+    var isConnected: ((Data) -> Bool)?
 
     init(config: Config = Config()) {
         self.config = config
@@ -149,6 +159,7 @@ final class I2PTunnelPeerSelector {
                now.timeIntervalSince(selected) < config.diversityWindow {
                 score *= config.recencyPenalty
             }
+            if isConnected?(hash) ?? false { score *= config.connectedBonus }
             score += Self.jitter(config.selectionJitter)
             ranked.append((peer: I2PTunnelPeer(routerHash: hash, encryptionPublicKey: key),
                            isFloodfill: isFloodfill, score: score))
