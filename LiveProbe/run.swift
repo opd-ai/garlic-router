@@ -4,8 +4,11 @@
 //  `swiftc` on a Mac and prints every row, so a failing check can be reproduced
 //  and inspected without a device. Not part of the app target.
 //
+//  `@main` is legal here because this file is not named main.swift; the probes
+//  that are named main.swift carry top-level code instead.
+//
 //    swiftc -swift-version 5 -o .probe-build/live \
-//        Untitled1/I2P/*.swift LiveProbe/run.swift
+//        Untitled1/I2P/*.swift SelfTestProbe/ProbeStubs.swift LiveProbe/run.swift
 //    ./.probe-build/live
 //
 

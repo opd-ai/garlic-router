@@ -20,6 +20,11 @@ final class I2PRouterAppContext {
     private let identity: I2PRouterIdentity
     private let netDB: I2PNetworkDatabase
     private let ntcp2: NTCP2Transport
+    private let ssu2: SSU2Transport
+    /// The introduction key our SSU2 RouterAddress publishes ("i"): header
+    /// obfuscation and the listener's responder sessions both key off it, so it
+    /// must be identical to the option peers read.
+    private let ssu2IntroKey: Data
     private let deliveryTransport: I2PNTCP2DeliveryTransport
     private let i2npRouter: I2NPMessageRouter
     private let tunnelPool: I2PTunnelPool
@@ -33,16 +38,33 @@ final class I2PRouterAppContext {
     private var started = false
     private var startedNetDBMaintenance = false
     private var ntcp2Bridge: NTCP2I2NPBridge?
+    /// Strongly held: `SSU2Transport.delegate` is weak, and a bridge released
+    /// here would silently drop every inbound SSU2 I2NP message.
+    private var ssu2Bridge: SSU2I2NPBridge?
 
     // MARK: Live bootstrap state
     /// The reseed → dial → explore keep-alive loop (spawns once per process).
     private var bootstrapTask: Task<Void, Never>?
     /// Last successful reseed; RouterInfos expire after ~1h, so the loop
     /// re-reseeds on a floor interval rather than waiting for the cache to drain.
-    private var lastReseedAt = Date.distantPast
+    /// Read by the live-interoperability screen, which reports the bootstrap
+    /// this router actually used.
+    private(set) var lastReseedAt = Date.distantPast
+    /// The report of the most recent successful reseed (memory only): the
+    /// source, the RouterInfos it carried and what survived verification.
+    private(set) var lastReseedReport: I2PReseedReport?
     /// Dial bookkeeping so concurrent demand-dials (netdb delivery, tunnel
     /// builds, the bootstrap dialer) never stack duplicate connection attempts.
     private let dialTracker = DemandDialTracker()
+    /// Peer handshake failure profiles (memory only, bounded): a dial that just
+    /// failed is scheduled for its next attempt instead of being repeated by
+    /// chance, and peers still inside their backoff are skipped where the
+    /// router picks targets.
+    private var handshakeBackoff: I2PPeerHandshakeBackoff { I2PPeerHandshakeBackoff.shared }
+    /// How long a dial's session is watched for its handshake outcome. The
+    /// transport bounds the connect at 8s and the handshake at 20s of its own,
+    /// so this window only catches a session that outlives both.
+    private static let handshakeWatchWindow: TimeInterval = 30
     /// Keep-alive cadence: reseed refresh, session re-dialing and DHT exploration.
     private static let bootstrapCycleInterval: TimeInterval = 900
     /// Re-reseed floor: the netdb prunes RouterInfos after an hour; a successful
@@ -95,9 +117,29 @@ final class I2PRouterAppContext {
         )
     }()
 
+    /// The IRC client's connection: one client destination with its own tunnel
+    /// pool, reused across server connections so the nick the server sees keeps
+    /// the same destination. A b33 server and an address-book name resolve
+    /// through the SAM bridge, which is where those destinations live.
+    lazy var ircClient: I2PIRCClient = {
+        I2PIRCClient(
+            core: self.routerCore,
+            credentials: { [weak self] address in
+                self?.samServer.b33Hosts().first { $0.address == address }?.credentials
+            },
+            addressBook: { [weak self] name in
+                self?.samServer.addressbook[name]
+            }
+        )
+    }()
+
     /// Live-network verification handles for the CI mainnet suite.
     var mainnetNetDB: I2PNetworkDatabase { netDB }
     var mainnetNTCP2: NTCP2Transport { ntcp2 }
+    /// The UDP transport the running router dials and accepts SSU2 sessions on.
+    var mainnetSSU2: SSU2Transport { ssu2 }
+    /// The introduction key our published SSU2 address carries.
+    var mainnetSSU2IntroKey: Data { ssu2IntroKey }
     var mainnetTunnelPool: I2PTunnelPool { tunnelPool }
     var mainnetI2NPRouter: I2NPMessageRouter { i2npRouter }
     var mainnetRouterHash: Data { routerHash }
@@ -185,17 +227,34 @@ final class I2PRouterAppContext {
         // memcmp them, and i2pd rejects a RouterAddress whose "s" has the
         // X25519 top bit set).
         let publishedStaticKey = I2PCrypto.canonicalX25519PublicKey(encryptionKey.publicKey.rawRepresentation)
+        // The SSU2 introduction key our RouterAddress publishes: header
+        // obfuscation, the listener's responder sessions and every peer's
+        // SessionRequest all derive from it, so it is derived from our identity
+        // hash and therefore stable across restarts (a peer that cached an
+        // earlier RouterInfo still de-obfuscates our inbound handshakes).
+        let introKey = Self.ssu2IntroductionKey(for: routerHash)
+        ssu2IntroKey = introKey
         let routerInfo = try! Self.makeRouterInfo(
             identity: identity,
             encryptionPublicKey: publishedStaticKey,
             signingSeed: signingSeed,
+            ssu2IntroKey: introKey,
             floodfill: participation.floodfillEnabled
         )
         mainnetRouterInfo = routerInfo
         let transport = NTCP2Transport(localRouterInfo: routerInfo, staticKey: encryptionKey,
                                         localStaticPublicKey: publishedStaticKey)
         ntcp2 = transport
+        // The UDP transport beside it: same identity, same signed RouterInfo,
+        // handshaking with the exact static-key encoding the RouterAddress
+        // publishes ("s"), so peers that compare the two agree.
+        let udpTransport = SSU2Transport(localStaticKey: encryptionKey,
+                                         introKey: introKey,
+                                         localRouterInfo: routerInfo,
+                                         localStaticPublicKey: publishedStaticKey)
+        ssu2 = udpTransport
         deliveryTransport = I2PNTCP2DeliveryTransport(ntcp2: transport)
+        deliveryTransport.ssu2 = udpTransport
         deliveryTransport.onSent = { [weak engine] bytes in
             engine?.recordOutgoing(bytes: bytes)
         }
@@ -230,6 +289,9 @@ final class I2PRouterAppContext {
         // replies arriving over live sessions to the registered participant,
         // completing organic inbound acceptance and the originator reply path.
         let buildTransport = I2PNTCP2TunnelBuildTransport(ntcp2: transport)
+        // Builds travel to hops with no NTCP2 session (or no NTCP2 address) over
+        // SSU2: the envelopes are the same I2NP bodies on the UDP transport.
+        buildTransport.ssu2 = udpTransport
         let participant = I2PTunnelParticipant(
             localRouterHash: routerHash,
             localEncryptionKey: encryptionKey,
@@ -247,9 +309,18 @@ final class I2PRouterAppContext {
         // record has to reach its hop now, and demand-dialing a cold RouterInfo
         // spends the build window on a handshake that often stalls — which is
         // why the live pool logged attempts and adopted nothing.
-        netdbPeerProvider.isConnected = { [weak transport] hash in
-            transport?.hasSession(for: hash) ?? false
+        netdbPeerProvider.isConnected = { [weak transport, weak udpTransport] hash in
+            (transport?.hasSession(for: hash) ?? false)
+                || (udpTransport?.hasSession(forRouterHash: hash) ?? false)
         }
+        // A blocked peer is never a hop, whatever the selector's scores say.
+        let blocklist = I2PPeerBlocklist.shared
+        netdbPeerProvider.isBlocked = { hash in blocklist.isBlocked(hash) }
+        // A peer whose handshake just failed is held out of hop selection until
+        // its backoff runs out: selecting it would spend the build's first
+        // record on a handshake that is known to be failing right now.
+        let backoff = I2PPeerHandshakeBackoff.shared
+        netdbPeerProvider.isHandshakeHeldBack = { hash in backoff.isHeldBack(hash) }
         tunnelPeerProvider = netdbPeerProvider
         tunnelPool = I2PTunnelPool(
             localRouterHash: routerHash,
@@ -280,14 +351,21 @@ final class I2PRouterAppContext {
         // Participation controls: the status engine reads live hop states for
         // the share reading, and the share ratio caps the tunnels we carry.
         participant.setTransitBudget(
-            I2PTunnelParticipant.transitTunnelBudget(forSharePercent: participation.tunnelSharePercent)
+            I2PTunnelParticipant.transitTunnelBudget(
+                forSharePercent: participation.effectiveTunnelSharePercent())
         )
         engine.attach(participant: participant)
         engine.recordFloodfillAdvertisement(advertised: participation.floodfillEnabled,
                                            publishedAt: nil)
         // The dashboard and peer inspector read session counts and per-peer
-        // readings through the status engine — it must observe the transport.
+        // readings through the status engine — it must observe both transports.
         engine.attach(ntcp2: transport)
+        engine.attach(ssu2: udpTransport)
+        // The handshake-failure profiles: the transport card counts the peers
+        // the dial paths are holding back, and the peer inspector names each
+        // peer's last failure and when its next attempt is due.
+        engine.heldBackPeerCount = { backoff.heldBackCount() }
+        engine.handshakeBackoffReading = { hash in backoff.reading(identityHex: hash) }
 
         // Demand-dial hooks: a netdb delivery or tunnel build that finds no
         // session resolves the peer's RouterInfo (netdb cache-first, so the
@@ -301,9 +379,16 @@ final class I2PRouterAppContext {
         // Let netdb lookups prefer floodfills we already have a session to, so
         // a cold DHT round trip does not burn its whole window on demand-dials.
         let sessionProbe = transport
+        let udpProbe = udpTransport
         Task {
             await database.installReachabilityProbe { hash in
-                sessionProbe.hasSession(for: hash)
+                sessionProbe.hasSession(for: hash) || udpProbe.hasSession(forRouterHash: hash)
+            }
+        }
+        // The blocklist also keeps blocked peers out of netdb lookups.
+        Task {
+            await database.installBlocklistProbe { hash in
+                blocklist.isBlocked(hash)
             }
         }
         buildTransport.dialPeer = { [weak self] hash in
@@ -324,6 +409,13 @@ final class I2PRouterAppContext {
         let bridge = NTCP2I2NPBridge(router: i2npRouter)
         ntcp2Bridge = bridge
         ntcp2.delegate = bridge
+        // The SSU2 listener: inbound SessionRequests demultiplex by our static
+        // key, so peers that learned our RouterAddress can hand us SSU2 sessions
+        // exactly as they hand us TCP ones.
+        _ = try? ssu2.startListener(port: 0)
+        let udpBridge = SSU2I2NPBridge(router: i2npRouter)
+        ssu2Bridge = udpBridge
+        ssu2.delegate = udpBridge
         // The netdb maintenance loop spawns exactly once for the process
         // lifetime; resume cycles must not duplicate it.
         if !startedNetDBMaintenance {
@@ -345,6 +437,9 @@ final class I2PRouterAppContext {
         engine.start()
         samServer.start()
         startRepublishLoop()
+        startQuietHoursWatchdog()
+        startBlocklistSweep()
+        startHandshakeBackoffSweep()
         // Re-apply the persisted participation controls (caps, share, netdb
         // role) so a resumed router matches what the screen shows.
         Task { await applyParticipationSettings() }
@@ -363,7 +458,14 @@ final class I2PRouterAppContext {
         bootstrapTask = nil
         republishTask?.cancel()
         republishTask = nil
+        quietHoursTask?.cancel()
+        quietHoursTask = nil
+        blocklistTask?.cancel()
+        blocklistTask = nil
+        handshakeBackoffTask?.cancel()
+        handshakeBackoffTask = nil
         ntcp2.shutdown()
+        ssu2.shutdown()
         tunnelPool.stop()
         samServer.stop()
     }
@@ -379,16 +481,96 @@ final class I2PRouterAppContext {
 
     /// Pushes the persisted participation controls onto the running router:
     /// the bandwidth caps into the governor, the tunnel-share ratio into the
-    /// participating-tunnel budget, and the floodfill role into the netdb.
-    /// The caps and the budget gate traffic immediately; the netdb role is
-    /// effective the moment the actor applies it.
+    /// participating-tunnel budget (zero while quiet hours are in effect), and
+    /// the floodfill role into the netdb. The caps and the budget gate traffic
+    /// immediately; the netdb role is effective the moment the actor applies it.
     func applyParticipationSettings() async {
         let settings = I2PParticipationSettings.shared
         settings.applyBandwidthCaps()
-        tunnelParticipant.setTransitBudget(
-            I2PTunnelParticipant.transitTunnelBudget(forSharePercent: settings.tunnelSharePercent)
-        )
+        applyTransitBudget(for: settings)
         await netDB.configureLocalFloodfill(settings.floodfillEnabled)
+    }
+
+    /// Sets the participating-tunnel ceiling from the share ratio the schedule
+    /// allows right now: the saved ratio outside quiet hours, zero inside them.
+    private func applyTransitBudget(for settings: I2PParticipationSettings) {
+        tunnelParticipant.setTransitBudget(
+            I2PTunnelParticipant.transitTunnelBudget(
+                forSharePercent: settings.effectiveTunnelSharePercent())
+        )
+    }
+
+    /// Re-applies the transit budget every so often so a quiet window's start and
+    /// end take effect on the running router without the screen open: the ceiling
+    /// is zero inside the window and the saved share ratio outside it.
+    private func startQuietHoursWatchdog() {
+        guard quietHoursTask == nil else { return }
+        quietHoursTask = Task { [weak self] in
+            while let self, !Task.isCancelled {
+                self.applyTransitBudget(for: I2PParticipationSettings.shared)
+                try? await Task.sleep(for: .seconds(20))
+            }
+        }
+    }
+
+    /// Closes the session to every blocked peer. Called when the blocklist
+    /// changes and by the periodic sweep, so a peer blocked mid-session — or one
+    /// that reconnected — loses its connection on the next maintenance tick.
+    func enforcePeerBlocklist() {
+        let blocklist = I2PPeerBlocklist.shared
+        guard blocklist.count > 0 else { return }
+        for summary in ntcp2.sessionSummaries() where blocklist.isBlocked(summary.hash) {
+            ntcp2.closeSession(for: summary.hash)
+        }
+        for summary in ssu2.sessionSummaries() where blocklist.isBlocked(summary.hash) {
+            ssu2.closeSession(forRouterHash: summary.hash)
+        }
+    }
+
+    /// Runs the blocklist enforcement on a short maintenance beat.
+    private func startBlocklistSweep() {
+        guard blocklistTask == nil else { return }
+        blocklistTask = Task { [weak self] in
+            while let self, !Task.isCancelled {
+                self.enforcePeerBlocklist()
+                try? await Task.sleep(for: .seconds(20))
+            }
+        }
+    }
+
+    // MARK: Handshake retry ladder
+
+    /// Starts the retry beat: the backoff windows are minutes long, so a peer
+    /// whose next attempt falls due is dialed here instead of waiting for the
+    /// next build of the route table.
+    private func startHandshakeBackoffSweep() {
+        guard handshakeBackoffTask == nil else { return }
+        handshakeBackoffTask = Task { [weak self] in
+            while let self, !Task.isCancelled {
+                await self.retryDueHandshakes()
+                try? await Task.sleep(for: .seconds(20))
+            }
+        }
+    }
+
+    /// Dials the peers whose handshake backoff has run out, at most `limit` per
+    /// beat. Only a peer this router holds no session to is attempted: a
+    /// backoff window never closes a session that already handshook.
+    @discardableResult
+    func retryDueHandshakes(limit: Int = 3) async -> Int {
+        var dialed = 0
+        for hash in handshakeBackoff.dispatchableRetries(limit: limit) {
+            guard !I2PPeerBlocklist.shared.isBlocked(hash) else { continue }
+            if hasSession(to: hash) {
+                // A manual dial or an inbound session won the race: the failure
+                // is history and the schedule resets.
+                handshakeBackoff.recordSuccess(hash)
+                continue
+            }
+            guard await dial(routerHash: hash) else { continue }
+            dialed += 1
+        }
+        return dialed
     }
 
     /// Turns the local netdb floodfill role on or off and re-publishes our
@@ -422,6 +604,9 @@ final class I2PRouterAppContext {
                                            publishedAt: lastRouterInfoPublishedAt)
         // Sessions must present the freshly signed address in message 3.
         ntcp2.updateLocalRouterInfo(advertised)
+        // SSU2 sessions carry the same RouterInfo (in the SessionConfirmed for
+        // an initiator, the SessionCreated payload for a responder).
+        ssu2.updateLocalRouterInfo(advertised)
         _ = await netDB.publish(routerInfo: advertised)
     }
 
@@ -440,7 +625,11 @@ final class I2PRouterAppContext {
     /// address probe or the floodfill set is unavailable.
     private func advertiseReachableAddress() async {
         try? await Task.sleep(for: .seconds(2))
-        guard let port = ntcp2.listenerPort, port > 0 else { return }
+        // Either listener is enough to be dialable: a router whose TCP port is
+        // taken still takes SSU2 sessions on the UDP port.
+        let tcpPort = ntcp2.listenerPort ?? 0
+        let udpPort = ssu2.listenerPort ?? 0
+        guard tcpPort > 0 || udpPort > 0 else { return }
         guard let address = try? await I2PExternalAddressDiscovery.publicIPv4Address() else { return }
         let floodfill = I2PParticipationSettings.shared.floodfillEnabled
         guard let advertised = try? Self.makeRouterInfo(
@@ -450,7 +639,10 @@ final class I2PRouterAppContext {
             encryptionPublicKey: encryptionKey.publicKey.rawRepresentation,
             signingSeed: signingSeed,
             ntcp2Host: address,
-            ntcp2Port: port,
+            ntcp2Port: tcpPort,
+            ssu2Host: address,
+            ssu2Port: udpPort,
+            ssu2IntroKey: ssu2IntroKey,
             floodfill: floodfill
         ) else { return }
         mainnetRouterInfo = advertised
@@ -460,6 +652,8 @@ final class I2PRouterAppContext {
         // From here on every handshake advertises the reachable address, so
         // peers that compare the observed endpoint against it keep the session.
         ntcp2.updateLocalRouterInfo(advertised)
+        ssu2.updateLocalRouterInfo(advertised)
+        ssu2.updatePublishedEndpoint(udpPort > 0 ? SSU2Endpoint(host: address, port: udpPort) : nil)
         _ = await netDB.publish(routerInfo: advertised)
     }
 
@@ -469,6 +663,12 @@ final class I2PRouterAppContext {
     private var republishInterval: TimeInterval = 60 * 10
     /// The periodic republish/keepalive loop.
     private var republishTask: Task<Void, Never>?
+    /// Re-applies the transit budget as the quiet-hours window opens and closes.
+    private var quietHoursTask: Task<Void, Never>?
+    /// Closes sessions to blocked peers on a maintenance beat.
+    private var blocklistTask: Task<Void, Never>?
+    /// Dispatches the handshake retries whose backoff has run out.
+    private var handshakeBackoffTask: Task<Void, Never>?
 
     /// Starts the periodic republish loop (the router's publication
     /// heartbeat): a re-signed RouterInfo goes out on the cadence
@@ -511,8 +711,9 @@ final class I2PRouterAppContext {
         let reseedDue = now.timeIntervalSince(lastReseedAt) >= Self.reseedFloorInterval
             || knownFloodfills < 8
         if reseedDue {
-            if (try? await I2PReseedService.reseed(into: netDB)) != nil {
+            if let report = try? await I2PReseedService.reseed(into: netDB) {
                 lastReseedAt = now
+                lastReseedReport = report
             }
         }
         // Advertise our reachable address before dialing: the handshake's
@@ -536,6 +737,10 @@ final class I2PRouterAppContext {
         let candidates = await netDB.selectFloodfills(for: routerHash, count: 24).prefix(16)
         for hash in candidates {
             guard !ntcp2.hasSession(for: hash) else { continue }
+            // Peers held back after a failed handshake are skipped here: the
+            // selection would otherwise spend a dial window on a peer that is
+            // known to be failing right now.
+            guard !handshakeBackoff.isHeldBack(hash) else { continue }
             _ = await dial(routerHash: hash)
             let deadline = Date().addingTimeInterval(4)
             while !ntcp2.hasSession(for: hash), Date() < deadline {
@@ -562,6 +767,8 @@ final class I2PRouterAppContext {
             for hash in candidates {
                 guard ntcp2.sessionCount() < target else { break }
                 guard !ntcp2.hasSession(for: hash), !attempted.contains(hash) else { continue }
+                // A peer inside its handshake backoff is skipped, not retried.
+                guard !handshakeBackoff.isHeldBack(hash) else { continue }
                 attempted.insert(hash)
                 _ = await dial(routerHash: hash)
             }
@@ -578,21 +785,129 @@ final class I2PRouterAppContext {
     /// serialized through the dial tracker so duplicate connection attempts
     /// never stack.
     private func dial(routerHash: Data) async -> Bool {
-        if ntcp2.hasSession(for: routerHash) { return true }
+        // A blocked peer is never dialed: the user asked us to have nothing to
+        // do with it, so demand-dials and session top-ups skip it.
+        guard !I2PPeerBlocklist.shared.isBlocked(routerHash) else { return false }
+        // A peer still inside its handshake backoff is skipped as well: repeating
+        // a handshake that just failed spends the dial window on nothing. The
+        // retry beat dials it again once the window has run out.
+        guard !handshakeBackoff.isHeldBack(routerHash) else { return false }
+        if hasSession(to: routerHash) { return true }
         guard await dialTracker.claim(routerHash) else { return true }
         defer {
             Task { await dialTracker.release(routerHash) }
         }
-        guard let info = await netDB.lookupRouterInfo(routerHash, timeoutPerRound: 1, maxRounds: 1),
-              let endpoint = NTCP2PeerEndpoint.preferred(from: info.addresses) else {
+        guard let info = await netDB.lookupRouterInfo(routerHash, timeoutPerRound: 1, maxRounds: 1) else {
             return false
         }
-        guard !ntcp2.hasSession(for: routerHash) else { return true }
-        ntcp2.connect(host: endpoint.host, port: endpoint.port,
-                      remoteRouterHash: info.identity.hash,
-                      remoteStaticKey: endpoint.staticKey,
-                      remoteIV: endpoint.iv)
-        return true
+        guard !hasSession(to: routerHash) else { return true }
+        // TCP first: an NTCP2 session is the cheaper path wherever a peer
+        // publishes an NTCP2 address.
+        if let endpoint = NTCP2PeerEndpoint.preferred(from: info.addresses) {
+            let session = ntcp2.connect(host: endpoint.host, port: endpoint.port,
+                                        remoteRouterHash: info.identity.hash,
+                                        remoteStaticKey: endpoint.staticKey,
+                                        remoteIV: endpoint.iv)
+            // The attempt's ending is recorded against the peer's profile, so a
+            // failed dial schedules the next attempt instead of leaving the peer
+            // to chance.
+            watchHandshake(of: session, peer: info.identity.hash)
+            // SSU2 is the fallback when that handshake never lands, so a peer
+            // reachable only over UDP does not stay unreachable.
+            scheduleSSU2Fallback(routerInfo: info)
+            return true
+        }
+        // No NTCP2 address works at all: dial the peer over SSU2 instead.
+        if let endpoint = SSU2PeerEndpoint.preferred(from: info.addresses) {
+            try? ssu2.connect(host: endpoint.host, port: endpoint.port,
+                              remoteStaticKey: endpoint.staticKey,
+                              remoteIntroKey: endpoint.introKey)
+            return true
+        }
+        return false
+    }
+
+    /// Whether either transport holds a live session to the peer.
+    private func hasSession(to routerHash: Data) -> Bool {
+        ntcp2.hasSession(for: routerHash) || ssu2.hasSession(forRouterHash: routerHash)
+    }
+
+    /// Watches one dial's session and folds its ending into the peer's handshake
+    /// profile: a session that handshakes at all resets the retry schedule, and a
+    /// session that never establishes records its failure and moves the peer to
+    /// the next rung. Nothing is closed here — the transport owns its own connect
+    /// and handshake timers, and an established session is left alone.
+    private func watchHandshake(of session: NTCP2Session?, peer hash: Data) {
+        guard let session else { return }
+        let backoff = handshakeBackoff
+        Task {
+            let deadline = Date().addingTimeInterval(Self.handshakeWatchWindow)
+            while Date() < deadline {
+                if session.isEstablished || session.state == .closed { break }
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+            if session.isEstablished || session.establishedAt != nil {
+                backoff.recordSuccess(hash)
+                return
+            }
+            // A session still handshaking past its own window is a handshake
+            // timeout; a closed one names its own ending.
+            let reason: I2PPeerHandshakeFailureReason?
+            if session.state == .closed {
+                reason = I2PPeerHandshakeFailureReason.classify(closeReason: session.closeReason)
+            } else if session.state == .handshaking {
+                reason = .handshakeTimeout
+            } else {
+                reason = nil
+            }
+            if let reason { backoff.recordFailure(hash, reason: reason) }
+        }
+    }
+
+    /// Waits out the NTCP2 handshake window and, when no TCP session appeared,
+    /// dials the same peer over SSU2. The dial path itself stays non-blocking,
+    /// so callers keep the timing they already budget for.
+    private func scheduleSSU2Fallback(routerInfo: I2PRouterInfo) {
+        guard SSU2PeerEndpoint.preferred(from: routerInfo.addresses) != nil else { return }
+        let hash = routerInfo.identity.hash
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(4))
+            guard let self, !Task.isCancelled else { return }
+            guard !self.ntcp2.hasSession(for: hash),
+                  !self.ssu2.hasSession(forRouterHash: hash) else { return }
+            _ = await self.dialSSU2(routerInfo: routerInfo, timeout: 4)
+        }
+    }
+
+    // MARK: SSU2 dialing
+
+    /// Dials a peer over SSU2 through the running transport and waits for the
+    /// session to establish: the route taken when a peer publishes no NTCP2
+    /// address, when its TCP handshake never lands, and by the wiring suite.
+    @discardableResult
+    func dialSSU2(routerInfo: I2PRouterInfo, timeout: TimeInterval = 8) async -> Bool {
+        let hash = routerInfo.identity.hash
+        guard !I2PPeerBlocklist.shared.isBlocked(hash) else { return false }
+        if ssu2.hasSession(forRouterHash: hash) { return true }
+        guard let endpoint = SSU2PeerEndpoint.preferred(from: routerInfo.addresses) else { return false }
+        try? ssu2.connect(host: endpoint.host, port: endpoint.port,
+                          remoteStaticKey: endpoint.staticKey,
+                          remoteIntroKey: endpoint.introKey)
+        let deadline = Date().addingTimeInterval(timeout)
+        while !ssu2.hasSession(forRouterHash: hash), Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(150))
+        }
+        let established = ssu2.hasSession(forRouterHash: hash)
+        // A successful SSU2 handshake resets the peer's retry schedule exactly as
+        // a TCP one does: the peer is not failing, it just answers over UDP.
+        if established { handshakeBackoff.recordSuccess(hash) }
+        return established
+    }
+
+    /// Sends one I2NP envelope down the running router's delivery path, which
+    /// rides whichever transport holds a session to the peer.
+    func sendEnvelope(_ i2npBytes: Data, to routerHash: Data) async throws {
+        try await deliveryTransport.deliver(i2npBytes, to: routerHash)
     }
 
     /// A signed RouterInfo for our own identity (real key material). The
@@ -603,6 +918,9 @@ final class I2PRouterAppContext {
                                        signingSeed: Data,
                                        ntcp2Host: String = "127.0.0.1",
                                        ntcp2Port: UInt16 = 0,
+                                       ssu2Host: String = "127.0.0.1",
+                                       ssu2Port: UInt16 = 0,
+                                       ssu2IntroKey: Data,
                                        floodfill: Bool = false) throws -> I2PRouterInfo {
         // NTCP2 §Published Router Info: a dialable address carries host, port,
         // the static key "s", the handshake IV "i" and v=2. A router that is not
@@ -637,10 +955,32 @@ final class I2PRouterAppContext {
             expiration: nil,
             options: options
         )
+        // The SSU2 address beside it: the same static key "s" (the bytes the
+        // handshake carries), the introduction key "i" that keys header
+        // obfuscation, and v=2. It follows the NTCP2 publication rule — a
+        // router that is not listening publishes "s"/"i"/"v" without a host or
+        // port, because advertising an endpoint it does not serve makes peers
+        // drop it.
+        var udpOptions: [String: String] = [
+            "s": I2PCrypto.i2pBase64(staticKey),
+            "i": I2PCrypto.i2pBase64(ssu2IntroKey),
+            "v": "2"
+        ]
+        let udpPublished = ssu2Port != 0 && !Self.isLoopback(ssu2Host)
+        if udpPublished {
+            udpOptions["host"] = ssu2Host
+            udpOptions["port"] = String(ssu2Port)
+        }
+        let udpAddress = I2PRouterAddress(
+            cost: udpPublished ? 6 : 14,
+            transportStyle: "SSU2",
+            expiration: nil,
+            options: udpOptions
+        )
         var routerInfo = I2PRouterInfo(
             identity: identity,
             published: Date(),
-            addresses: [address],
+            addresses: [address, udpAddress],
             options: [
                 // Peers compare this against their minimum supported router
                 // version and drop (or ban) anything older that does not also
@@ -664,6 +1004,17 @@ final class I2PRouterAppContext {
             || host == "::1" || host.hasPrefix("127.")
     }
 
+    /// The introduction key our SSU2 RouterAddress publishes ("i"): header
+    /// obfuscation, the listener's responder sessions and every peer's
+    /// SessionRequest derive from it, so it is derived from the identity hash
+    /// and stays the same across launches — a peer that cached an earlier
+    /// RouterInfo still de-obfuscates our inbound handshakes.
+    private static func ssu2IntroductionKey(for routerHash: Data) -> Data {
+        var material = routerHash
+        material.append(Data("SSU2 introduction key".utf8))
+        return I2PCrypto.sha256(material)
+    }
+
     private static func urlSafeBase64(_ data: Data) -> String {
         data.base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")
@@ -679,7 +1030,13 @@ private final class NTCP2I2NPBridge: NTCP2TransportDelegate {
         self.router = router
     }
 
-    func transport(_ transport: NTCP2Transport, sessionEstablished session: NTCP2Session) {}
+    func transport(_ transport: NTCP2Transport, sessionEstablished session: NTCP2Session) {
+        // Any successful handshake — ours or the peer's — resets that peer's
+        // retry schedule.
+        if let hash = session.remoteRouterHash {
+            I2PPeerHandshakeBackoff.shared.recordSuccess(hash)
+        }
+    }
 
     func transport(_ transport: NTCP2Transport, session: NTCP2Session, didReceiveData data: Data) {
         let source = session.remoteRouterHash ?? Data()
@@ -696,6 +1053,38 @@ private final class NTCP2I2NPBridge: NTCP2TransportDelegate {
     }
 
     func transport(_ transport: NTCP2Transport, sessionDidClose session: NTCP2Session) {}
+}
+
+/// Bridges established SSU2 sessions into the I2NP router: the UDP transport
+/// hands over the same I2NP bytes an NTCP2 session does, so netdb traffic,
+/// garlic messages, tunnel data and tunnel builds travel it unchanged.
+private final class SSU2I2NPBridge: SSU2TransportDelegate {
+    private let router: I2NPMessageRouter
+
+    init(router: I2NPMessageRouter) {
+        self.router = router
+    }
+
+    func transport(_ transport: SSU2Transport, sessionEstablished session: SSU2Session) {
+        // The UDP session is the peer answering after all: reset its schedule.
+        if let hash = session.remoteRouterHash {
+            I2PPeerHandshakeBackoff.shared.recordSuccess(hash)
+        }
+    }
+
+    func transport(_ transport: SSU2Transport, session: SSU2Session, didReceiveData data: Data) {
+        let source = session.remoteRouterHash ?? Data()
+        if let message = try? I2NPMessage.parse(data) {
+            Task {
+                // Inbound bandwidth cap: the message waits for its tokens, the
+                // same admission an NTCP2 data block passes through.
+                await I2PBandwidthGovernor.shared.admitInbound(bytes: data.count)
+                await router.handleIncoming(message, from: source)
+            }
+        }
+    }
+
+    func transport(_ transport: SSU2Transport, sessionDidClose session: SSU2Session) {}
 }
 
 // MARK: - Identity keychain

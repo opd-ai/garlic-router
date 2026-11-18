@@ -94,6 +94,16 @@ final class I2PTunnelPeerSelector {
     /// running router; nil (no preference) elsewhere, such as test harnesses.
     var isConnected: ((Data) -> Bool)?
 
+    /// Whether the user blocked a peer. Set by the running router; a blocked
+    /// peer is never selected as a hop, whatever its profile says.
+    var isBlocked: ((Data) -> Bool)?
+
+    /// Whether a dial to this peer just failed and its handshake backoff is
+    /// still running. Set by the running router: selecting such a peer spends the
+    /// build's first record on a handshake that is known to be failing now, so
+    /// it is held out of selection until its next attempt is due.
+    var isHandshakeHeldBack: ((Data) -> Bool)?
+
     init(config: Config = Config()) {
         self.config = config
     }
@@ -141,6 +151,8 @@ final class I2PTunnelPeerSelector {
                   hash.count == 32,
                   hash != localRouterHash,
                   !excluding.contains(hash) else { continue }
+            guard !(isBlocked?(hash) ?? false) else { continue }
+            guard !(isHandshakeHeldBack?(hash) ?? false) else { continue }
             let key = candidate.info.identity.encryptionPublicKey
             guard Self.isUsableEncryptionKey(key) else { continue }
             let published = candidate.info.published

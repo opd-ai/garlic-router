@@ -184,15 +184,27 @@ actor I2PNetworkDatabase {
 
     // MARK: Floodfill selection
 
-    /// The `count` known floodfills closest to the key, excluding ourselves.
+    /// The `count` known floodfills closest to the key, excluding ourselves and
+    /// any peer the user blocked (a blocked peer is never a lookup target).
     /// Defaults to the spec's 3 closest for lookups.
     func selectFloodfills(for key: Data, count: Int = 3) -> [Data] {
         Array(
             knownFloodfills
                 .filter { $0 != localRouterHash }
+                .filter { !(peerIsBlocked?($0) ?? false) }
                 .sorted { Self.isCloser($0, than: $1, to: key) }
                 .prefix(count)
         )
+    }
+
+    /// Optional peer blocklist probe installed by the running router: a blocked
+    /// floodfill is never queried, because the user asked us to have nothing to
+    /// do with it.
+    private(set) var peerIsBlocked: ((Data) -> Bool)?
+
+    /// Installs the blocklist probe the running router wires to the user's list.
+    func installBlocklistProbe(_ probe: @escaping (Data) -> Bool) {
+        peerIsBlocked = probe
     }
 
     /// Optional transport reachability probe installed by the running router
@@ -232,6 +244,7 @@ actor I2PNetworkDatabase {
         if candidates.contains(where: { !reachable($0) }) {
             let live = knownFloodfills
                 .filter { $0 != localRouterHash && !queried.contains($0) && reachable($0) }
+                .filter { !(peerIsBlocked?($0) ?? false) }
                 .sorted { Self.isCloser($0, than: $1, to: key) }
                 .prefix(liveFanOut)
             candidates = Array(Set(candidates + live))
@@ -1131,11 +1144,13 @@ actor I2PNetworkDatabase {
 
     /// Floodfills to gossip a freshly stored entry to: the next `replicationFanout`
     /// floodfills farther from the key than ourselves, so replication ripples outward
-    /// through the XOR-ordered ring until every floodfill holds the entry.
+    /// through the XOR-ordered ring until every floodfill holds the entry. A peer
+    /// the user blocked is never one of them.
     private func gossipTargets(for key: Data) -> [Data] {
         Array(
             knownFloodfills
                 .filter { $0 != localRouterHash }
+                .filter { !(peerIsBlocked?($0) ?? false) }
                 .filter { Self.isCloser(localRouterHash, than: $0, to: key) }
                 .sorted { Self.isCloser($0, than: $1, to: key) }
                 .prefix(Self.replicationFanout)

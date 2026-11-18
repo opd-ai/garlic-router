@@ -189,16 +189,32 @@ enum I2PSpecConformanceAudit {
     }
 
     /// Crypto primitives per RFC 8032 / RFC 7539:
-    /// - Ed25519 public keys are 32-byte canonical encodings (high bit of the
-    ///   final byte clear) for both SigType 7 and SigType 11 material.
+    /// - Ed25519 public keys are canonical 32-byte point encodings: RFC 8032
+    ///   §5.1.3 pins the masked y coordinate below p = 2^255−19, while bit 255
+    ///   carries the sign of x and is free for any real key. Both SigType 7 and
+    ///   SigType 11 material is checked, and the pure-Swift encoder must agree
+    ///   with CryptoKit byte for byte.
+    /// - A non-canonical encoding of the same point (y + p) is rejected, so one
+    ///   key has exactly one valid byte string.
+    /// - X25519 public keys as RouterInfo `s` options are published with the
+    ///   high bit of the last byte clear — that *is* a high-bit rule, and it is
+    ///   the one reference routers validate.
     /// - Signatures are exactly 64 bytes; verification is constant-time
-    ///   (CryptoKit) and rejects cross-key and tampered signatures outright.
+    ///   (CryptoKit) and rejects S ≥ L, cross-key and tampered signatures.
     /// - Entropy comes from the system generator and never repeats draws.
     private static func cryptoPrimitives() async throws -> String {
         let seed = I2PCrypto.generateEd25519Seed()
         let publicKey = I2PCrypto.ed25519PublicKey(fromSeed: seed)
-        guard publicKey.count == 32, publicKey[31] & 0x80 == 0 else {
-            throw I2PMainnetFailure(message: "Ed25519 public key encoding not canonical (RFC 8032)")
+        guard publicKey.count == 32 else {
+            throw I2PMainnetFailure(message: "Ed25519 public key is \(publicKey.count) bytes, expected 32")
+        }
+        // Canonical means y < p. Demanding the high bit be clear would reject
+        // roughly half of all valid keys: that bit is the sign of x.
+        guard I2PCrypto.ed25519IsCanonicalPublicKey(publicKey) else {
+            throw I2PMainnetFailure(message: "Ed25519 public key encoding not canonical (RFC 8032 §5.1.3: y >= p)")
+        }
+        guard I2PCrypto.ed25519PurePublicKey(fromSeed: seed) == publicKey else {
+            throw I2PMainnetFailure(message: "pure-Swift Ed25519 encoder disagrees with CryptoKit on the public-key encoding")
         }
 
         let message = I2PCrypto.randomBytes(64)
@@ -209,9 +225,37 @@ enum I2PSpecConformanceAudit {
         guard I2PCrypto.ed25519Verify(signature: signature, message: message, publicKey: publicKey) else {
             throw I2PMainnetFailure(message: "valid Ed25519 signature failed verification")
         }
+        guard I2PCrypto.ed25519PureVerify(signature: signature, message: message, publicKey: publicKey) else {
+            throw I2PMainnetFailure(message: "pure-Swift Ed25519 verifier rejected a valid signature")
+        }
 
-        let (_, otherSeed) = I2PSamples.sampleIdentity()
-        let otherPublicKey = I2PCrypto.ed25519PublicKey(fromSeed: otherSeed)
+        // y + p for y = 1 (the identity's y) is 2^255 − 18, which fits in the
+        // encoding: the same point written a second time. RFC 8032 requires the
+        // decoder to reject it.
+        var nonCanonical = [UInt8](repeating: 0xff, count: 32)
+        nonCanonical[0] = 0xee     // 2^255 − 18, little-endian
+        nonCanonical[31] = 0x7f
+        guard !I2PCrypto.ed25519IsCanonicalPublicKey(Data(nonCanonical)) else {
+            throw I2PMainnetFailure(message: "non-canonical Ed25519 encoding (y + p) reported as canonical")
+        }
+        guard !I2PCrypto.ed25519PureVerify(signature: signature, message: message,
+                                           publicKey: Data(nonCanonical)) else {
+            throw I2PMainnetFailure(message: "non-canonical Ed25519 public key decoded instead of being rejected")
+        }
+
+        // SigType 11 material has the same key shape and signature length.
+        let (_, phSeed) = I2PSamples.sampleIdentity()
+        let phPublicKey = I2PCrypto.ed25519PublicKey(fromSeed: phSeed)
+        guard phPublicKey.count == 32, I2PCrypto.ed25519IsCanonicalPublicKey(phPublicKey) else {
+            throw I2PMainnetFailure(message: "Ed25519ph (SigType 11) public key encoding not canonical")
+        }
+        guard let phSignature = I2PCrypto.ed25519phSign(message, seed: phSeed),
+              phSignature.count == 64,
+              I2PCrypto.ed25519phVerify(signature: phSignature, message: message, publicKey: phPublicKey) else {
+            throw I2PMainnetFailure(message: "Ed25519ph signature is not a 64-byte verifiable signature")
+        }
+
+        let otherPublicKey = I2PCrypto.ed25519PublicKey(fromSeed: phSeed)
         guard !I2PCrypto.ed25519Verify(signature: signature, message: message, publicKey: otherPublicKey) else {
             throw I2PMainnetFailure(message: "cross-key Ed25519 signature accepted")
         }
@@ -220,12 +264,28 @@ enum I2PSpecConformanceAudit {
         guard !I2PCrypto.ed25519Verify(signature: tampered, message: message, publicKey: publicKey) else {
             throw I2PMainnetFailure(message: "tampered Ed25519 signature accepted")
         }
+        // S at or above the group order L is not a valid signature.
+        var oversized = signature
+        for index in 32..<64 { oversized[index] = 0xff }
+        guard !I2PCrypto.ed25519PureVerify(signature: oversized, message: message, publicKey: publicKey) else {
+            throw I2PMainnetFailure(message: "Ed25519 signature with S >= L accepted")
+        }
+
+        // X25519 `s` option keys: the high bit of the last byte must be clear.
+        var xKey = I2PCrypto.generateX25519KeyPair().publicKey
+        xKey[31] |= 0x80
+        let xCanonical = I2PCrypto.canonicalX25519PublicKey(xKey)
+        guard xCanonical.count == 32,
+              xCanonical[31] & 0x80 == 0,
+              xCanonical.prefix(31) == xKey.prefix(31) else {
+            throw I2PMainnetFailure(message: "X25519 `s` option key is not published canonically (high bit set)")
+        }
 
         guard I2PCrypto.randomBytes(32) != I2PCrypto.randomBytes(32) else {
             throw I2PMainnetFailure(message: "system entropy produced repeated draws")
         }
 
-        return "canonical 32-byte public keys (high bit clear), 64-byte signatures, cross-key and tampered signatures rejected, entropy never repeats"
+        return "canonical 32-byte Ed25519 keys (y < p; the x-sign bit is free), pure-Swift and CryptoKit encoders agree, a y + p encoding is rejected, Ed25519ph signatures verify, S >= L / cross-key / tampered signatures rejected, X25519 `s` keys published with the high bit clear, entropy never repeats"
     }
 
     /// RouterInfo wire format: identity + published + addresses + options +

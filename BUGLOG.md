@@ -1617,3 +1617,107 @@ nothing.
 - Status: fixed (live confirmation pending: needs one device audit run — either
   the build completes through real hops, or the row reports the environment
   verdict with the attempt and its reply route named).
+
+
+
+---
+
+## BUG-045 — TunnelGateway dropped the spec's 2-byte length
+
+- Component: `I2NPMessages.swift` (`I2PTunnelGatewayPayload`).
+- Symptom (static, from the 2026-11-17 audit): the body was
+  `[tunnelID][message]` where the I2NP spec says
+  `tunnelID (4) | length (2) | data`. A reference gateway reads the first two
+  bytes of our inner I2NP message as a length. Garlic delivery, build-reply
+  delivery and the browser/IRC stream paths all ride this body.
+- Root cause: a codec that is wrong in the same way in both directions. Every
+  test round-tripped the struct through itself, so the bytes matched and the
+  missing field never surfaced.
+- Fix: the encoder writes the length and the parser reads exactly that many
+  bytes, rejecting a body that under- or overruns it.
+- Tests: `T4-NP-TUNGW-RT` is now a golden vector — literal spec bytes in both
+  directions plus short, trailing and header-only rejections.
+- Status: fixed; the truth-table row states the real layout. Byte-level
+  confirmation against a reference capture is still pending.
+
+## BUG-046 — Data message dropped its 4-byte length
+
+- Component: `I2NPMessages.swift` (`I2NPDataMessage`), plus the three live
+  producers/consumers (`I2PEepsiteClient`, `I2PIRCStreamClient`, `I2PSAMSession`).
+- Symptom: the body was the caller's payload with no length prefix, so a spec
+  reader saw the payload's first four bytes as a length and our own parser would
+  have prepended four bytes to anything a reference peer sent.
+- Fix: `I2NPDataMessage` owns `length (4) | payload`; `parseBody()` and every
+  stream send/receive path go through it, and a body whose length disagrees is
+  dropped rather than half-read.
+- Tests: `T4-NP-DATA-RT` (golden vector, both directions, three rejections) and
+  the I2NP typed-payload suite.
+- Status: fixed.
+
+## BUG-047 — The RTT reading was always amber
+
+- Component: `I2PIRCLatency.isSlow`.
+- Symptom: "RTT 240 ms" was reported as a warning; only a reading of 2 ms or
+  less stayed quiet.
+- Root cause: the reading is kept in whole milliseconds while
+  `slowThreshold` is stated in seconds, and the two numbers were compared
+  directly.
+- Fix: `milliseconds > 2000`. The self-test now pins the boundary (2000 ms quiet,
+  2500 ms amber).
+- Status: fixed.
+
+## BUG-048 — Channel errors landed in the server buffer
+
+- Component: `I2PIRCChannel.apply` (numeric errors, 400–599).
+- Symptom: "482 #i2p :You're not channel operator" appeared in the server
+  buffer with the channel name glued into the sentence, never in the channel it
+  was about.
+- Root cause: the router filed the numeric by `params[0]`, which for a
+  channel-scoped numeric is our own nick, and never looked at `params[1]`.
+- Fix: the channel in `params[1]` is used when it is a conversation we hold, and
+  our nick and the channel name are dropped from the sentence. A numeric about a
+  channel we are not in keeps its name and stays in the server buffer, so nothing
+  appears in a conversation the user cannot see.
+- Status: fixed.
+
+## BUG-049 — Bookmark suggestions matched the TLD every host shares
+
+- Component: `I2PSavedHostsStore.suggestions/completion`.
+- Symptom: typing "i2p" in the address bar listed every saved host, since they
+  all end in `.i2p`.
+- Fix: matching is on the host without its `.i2p` suffix (and on the query
+  likewise, so pasting a whole host still matches); completion keeps a prefix
+  match on both forms so "planet.i" still completes. The self-test asserts both
+  the label rule and that a never-visited host still sorts last.
+- Status: fixed.
+
+## BUG-050 — CI could never run the tests it runs
+
+- Component: `Untitled1.xcodeproj` (Untitled1Tests Debug/Release), `ci.yml`.
+- Symptom: `xcodebuild test` failed at compile time with "compiling for iOS 18.5,
+  but module 'Untitled1' has a minimum deployment target of iOS 26.0".
+- Root cause: the app target pins `IPHONEOS_DEPLOYMENT_TARGET = 26.0` while the
+  unit test target kept the project default of 18.5, so `@testable import
+  Untitled1` could never resolve.
+- Fix: both unit-test configurations now say 26.0. Verified with
+  `xcodebuild build-for-testing` → ** TEST BUILD SUCCEEDED **.
+- Tests: `Untitled1Tests/I2PProtocolTests.swift` now runs the cross-validation
+  suite, the core suite, the client-logic suites and a truth-table/type-code
+  check, so the protocol layer is gated instead of compiling into a green build.
+- Status: fixed; the suites themselves still need a CI run (this Mac has no
+  simulator runtime).
+
+## BUG-051 — Six self-test assertions could never have passed
+
+- Component: the IRC and saved-hosts suites.
+- Root cause: assertions written against an imagined implementation (a split
+  fixture too short to split, a roster compared in sorted order, an hour-long
+  snooze expected to be over after 15 seconds, the server's 001 sentence expected
+  in a buffer that summarises it into a connect line, a nick expected in the
+  roster after her QUIT, and a suggestion expectation only reachable under
+  full-host matching). Nothing gated them, so they rotted silently.
+- Fix: each was triaged against what the product should do; the two that pointed
+  at real defects became BUG-047 and BUG-048, and the rest were corrected to
+  assert the rule they name.
+- Verification: `--all` → 190 passed, 0 failed (was 181/9).
+- Status: fixed.

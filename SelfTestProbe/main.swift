@@ -5,8 +5,11 @@
 //  reproduced without the simulator. See INTEROP_REPORT.md for the workflow.
 //
 //    swiftc -swift-version 5 -o .probe-build/selftestprobe \
-//        Untitled1/I2P/*.swift SelfTestProbe/main.swift
+//        Untitled1/I2P/*.swift SelfTestProbe/ProbeStubs.swift SelfTestProbe/main.swift
 //    ./.probe-build/selftestprobe --all
+//
+//  ProbeStubs.swift stands in for the two self-test suites that live inside a
+//  SwiftUI view file and so cannot be compiled here.
 //
 
 import Foundation
@@ -39,6 +42,10 @@ if CommandLine.arguments.contains("--alignment") {
                           passed: result.passed,
                           detail: "\(result.testID) · \(result.detail)")
     }
+}
+if CommandLine.arguments.contains("--spec") {
+    // The I2P Core tab's spec conformance probes, runnable off-device.
+    results += await I2PSpecConformanceAudit.runAll()
 }
 
 for result in results {

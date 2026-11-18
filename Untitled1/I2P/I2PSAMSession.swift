@@ -267,6 +267,16 @@ final class I2PSAMSession {
     private(set) var leaseSet: I2PLeaseSet?
     private(set) var bytesTx = 0
     private(set) var bytesRx = 0
+    /// Messages (not chunks) exchanged in each direction, split by style.
+    private var streamsSent = 0
+    private var streamsReceived = 0
+    private var datagramsSent = 0
+    private var datagramsReceived = 0
+    /// When the client created the session (the detail screen's uptime).
+    let createdAt: Date
+    /// Cached at-cap verdict for the send log, refreshed at most once a second.
+    private var lastCapCheck = Date.distantPast
+    private var wasAtCap = false
     /// Connections waiting for an inbound stream (STREAM ACCEPT).
     var pendingAccept: I2PSAMConnection?
     /// One buffered inbound SYN for the accept-after-connect race.
@@ -316,14 +326,20 @@ final class I2PSAMSession {
     var destinationHash: Data { keys.destination.hash }
     var destinationBase64: String { keys.destination.raw.base64EncodedString() }
 
+    /// The key this session's bandwidth ceiling is saved and measured under:
+    /// the SAM session ID the client created it with.
+    var bandwidthKey: String { nickname }
+
     init(nickname: String, style: I2PSAMStyle, keys: I2PSAMDestinationKeys,
          pool: I2PTunnelPool, transport: I2PSAMGarlicTransport,
-         delivery: I2PDeliveryTransport, encryptedPublication: Bool = false) {
+         delivery: I2PDeliveryTransport, encryptedPublication: Bool = false,
+         createdAt: Date = Date()) {
         self.nickname = nickname
         self.style = style
         self.keys = keys
         self.pool = pool
         self.transport = transport
+        self.createdAt = createdAt
         self.publishesEncryptedLeaseSet = encryptedPublication
         self.b33Credentials = I2PB33Credentials(
             ed25519Seed: keys.signingSeed,
@@ -343,8 +359,14 @@ final class I2PSAMSession {
         }
         garlicHandler.addLocalConsumer { [weak self] message, _ in
             guard let self, message.type == .dataMessage else { return }
-            guard let frame = I2PSAMFrame.parse(message.payload) else {
-                self.event("inbound frame unparseable (\(message.payload.count)B)")
+            // The Data body is length-prefixed; a body whose length is wrong is
+            // dropped rather than read as a frame.
+            guard let body = try? I2NPDataMessage.parse(message.payload) else {
+                self.event("inbound data body unparseable (\(message.payload.count)B)")
+                return
+            }
+            guard let frame = I2PSAMFrame.parse(body) else {
+                self.event("inbound frame unparseable (\(body.count)B)")
                 return
             }
             self.assembler.ingest(frame)
@@ -369,7 +391,13 @@ final class I2PSAMSession {
     }
 
     func send(_ frame: I2PSAMFrame, to lease: I2PGarlicLease, remote: I2PDestination) async throws {
-        let message = I2NPMessage(type: .dataMessage, payload: frame.serialize())
+        let payload = frame.serialize()
+        // The session's own ceiling shapes every stream and datagram send that
+        // leaves it, on top of the router-wide caps: one client cannot consume
+        // the whole router cap.
+        await I2PBandwidthGovernor.shared.admitSessionSend(bandwidthKey, bytes: payload.count)
+        let message = I2NPMessage(type: .dataMessage,
+                                  payload: I2NPDataMessage(payload: payload).serialize())
         let garlic = try garlicSession(toward: remote)
         try await transport.send(message, to: lease, garlicSession: garlic, pool: pool)
         lock.lock()
@@ -377,7 +405,54 @@ final class I2PSAMSession {
         if frame.flags.contains(.datagram), frame.chunkIndex == 0 {
             replyLeases[remote.hash] = lease
         }
+        // Counters are per message, not per chunk: only the first chunk of a
+        // message speaks for it.
+        if frame.chunkIndex == 0 {
+            if frame.flags.contains(.datagram) {
+                datagramsSent += 1
+            } else {
+                streamsSent += 1
+            }
+        }
         lock.unlock()
+        if frame.chunkIndex == 0 {
+            noteSend(frame)
+        }
+    }
+
+    /// One bridge log line per message sent, so the session's recent-activity
+    /// list says what it did between its inbound frames.
+    private func noteSend(_ frame: I2PSAMFrame) {
+        var line: String
+        if frame.flags.contains(.datagram) {
+            line = "datagram \(frame.chunk.count)B"
+        } else if frame.flags.contains(.syn) {
+            line = "stream syn"
+        } else if frame.flags.contains(.fin) {
+            line = "stream fin"
+        } else {
+            line = "send \(frame.chunk.count)B"
+        }
+        let now = Date()
+        lock.lock()
+        let recheck = now.timeIntervalSince(lastCapCheck) >= 1
+        var atCap = wasAtCap
+        lock.unlock()
+        if recheck {
+            // The governor's reading walks its whole sample window, so a busy
+            // session asks it once a second rather than once per message.
+            let reading = I2PBandwidthGovernor.shared.sessionReading(bandwidthKey)
+            atCap = reading.capBytesPerSecond > 0
+                && reading.bytesPerSecond >= Double(reading.capBytesPerSecond) * 0.9
+            lock.lock()
+            lastCapCheck = now
+            wasAtCap = atCap
+            lock.unlock()
+        }
+        if atCap {
+            line += " · at cap"
+        }
+        event(line)
     }
 
     // MARK: LeaseSet publication
@@ -500,6 +575,11 @@ final class I2PSAMSession {
     private func routeInbound(_ completed: I2PSAMInboundAssembler.Completed) {
         lock.lock()
         bytesRx += completed.data.count
+        if completed.flags.contains(.datagram) {
+            datagramsReceived += 1
+        } else {
+            streamsReceived += 1
+        }
         let owner = self.owner
         lock.unlock()
         event("inbound frame: \(completed.data.count)B flags=\(completed.flags.rawValue) stream=\(completed.streamID)")
@@ -534,6 +614,8 @@ final class I2PSAMSession {
     func shutdown() {
         pool.stop()
         udpSender?.shutdown()
+        // Frees the bucket; the ceiling itself stays saved under the session key.
+        I2PBandwidthGovernor.shared.forgetSession(bandwidthKey)
     }
 
     /// Lazily creates the UDP delivery socket and sends a datagram to the
@@ -554,6 +636,7 @@ final class I2PSAMSession {
         let rx = bytesRx
         let published = leaseSet != nil || encryptedLeaseSet != nil
         lock.unlock()
+        let bandwidth = I2PBandwidthGovernor.shared.sessionReading(bandwidthKey)
         return I2PSAMSessionSummary(
             nickname: nickname,
             style: style.rawValue,
@@ -562,7 +645,61 @@ final class I2PSAMSession {
             tunnelsIn: pool.activeCount(.inbound),
             published: published,
             bytesTx: tx,
-            bytesRx: rx
+            bytesRx: rx,
+            sendBytesPerSecond: bandwidth.bytesPerSecond,
+            capBytesPerSecond: bandwidth.capBytesPerSecond
+        )
+    }
+
+    /// Everything the session detail screen reads: the destination, the tunnel
+    /// pool per direction with each live tunnel's remaining lifetime, the
+    /// stream/datagram counters, the live send rate against the saved cap, and
+    /// the bridge log lines that belong to this session (supplied by the
+    /// bridge, which owns the log).
+    func detail(logLines: [String] = []) -> I2PSAMSessionDetail {
+        let outbound = pool.outboundTunnels
+            .sorted { $0.expiresAt < $1.expiresAt }
+            .map { tunnel in
+                I2PSAMTunnelReading(gatewayTunnelID: tunnel.gatewayTunnelID,
+                                    hopCount: tunnel.hopCount,
+                                    remainingLifetime: tunnel.remainingLifetime())
+            }
+        let inbound = pool.inboundTunnels
+            .sorted { $0.expiresAt < $1.expiresAt }
+            .map { tunnel in
+                I2PSAMTunnelReading(gatewayTunnelID: tunnel.gatewayTunnelID,
+                                    hopCount: tunnel.hopCount,
+                                    remainingLifetime: tunnel.remainingLifetime())
+            }
+        lock.lock()
+        let streams = (sent: streamsSent, received: streamsReceived)
+        let datagrams = (sent: datagramsSent, received: datagramsReceived)
+        let tx = bytesTx
+        let rx = bytesRx
+        let published = leaseSet != nil || encryptedLeaseSet != nil
+        lock.unlock()
+        let bandwidth = I2PBandwidthGovernor.shared.sessionReading(bandwidthKey)
+        return I2PSAMSessionDetail(
+            nickname: nickname,
+            style: style.rawValue,
+            createdAt: createdAt,
+            destinationHashHex: destinationHash.hex,
+            destinationBase64: destinationBase64,
+            b33Address: b33Address,
+            leasePublished: published,
+            tunnelsOut: outbound,
+            tunnelsOutTarget: pool.targetCount(.outbound),
+            tunnelsIn: inbound,
+            tunnelsInTarget: pool.targetCount(.inbound),
+            streamsSent: streams.sent,
+            streamsReceived: streams.received,
+            datagramsSent: datagrams.sent,
+            datagramsReceived: datagrams.received,
+            bytesTx: tx,
+            bytesRx: rx,
+            sendBytesPerSecond: bandwidth.bytesPerSecond,
+            capBytesPerSecond: bandwidth.capBytesPerSecond,
+            logLines: logLines
         )
     }
 }
@@ -577,6 +714,49 @@ struct I2PSAMSessionSummary {
     let published: Bool
     let bytesTx: Int
     let bytesRx: Int
+    /// The session's measured send rate over the last minute.
+    let sendBytesPerSecond: Double
+    /// The per-session cap it is held to; 0 means uncapped.
+    let capBytesPerSecond: Int
+}
+
+/// One live tunnel of a session's pool, as the detail screen's countdowns see
+/// it.
+struct I2PSAMTunnelReading: Identifiable {
+    /// The gateway's receive tunnel ID, unique within the pool.
+    var id: UInt32 { gatewayTunnelID }
+    let gatewayTunnelID: UInt32
+    let hopCount: Int
+    let remainingLifetime: TimeInterval
+}
+
+/// The live reading behind the SAM session detail screen.
+struct I2PSAMSessionDetail {
+    let nickname: String
+    let style: String
+    let createdAt: Date
+    /// The full destination hash in hex; the screen shows its prefix.
+    let destinationHashHex: String
+    /// The full destination, as the copy button hands it out.
+    let destinationBase64: String
+    /// The session's b33 host when it publishes an encrypted LeaseSet.
+    let b33Address: String?
+    let leasePublished: Bool
+    /// Live tunnels per direction, soonest expiry first.
+    let tunnelsOut: [I2PSAMTunnelReading]
+    let tunnelsOutTarget: Int
+    let tunnelsIn: [I2PSAMTunnelReading]
+    let tunnelsInTarget: Int
+    let streamsSent: Int
+    let streamsReceived: Int
+    let datagramsSent: Int
+    let datagramsReceived: Int
+    let bytesTx: Int
+    let bytesRx: Int
+    let sendBytesPerSecond: Double
+    let capBytesPerSecond: Int
+    /// The bridge log lines that belong to this session, oldest first.
+    let logLines: [String]
 }
 // MARK: - Session key persistence
 

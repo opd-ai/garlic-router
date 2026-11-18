@@ -2,48 +2,52 @@
 //  RouterDashboardView.swift
 //  Live router status dashboard fed by the running router's event stream.
 //
+//  The first card answers "is it working?" in plain language and offers the
+//  one action that helps; the cards below stay the technical detail they were.
+//
 
 import SwiftUI
 
 struct RouterDashboardView: View {
     @State private var snapshot: I2PRouterStatusSnapshot?
+    /// True from the moment a start is asked for until the first live reading
+    /// arrives, so the screen never flashes "Router is off" while the router
+    /// is actually opening connections.
     @State private var isStarting = false
+    @State private var isLookingForPeers = false
+    /// Set when an explicit "look for peers" round comes back with nothing:
+    /// a recovery hint instead of a silent no-op.
+    @State private var peerAttemptMessage: String?
+    /// One subscription for this view's lifetime: the status stream is a
+    /// single-consumer sequence, so it is attached once and never cancelled
+    /// (a pushed detail screen does not stop the dashboard's readings).
+    @State private var streamTask: Task<Void, Never>?
 
     private let accent = Color(red: 0.47, green: 0.44, blue: 0.97)
     private let background = Color(red: 0.055, green: 0.06, blue: 0.09)
+    private let okGreen = Color(red: 0.29, green: 0.87, blue: 0.50)
+    private let warnOrange = Color(red: 0.98, green: 0.62, blue: 0.24)
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 14) {
                     if let snapshot {
-                        headerCard(snapshot)
+                        statusCard(snapshot)
                         eepsiteBrowserCard
                         participationCard
                         statGrid(snapshot)
+                        liveInteropCard(snapshot)
                         b33HostsCard
                         peersCard(snapshot)
                         tunnelsCard(snapshot)
                         throughputCard(snapshot)
                         footerText(snapshot)
                     } else if isStarting {
-                        ProgressView("Starting router…")
-                            .padding(.top, 80)
+                        startingCard
+                            .padding(.top, 40)
                     } else {
-                        card(title: "Router is stopped") {
-                            Text("The router starts only when you ask, keeping app launch light and predictable.")
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                            Button(action: startRouter) {
-                                Label("Start router", systemImage: "play.fill")
-                                    .font(.subheadline.weight(.semibold))
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 10)
-                                    .background(accent.opacity(0.18), in: RoundedRectangle(cornerRadius: 12))
-                            }
-                            .buttonStyle(.plain)
-                            .tint(accent)
-                        }
+                        stoppedCard
                         eepsiteBrowserCard
                         participationCard
                         b33HostsCard
@@ -56,8 +60,31 @@ struct RouterDashboardView: View {
             .background(background.ignoresSafeArea())
             .navigationTitle("Router")
             .navigationBarTitleDisplayMode(.large)
+            .onAppear(perform: attachIfRunning)
         }
         .preferredColorScheme(.dark)
+    }
+
+    // MARK: - Starting and subscribing
+
+    /// The router runs for the whole process, not for this tab: a router
+    /// started from the first-run screen (or left running while another tab was
+    /// open) must read as running here instead of offering to start it again.
+    private func attachIfRunning() {
+        guard I2PRouterAppContext.shared.lifecycleState == .running else { return }
+        isStarting = true
+        attachToSnapshots()
+    }
+
+    private func attachToSnapshots() {
+        guard streamTask == nil else { return }
+        let engine = I2PRouterAppContext.shared.engine
+        streamTask = Task { @MainActor in
+            for await update in engine.snapshots {
+                snapshot = update
+                isStarting = false
+            }
+        }
     }
 
     private func startRouter() {
@@ -66,27 +93,74 @@ struct RouterDashboardView: View {
         Task { @MainActor in
             let context = I2PRouterAppContext.shared
             context.start()
-            for await update in context.engine.snapshots {
-                snapshot = update
-                isStarting = false
-            }
+            attachToSnapshots()
         }
     }
 
-    // MARK: - Header
+    /// The action the "looking for peers" reading offers: one deliberate round
+    /// of dialing now instead of waiting for the bootstrap cycle's next pass.
+    private func lookForPeers() {
+        guard !isLookingForPeers else { return }
+        isLookingForPeers = true
+        peerAttemptMessage = nil
+        Task { @MainActor in
+            let established = await I2PRouterAppContext.shared.ensureSessions(atLeast: 3, within: 20)
+            isLookingForPeers = false
+            peerAttemptMessage = established > 0 ? nil
+                : "Still no peer after a fresh attempt. Check that this device has internet access; the router keeps retrying on its own."
+        }
+    }
 
-    private func headerCard(_ snapshot: I2PRouterStatusSnapshot) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                Circle().fill(Color.green).frame(width: 8, height: 8)
-                Text("Router live")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(Color.green)
-                Spacer()
-                Text(uptimeText(snapshot.uptime))
+    // MARK: - Status
+
+    /// The one honest status line: what the router is doing, in plain words,
+    /// with the next useful action when there is one.
+    private func statusCard(_ snapshot: I2PRouterStatusSnapshot) -> some View {
+        let status = I2PRouterPlainStatus.reading(for: snapshot)
+        return VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(toneColor(status.tone))
+                        .frame(width: 8, height: 8)
+                    Text(status.headline)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(toneColor(status.tone))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 6)
+                }
+                Text(status.detail)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(status.accessibilitySummary)
+            .accessibilityAddTraits(.updatesFrequently)
+
+            if status.action == .findPeers {
+                Button(action: lookForPeers) {
+                    Label(isLookingForPeers ? "Looking for peers…" : "Look for peers now",
+                          systemImage: isLookingForPeers ? "hourglass" : "arrow.clockwise")
+                        .font(.subheadline.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                        .background(accent.opacity(0.18), in: RoundedRectangle(cornerRadius: 12))
+                }
+                .buttonStyle(.plain)
+                .tint(accent)
+                .disabled(isLookingForPeers)
+                .accessibilityHint("Dials the peers closest to this router again")
+            }
+
+            if let note = peerAttemptMessage {
+                Text(note)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
+
+            Divider().opacity(0.2)
 
             Text("Router identity")
                 .font(.caption.weight(.semibold))
@@ -101,6 +175,8 @@ struct RouterDashboardView: View {
                 .padding(.horizontal, 12)
                 .frame(maxWidth: .infinity)
                 .background(accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+                .accessibilityLabel("Router identity")
+                .accessibilityValue(formatHash(snapshot.identityHashHex))
 
             if snapshot.isLocalFloodfill {
                 Label("Floodfill router", systemImage: "point.3.connected.trianglepath.dotted")
@@ -113,18 +189,97 @@ struct RouterDashboardView: View {
         .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 18))
     }
 
+    private func toneColor(_ tone: I2PRouterPlainStatus.Tone) -> Color {
+        switch tone {
+        case .good: return okGreen
+        case .waiting: return warnOrange
+        case .off: return Color.secondary
+        }
+    }
+
+    /// Shown from the tap on Start until the first reading: names what is
+    /// happening, how long it normally takes and that nothing is blocked.
+    private var startingCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(accent)
+                Text("Starting the router…")
+                    .font(.subheadline.weight(.semibold))
+            }
+            Text("Opening connections and looking for the first peers. That usually takes under a minute.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("You can switch tabs — the router keeps working while this app is open.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 18))
+        .accessibilityElement(children: .combine)
+    }
+
+    /// The stopped state as a small first-run screen of its own: what turning it
+    /// on means, the single primary action, and where the limits live.
+    private var stoppedCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(Color.secondary.opacity(0.6))
+                    .frame(width: 8, height: 8)
+                Text("Router is off")
+                    .font(.subheadline.weight(.semibold))
+                Spacer(minLength: 6)
+            }
+
+            Text("Nothing is sent or received until you start it. The router runs while this app is open; iOS pauses it when you leave.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Button(action: startRouter) {
+                Label("Start router", systemImage: "play.fill")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 11)
+                    .background(accent.opacity(0.22), in: RoundedRectangle(cornerRadius: 12))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12)
+                            .strokeBorder(accent.opacity(0.35), lineWidth: 1)
+                    )
+            }
+            .buttonStyle(.plain)
+            .tint(accent)
+            .accessibilityHint("Joins the I2P network and starts looking for peers")
+
+            Text("Bandwidth caps, quiet hours and whether the router carries other people's tunnels live in Participation.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 18))
+    }
+
     // MARK: - Stat grid
 
     private func statGrid(_ snapshot: I2PRouterStatusSnapshot) -> some View {
         LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
-            statTile("NTCP2 sessions", value: "\(snapshot.ntcp2SessionCount)",
-                     icon: "link", caption: "established")
+            statTile("NTCP2 peers", value: "\(snapshot.ntcp2SessionCount)",
+                     icon: "link", caption: "live sessions")
+            statTile("SSU2 peers", value: "\(snapshot.ssu2SessionCount)",
+                     icon: "antenna.radiowaves.left.and.right", caption: "live sessions")
             statTile("Floodfills", value: "\(snapshot.floodfillCount)",
                      icon: "point.3.connected.trianglepath.dotted", caption: "\(snapshot.peerCount) peers known")
             statTile("RouterInfos", value: "\(snapshot.routerInfoCount)",
-                     icon: "network", caption: "netdb entries")
+                     icon: "network", caption: "network database")
             statTile("LeaseSets", value: "\(snapshot.leaseSetCount)",
-                     icon: "doc.text", caption: "netdb entries")
+                     icon: "doc.text", caption: "network database")
         }
     }
 
@@ -143,6 +298,58 @@ struct RouterDashboardView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(14)
         .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 16))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(title): \(value), \(caption)")
+    }
+
+    // MARK: - Live interoperability
+
+    /// The transport card's way into the live probe: what the last run of
+    /// real handshakes against mainnet peers observed, and how many peers a
+    /// failed handshake is holding back from the dial paths right now.
+    private func liveInteropCard(_ snapshot: I2PRouterStatusSnapshot) -> some View {
+        NavigationLink {
+            LiveInteropView()
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "arrow.left.arrow.right")
+                    .font(.subheadline)
+                    .foregroundStyle(accent)
+                    .frame(width: 22)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Live interoperability")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                    Text("Handshake results from the last live probe")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                    Text(heldBackLine(snapshot))
+                        .font(.caption2)
+                        .foregroundStyle(snapshot.handshakeHeldBackCount > 0 ? warnOrange : Color.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                }
+                Spacer(minLength: 6)
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(16)
+            .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 18))
+        }
+        .buttonStyle(.plain)
+        .accessibilityHint("Opens the live handshake probe results")
+    }
+
+    /// The transport card's count of peers the dial paths are skipping until
+    /// their next attempt is due.
+    private func heldBackLine(_ snapshot: I2PRouterStatusSnapshot) -> String {
+        let count = snapshot.handshakeHeldBackCount
+        guard count > 0 else { return "No peer held back by a failed handshake" }
+        return "\(I2PRouterPlainStatus.count(count, "peer")) held back after a failed handshake"
     }
 
     // MARK: - Eepsite browser
@@ -183,6 +390,7 @@ struct RouterDashboardView: View {
             )
         }
         .buttonStyle(.plain)
+        .accessibilityHint("Opens the .i2p browser")
     }
 
     // MARK: - b33 host book
@@ -218,6 +426,7 @@ struct RouterDashboardView: View {
             .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 18))
         }
         .buttonStyle(.plain)
+        .accessibilityHint("Opens the b33 host book")
     }
 
     // MARK: - Participation controls
@@ -237,7 +446,7 @@ struct RouterDashboardView: View {
                     Text("Participation")
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.primary)
-                    Text("Bandwidth caps, tunnel share and floodfill role")
+                    Text("Bandwidth caps, quiet hours and the floodfill role")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -253,6 +462,7 @@ struct RouterDashboardView: View {
             .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 18))
         }
         .buttonStyle(.plain)
+        .accessibilityHint("Opens the participation controls")
     }
 
     // MARK: - Peers & sessions
@@ -260,10 +470,11 @@ struct RouterDashboardView: View {
     private func peersCard(_ snapshot: I2PRouterStatusSnapshot) -> some View {
         card(title: "Peers & Sessions") {
             if snapshot.peers.isEmpty {
-                Label("No peer sessions yet — sessions appear once transports establish",
+                Label("No peer connected yet. Peers appear here as soon as a session establishes — the router keeps trying while it runs.",
                       systemImage: "antenna.radiowaves.left.and.right")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             } else {
                 ForEach(snapshot.peers) { peer in
                     NavigationLink {
@@ -272,6 +483,7 @@ struct RouterDashboardView: View {
                         peerRow(peer)
                     }
                     .buttonStyle(.plain)
+                    .accessibilityHint("Opens this peer's details")
                 }
             }
         }
@@ -300,6 +512,7 @@ struct RouterDashboardView: View {
                         Image(systemName: "point.3.connected.trianglepath.dotted")
                             .font(.caption2)
                             .foregroundStyle(accent)
+                            .accessibilityLabel("Floodfill")
                     }
                     Text("bucket \(peer.kademliaBucket)")
                         .font(.system(.caption2, design: .monospaced))
@@ -316,6 +529,7 @@ struct RouterDashboardView: View {
                 .foregroundStyle(.secondary)
         }
         .padding(.vertical, 2)
+        .accessibilityElement(children: .combine)
     }
 
     private func formatBytes(_ bytes: Int) -> String {
@@ -348,6 +562,7 @@ struct RouterDashboardView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .accessibilityHint("Opens tunnel health: build success, latency and pool timelines")
             ForEach(snapshot.pools, id: \.direction) { pool in
                 poolSection(pool)
             }
@@ -370,9 +585,10 @@ struct RouterDashboardView: View {
                 .foregroundStyle(.secondary)
         }
         if pool.tunnels.isEmpty {
-            Text("No tunnels yet — builds start once peers are known")
+            Text("No tunnels yet — builds start once the router has a few peers.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         } else {
             ForEach(pool.tunnels) { tunnel in
                 tunnelRow(tunnel)
@@ -384,8 +600,9 @@ struct RouterDashboardView: View {
         let remaining = tunnel.expiresAt.timeIntervalSince(snapshotDate)
         return HStack(spacing: 10) {
             Circle()
-                .fill(remaining > 300 ? Color.green : Color.orange)
+                .fill(remaining > 300 ? okGreen : warnOrange)
                 .frame(width: 7, height: 7)
+                .accessibilityHidden(true)
             Text("\(tunnel.hopCount) hops")
                 .font(.footnote.weight(.medium))
             if let latency = tunnel.buildLatency {
@@ -398,6 +615,8 @@ struct RouterDashboardView: View {
                 .font(.system(.caption, design: .monospaced))
                 .foregroundStyle(.secondary)
         }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(tunnel.hopCount) hops, \(remaining > 300 ? "healthy" : "expiring soon"), expires in \(countdownText(max(0, remaining)))")
     }
 
     private var snapshotDate: Date {
@@ -432,6 +651,8 @@ struct RouterDashboardView: View {
                 .foregroundStyle(accent)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(label)bound: \(value) messages, \(String(format: "%.1f", rate)) per second")
     }
 
     private func sparkline(history: [Double]) -> some View {
@@ -446,6 +667,7 @@ struct RouterDashboardView: View {
         }
         .frame(height: 46, alignment: .bottom)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityHidden(true)
     }
 
     private func footerText(_ snapshot: I2PRouterStatusSnapshot) -> some View {
@@ -463,6 +685,7 @@ struct RouterDashboardView: View {
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
                 .textCase(.uppercase)
+                .accessibilityAddTraits(.isHeader)
             content()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -475,12 +698,6 @@ struct RouterDashboardView: View {
     private func formatHash(_ hex: String) -> String {
         guard hex.count > 20 else { return hex }
         return "\(hex.prefix(10))…\(hex.suffix(10))"
-    }
-
-    private func uptimeText(_ seconds: TimeInterval) -> String {
-        let total = Int(seconds)
-        if total >= 3600 { return "up \(total / 3600)h \((total % 3600) / 60)m" }
-        return "up \(total / 60)m \(total % 60)s"
     }
 
     private func countdownText(_ seconds: TimeInterval) -> String {

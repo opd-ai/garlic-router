@@ -129,10 +129,17 @@ private static func typedPayloadTest() async throws -> String {
         guard (try? I2NPMessage.parse(obsolete)) == nil else {
             throw I2NPError.unsupportedType
         }
+        // A Data body is the spec's [length (4)][payload]; the codec is what
+        // writes the length, so the fixture is built through it.
         let blob = I2PCrypto.randomBytes(64)
-        let dataMessage = I2NPMessage(type: .dataMessage, payload: blob)
+        let dataMessage = I2NPMessage(type: .dataMessage,
+                                      payload: I2NPDataMessage(payload: blob).serialize())
         guard case .dataMessage(let payload) = try I2NPMessage.parse(dataMessage.serialize()).parseBody(),
               payload == blob else { throw I2NPError.invalidPayload }
+        // A hand-built body whose length disagrees with it is rejected whole.
+        guard (try? I2NPDataMessage.parse(Data([0, 0, 0, 64]) + I2PCrypto.randomBytes(10))) == nil else {
+            throw I2NPError.invalidPayload
+        }
         let garlic = I2NPMessage(type: .garlic, payload: I2PCrypto.randomBytes(88))
         guard case .garlic(let cloveSet) = try I2NPMessage.parse(garlic.serialize()).parseBody(),
               cloveSet.count == 88 else { throw I2NPError.invalidPayload }

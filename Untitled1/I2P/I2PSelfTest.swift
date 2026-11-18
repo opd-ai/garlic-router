@@ -93,8 +93,44 @@ enum I2PSelfTest {
         results.append(contentsOf: await I2PGarlicSelfTest.runAll())
         results.append(contentsOf: await I2PB33BlindingSelfTest.runAll())
         results.append(contentsOf: await I2PB33HostBookSelfTest.runAll())
+        results.append(contentsOf: I2PSavedHostsSelfTest.runAll())
+        results.append(contentsOf: I2PRouterPlainStatusSelfTest.runAll())
+        results.append(contentsOf: I2PLiveInteropSelfTest.runAll())
+        results.append(contentsOf: I2POfflinePagesSelfTest.runAll())
+        results.append(contentsOf: await I2PSavedHostsRefreshSelfTest.runAll())
+        results.append(contentsOf: I2PBrowserHistorySelfTest.runAll())
+        results.append(contentsOf: I2PEepsiteVisitStackSelfTest.runAll())
+        results.append(contentsOf: I2PEepsiteShareSelfTest.runAll())
+        results.append(contentsOf: I2PEepsiteFindSelfTest.runAll())
+        results.append(contentsOf: I2PReaderTextSizeSelfTest.runAll())
+        results.append(contentsOf: I2PIRCProtocolSelfTest.runAll())
+        results.append(contentsOf: I2PIRCChatStateSelfTest.runAll())
+        results.append(contentsOf: I2PIRCChannelListSelfTest.runAll())
+        results.append(contentsOf: I2PIRCMentionSelfTest.runAll())
+        results.append(contentsOf: I2PIRCKeywordSelfTest.runAll())
+        results.append(contentsOf: I2PIRCKeywordPauseSelfTest.runAll())
+        results.append(contentsOf: I2PIRCHighlightMatchesSelfTest.runAll())
+        results.append(contentsOf: I2PIRCKeywordEmphasisSelfTest.runAll())
+        results.append(contentsOf: I2PIRCLatencySelfTest.runAll())
+        results.append(contentsOf: I2PIRCSearchSelfTest.runAll())
+        results.append(contentsOf: I2PIRCGlobalSearchSelfTest.runAll())
+        results.append(contentsOf: I2PIRCDayGroupingSelfTest.runAll())
+        results.append(contentsOf: I2PIRCMemberListSelfTest.runAll())
+        results.append(contentsOf: I2PIRCNickCompletionSelfTest.runAll())
+        results.append(contentsOf: I2PIRCDraftsSelfTest.runAll())
+        results.append(contentsOf: I2PIRCServerBookSelfTest.runAll())
+        results.append(contentsOf: I2PIRCHistorySelfTest.runAll())
+        results.append(contentsOf: I2PIRCMuteSelfTest.runAll())
+        results.append(contentsOf: I2PIRCSnoozeSelfTest.runAll())
+        results.append(contentsOf: I2PIRCIgnoreSelfTest.runAll())
         results.append(contentsOf: await I2PSSU2SelfTest.runAll())
+        results.append(contentsOf: await I2PRouterTransportWiringSelfTest.runAll())
         results.append(contentsOf: await I2PRouterStatusSelfTest.runAll())
+        results.append(contentsOf: I2PParticipationSelfTest.runAll())
+        results.append(contentsOf: I2PPeerBlocklistSelfTest.runAll())
+        results.append(contentsOf: I2PPeerHandshakeBackoffSelfTest.runAll())
+        results.append(contentsOf: await I2PSAMBandwidthSelfTest.runAll())
+        results.append(contentsOf: I2PSAMCapShareTests.runAll())
         results.append(contentsOf: I2PSpecComplianceSelfTest.runAll())
         results.append(contentsOf: await I2PCrossValidation.selfTestEntries())
         results.append(contentsOf: await I2PSAMConformanceTest.runAll())
@@ -121,6 +157,31 @@ enum I2PSelfTest {
             let ba = try I2PCrypto.x25519SharedSecret(privateKey: b.privateKey, peerPublicKey: a.publicKey)
             guard ab == ba, ab.count == 32 else { throw I2PWireError.invalidFormat }
             return "32-byte shared secret agreed both directions"
+        }
+
+        run("Ed25519 canonical point encoding (RFC 8032 §5.1.3)") {
+            let seed = I2PCrypto.generateEd25519Seed()
+            let publicKey = I2PCrypto.ed25519PublicKey(fromSeed: seed)
+            guard I2PCrypto.ed25519IsCanonicalPublicKey(publicKey) else {
+                throw I2PWireError.invalidFormat
+            }
+            // y + p for y = 1 is the identity's y written a second time: the
+            // same point with a second valid-looking byte string, which RFC
+            // 8032 requires the decoder to reject.
+            var nonCanonical = [UInt8](repeating: 0xff, count: 32)
+            nonCanonical[0] = 0xee     // 2^255 − 18, little-endian
+            nonCanonical[31] = 0x7f
+            guard !I2PCrypto.ed25519IsCanonicalPublicKey(Data(nonCanonical)) else {
+                throw I2PWireError.invalidFormat
+            }
+            let message = I2PCrypto.randomBytes(32)
+            guard let signature = I2PCrypto.ed25519PureSign(message, seed: seed),
+                  I2PCrypto.ed25519PureVerify(signature: signature, message: message, publicKey: publicKey),
+                  !I2PCrypto.ed25519PureVerify(signature: signature, message: message,
+                                               publicKey: Data(nonCanonical)) else {
+                throw I2PWireError.invalidFormat
+            }
+            return "y < p enforced; a y + p encoding verifies against no signature"
         }
 
         run("HKDF-SHA256 · RFC 5869 vector") {

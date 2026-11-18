@@ -9,6 +9,8 @@ import SwiftUI
 
 struct PeerDetailView: View {
     @State private var peer: I2PPeerSummary
+    @State private var blockReason = ""
+    @State private var isBlocked: Bool
 
     private let accent = Color(red: 0.47, green: 0.44, blue: 0.97)
     private let background = Color(red: 0.055, green: 0.06, blue: 0.09)
@@ -19,6 +21,7 @@ struct PeerDetailView: View {
 
     init(summary: I2PPeerSummary) {
         _peer = State(initialValue: summary)
+        _isBlocked = State(initialValue: I2PPeerBlocklist.shared.isBlocked(identityHex: summary.id))
     }
 
     var body: some View {
@@ -27,8 +30,10 @@ struct PeerDetailView: View {
                 headerCard
                 identityCard
                 sessionCard
+                handshakeCard
                 kademliaCard
                 participationCard
+                blockCard
                 Text("Live · from the router status engine")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
@@ -129,6 +134,53 @@ struct PeerDetailView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    // MARK: - Handshake backoff
+
+    /// The last failed dial of this peer and when the router will try it again.
+    /// The profile lives in memory, so a relaunch starts with no history.
+    private var handshakeCard: some View {
+        card(title: "Handshake") {
+            if let reading = peer.handshakeBackoff {
+                HStack(spacing: 8) {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                        .font(.caption)
+                        .foregroundStyle(accent)
+                        .accessibilityHidden(true)
+                    Text("Last failure")
+                        .font(.footnote.weight(.medium))
+                    Spacer()
+                    Text("\(uptimeText(Date().timeIntervalSince(reading.failedAt))) ago")
+                        .font(.system(.caption, design: .monospaced).weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+                Text(reading.reason.label)
+                    .font(.footnote)
+                    .foregroundStyle(accent)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(nextAttemptText(reading))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("No failed dial recorded for this peer since the router started.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    /// Names when the next dial is due, or says why nothing is scheduled.
+    private func nextAttemptText(_ reading: I2PPeerHandshakeBackoffReading) -> String {
+        guard let due = reading.nextAttemptAt else {
+            return "No retry scheduled — the last handshake succeeded and reset the schedule."
+        }
+        let remaining = due.timeIntervalSinceNow
+        if remaining <= 0 { return "Next attempt is due now." }
+        let clock = due.formatted(date: .omitted, time: .shortened)
+        return "Next attempt in \(uptimeText(remaining)) (at \(clock))."
+    }
+
     // MARK: - Kademlia keyspace
 
     private var kademliaCard: some View {
@@ -189,6 +241,50 @@ struct PeerDetailView: View {
                     .foregroundStyle(peer.tunnelRole != nil ? accent : Color.secondary)
             }
         }
+    }
+
+    // MARK: - Blocklist
+
+    private var blockCard: some View {
+        card(title: "Blocklist") {
+            if isBlocked {
+                Label("Blocked — this peer is never used as a tunnel hop or a netdb lookup target, and its session is closed.",
+                      systemImage: "nosign")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("Unblock it from the Blocked peers section of the Participation screen.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else {
+                TextField("Reason (optional)", text: $blockReason)
+                    .textFieldStyle(.plain)
+                    .font(.footnote)
+                    .padding(.vertical, 8)
+                    .padding(.horizontal, 12)
+                    .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+                Button(action: blockPeer) {
+                    Label("Block this peer", systemImage: "nosign")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(Color.red)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 9)
+                        .background(Color.red.opacity(0.18), in: RoundedRectangle(cornerRadius: 10))
+                }
+                .buttonStyle(.plain)
+                Text("Blocks the identity, not just this connection: hop selection and netdb lookups skip it and the router never dials it again.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func blockPeer() {
+        I2PPeerBlocklist.shared.block(identityHex: peer.id, reason: blockReason)
+        blockReason = ""
+        isBlocked = true
+        Task { await I2PRouterAppContext.shared.enforcePeerBlocklist() }
     }
 
     // MARK: - Helpers

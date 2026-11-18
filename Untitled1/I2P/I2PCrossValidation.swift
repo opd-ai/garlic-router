@@ -156,8 +156,11 @@ enum I2PCrossValidation {
         run("T4-NP-DI-RT", rowID: "NP-DI", "Delivery instructions: local/tunnel/router × delay round trips") {
             try deliveryInstructionsRoundTrip()
         }
-        run("T4-NP-TUNGW-RT", rowID: "NP-TUNGW", "TunnelGateway: gateway ID + message round trip identical") {
+        run("T4-NP-TUNGW-RT", rowID: "NP-TUNGW", "TunnelGateway: the spec's golden layout [tunnelID (4)][length (2)][message] parses and serializes byte-for-byte; short and trailing bodies rejected") {
             try tunnelGatewayRoundTrip()
+        }
+        run("T4-NP-DATA-RT", rowID: "NP-DATA", "Data message body: the spec's [length (4)][payload] golden layout parses and serializes byte-for-byte; short and trailing bodies rejected") {
+            try dataMessageRoundTrip()
         }
         run("T4-NP-TUNDATA-RT", rowID: "NP-TUNDATA", "TunnelData payload: fixed-shape round trip; short payload rejected") {
             try tunnelDataRoundTrip()
@@ -1327,18 +1330,70 @@ enum I2PCrossValidation {
     }
 
     private static func tunnelGatewayRoundTrip() throws -> String {
+        // Golden layout hand-assembled from the I2NP spec's diagram:
+        // tunnelId (4 BE) | length (2 BE) | that many message bytes. Asserting
+        // literal bytes — not a round trip through this same codec — is what
+        // catches a field the encoder and decoder both omit.
+        let innerBytes = Data([0x0B, 0x00, 0x00, 0x00, 0x01])
+        let golden = Data([0x11, 0x22, 0x33, 0x44, 0x00, 0x05, 0x0B, 0x00, 0x00, 0x00, 0x01])
+        let payload = I2PTunnelGatewayPayload(gatewayID: 0x1122_3344, message: innerBytes).serialize()
+        guard payload == golden else { throw I2PWireError.invalidFormat }
+        let (goldenID, goldenMessage) = try I2PTunnelGatewayPayload.parse(golden)
+        guard goldenID == 0x1122_3344, goldenMessage == innerBytes else {
+            throw I2PWireError.invalidFormat
+        }
+        // The same shape with a real I2NP message inside, and the length field
+        // counts exactly that message.
         let inner = I2NPMessage(type: .dataMessage, messageID: 0x0000_0042,
                                 payload: Data("gateway payload".utf8))
-        let payload = I2PTunnelGatewayPayload(gatewayID: 0x1122_3344,
-                                              message: inner.serialize()).serialize()
-        let (gatewayID, message) = try I2PTunnelGatewayPayload.parse(payload)
-        guard gatewayID == 0x1122_3344, message == inner.serialize() else {
+        let framed = I2PTunnelGatewayPayload(gatewayID: 0x01_0203, message: inner.serialize()).serialize()
+        let messageLength = inner.serialize().count
+        guard framed.count == 4 + 2 + messageLength,
+              Array(framed[4..<6]) == [UInt8(messageLength >> 8), UInt8(messageLength & 0xff)],
+              framed[6..<(6 + messageLength)] == inner.serialize()[...] else {
             throw I2PWireError.invalidFormat
         }
-        guard I2PTunnelGatewayPayload(gatewayID: gatewayID, message: message).serialize() == payload else {
+        let (gatewayID, message) = try I2PTunnelGatewayPayload.parse(framed)
+        guard gatewayID == 0x01_0203, message == inner.serialize() else {
             throw I2PWireError.invalidFormat
         }
-        return "gateway ID and encapsulated message round trip byte-for-byte"
+        guard I2PTunnelGatewayPayload(gatewayID: gatewayID, message: message).serialize() == framed else {
+            throw I2PWireError.invalidFormat
+        }
+        // A length that overruns the body is truncated; one that under-runs it
+        // leaves trailing data. Both are rejected rather than guessed at.
+        guard expectThrow({ _ = try I2PTunnelGatewayPayload.parse(framed.dropLast()) }),
+              expectThrow({ _ = try I2PTunnelGatewayPayload.parse(framed + Data([0x00])) }),
+              expectThrow({ _ = try I2PTunnelGatewayPayload.parse(Data([0x11, 0x22, 0x33, 0x44])) })
+        else {
+            throw I2PCrossValidationError.unexpectedSuccess
+        }
+        return "spec golden bytes [tunnelID][length][message] verified in both directions; short, trailing and header-only bodies rejected"
+    }
+
+    private static func dataMessageRoundTrip() throws -> String {
+        // Golden layout per the I2NP spec: length (4 BE) then the payload.
+        let golden = Data([0x00, 0x00, 0x00, 0x03, 0xAA, 0xBB, 0xCC])
+        let payload = Data([0xAA, 0xBB, 0xCC])
+        guard I2NPDataMessage(payload: payload).serialize() == golden,
+              try I2NPDataMessage.parse(golden) == payload else {
+            throw I2PWireError.invalidFormat
+        }
+        // A whole I2NP message framed as a Data body keeps its own header.
+        let message = I2NPMessage(type: .dataMessage, messageID: 0x0000_0007,
+                                  payload: Data("stream frame".utf8))
+        let body = I2NPDataMessage(payload: message.serialize()).serialize()
+        guard try I2NPDataMessage.parse(body) == message.serialize() else {
+            throw I2PWireError.invalidFormat
+        }
+        // A length that disagrees with the body is rejected both ways.
+        guard expectThrow({ _ = try I2NPDataMessage.parse(golden.dropLast()) }),
+              expectThrow({ _ = try I2NPDataMessage.parse(golden + Data([0x00])) }),
+              expectThrow({ _ = try I2NPDataMessage.parse(Data([0x00, 0x00])) })
+        else {
+            throw I2PCrossValidationError.unexpectedSuccess
+        }
+        return "spec golden bytes [length][payload] verified in both directions; short, trailing and header-only bodies rejected"
     }
 
     private static func tunnelDataRoundTrip() throws -> String {

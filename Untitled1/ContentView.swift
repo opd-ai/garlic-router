@@ -2,11 +2,16 @@
 //  ContentView.swift
 //  Untitled1
 //
+//  The audit console (I2P Core) plus the app shell and its one-time
+//  first-run screen.
+//
 
 import SwiftUI
 import UIKit
 
-struct ContentView: View {
+/// The I2P Core tab: the cryptographic suite, the serialization readings and
+/// the five audits. Reached from the shell's "I2P Core" tab.
+struct CoreAuditView: View {
     @State private var results: [I2PSelfTestResult] = []
     @State private var readinessResults: [I2PSelfTestResult] = []
     @State private var stabilityResults: [I2PSelfTestResult] = []
@@ -37,32 +42,10 @@ struct ContentView: View {
 
     private let accent = Color(red: 0.47, green: 0.44, blue: 0.97)
     private let background = Color(red: 0.055, green: 0.06, blue: 0.09)
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        TabView {
-            coreTab
-                .tabItem {
-                    Label("I2P Core", systemImage: "cpu")
-                }
-            RouterDashboardView()
-                .tabItem {
-                    Label("Router", systemImage: "speedometer")
-                }
-            SAMView()
-                .tabItem {
-                    Label("SAM", systemImage: "terminal")
-                }
-            AlignmentView()
-                .tabItem {
-                    Label("Alignment", systemImage: "checkmark.seal")
-                }
-            StrategyView()
-                .tabItem {
-                    Label("Roadmap", systemImage: "map")
-                }
-        }
-        .tint(accent)
-        .preferredColorScheme(.dark)
+        coreTab
     }
 
     private var coreTab: some View {
@@ -753,7 +736,8 @@ struct ContentView: View {
                                      @ViewBuilder rows: () -> some View) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             Button {
-                withAnimation(.easeInOut(duration: 0.2)) {
+                // Reduce Motion: the list still expands, without the animation.
+                withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) {
                     isExpanded.wrappedValue.toggle()
                 }
             } label: {
@@ -789,8 +773,8 @@ struct ContentView: View {
     }
 }
 
-#Preview {
-    ContentView()
+#Preview("I2P Core") {
+    CoreAuditView()
 }
 
 /// Holds a UIApplication background-task assertion for the duration of a long
@@ -825,4 +809,177 @@ struct CapturedCrash {
     let capturedAt: Date
     let probe: String?
     let reportHead: String
+}
+
+// MARK: - App shell
+
+/// The app shell. Five tabs, because iOS turns anything beyond five into a
+/// "More" list that buries whole screens; the product roadmap moved behind the
+/// Alignment tab's toolbar, where it stays one tap away.
+struct ContentView: View {
+    /// Set the first time the first-run screen is dismissed, whichever way it
+    /// is left, so a returning user never meets it again.
+    @AppStorage("i2p.firstRun.completed") private var firstRunCompleted = false
+    @State private var selection: AppTab = .irc
+    @State private var showingFirstRun = false
+
+    private let accent = Color(red: 0.47, green: 0.44, blue: 0.97)
+
+    enum AppTab: Hashable {
+        case irc
+        case core
+        case router
+        case sam
+        case alignment
+    }
+
+    var body: some View {
+        TabView(selection: $selection) {
+            IRCView()
+                .tabItem {
+                    Label("IRC", systemImage: "bubble.left.and.bubble.right")
+                }
+                .tag(AppTab.irc)
+            CoreAuditView()
+                .tabItem {
+                    Label("I2P Core", systemImage: "cpu")
+                }
+                .tag(AppTab.core)
+            RouterDashboardView()
+                .tabItem {
+                    Label("Router", systemImage: "speedometer")
+                }
+                .tag(AppTab.router)
+            SAMView()
+                .tabItem {
+                    Label("SAM", systemImage: "terminal")
+                }
+                .tag(AppTab.sam)
+            AlignmentView()
+                .tabItem {
+                    Label("Alignment", systemImage: "checkmark.seal")
+                }
+                .tag(AppTab.alignment)
+        }
+        .tint(accent)
+        .preferredColorScheme(.dark)
+        .task {
+            if !firstRunCompleted { showingFirstRun = true }
+        }
+        .sheet(isPresented: $showingFirstRun,
+               onDismiss: { firstRunCompleted = true }) {
+            FirstRunView(
+                onStart: {
+                    // Land on the Router tab: starting is the first-run
+                    // decision, and the dashboard is where its result shows.
+                    selection = .router
+                    Task { @MainActor in
+                        I2PRouterAppContext.shared.start()
+                    }
+                },
+                onSkip: {}
+            )
+        }
+    }
+}
+
+// MARK: - First run
+
+/// The one-time introduction: what the app is, what it does with the
+/// connection, and the single decision it needs — start now or not. Skippable,
+/// and never shown again once dismissed.
+struct FirstRunView: View {
+    let onStart: () -> Void
+    let onSkip: () -> Void
+
+    @Environment(\.dismiss) private var dismiss
+
+    private let accent = Color(red: 0.47, green: 0.44, blue: 0.97)
+    private let background = Color(red: 0.055, green: 0.06, blue: 0.09)
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: 10) {
+                Image(systemName: "circle.hexagongrid.fill")
+                    .font(.system(.largeTitle, design: .rounded))
+                    .foregroundStyle(accent)
+                    .accessibilityHidden(true)
+                Text("Welcome to Garlic Router")
+                    .font(.title2.weight(.bold))
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("A full I2P router that runs on this phone — no desktop, no daemon.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            VStack(alignment: .leading, spacing: 16) {
+                point(icon: "iphone",
+                      title: "Runs on this iPhone",
+                      body: "The router joins the I2P network directly. There is nothing to configure to start.")
+                point(icon: "key.fill",
+                      title: "Your identity stays here",
+                      body: "Router keys are generated on this device and kept in the iOS Keychain.")
+                point(icon: "clock",
+                      title: "Runs while the app is open",
+                      body: "iOS pauses the router when you leave. Bandwidth caps and quiet hours are in Participation.")
+            }
+
+            Spacer(minLength: 8)
+
+            Button {
+                onStart()
+                dismiss()
+            } label: {
+                Label("Start the router", systemImage: "play.fill")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(accent.opacity(0.22), in: RoundedRectangle(cornerRadius: 12))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12)
+                            .strokeBorder(accent.opacity(0.35), lineWidth: 1)
+                    )
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint("Joins the I2P network now")
+
+            Button {
+                onSkip()
+                dismiss()
+            } label: {
+                Text("Not now")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(background.ignoresSafeArea())
+        .preferredColorScheme(.dark)
+        .presentationDetents([.large])
+    }
+
+    private func point(icon: String, title: String, body: String) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: icon)
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(accent)
+                .frame(width: 30, height: 30)
+                .background(accent.opacity(0.14), in: RoundedRectangle(cornerRadius: 9))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                Text(body)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .accessibilityElement(children: .combine)
+    }
 }

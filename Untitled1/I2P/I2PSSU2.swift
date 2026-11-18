@@ -185,6 +185,11 @@ final class SSU2InitiatorHandshake {
 
     private var chain = NTCP2NoiseChain()
     private let localStaticKey: Curve25519.KeyAgreement.PrivateKey
+    /// The 32 static-key bytes this router publishes as its SSU2 `s` option.
+    /// The encrypted static section must carry exactly those bytes: a peer
+    /// compares them against the RouterInfo it dialed, and the responder
+    /// demultiplex connection ID derives from the same encoding.
+    private let localStaticPublicKey: Data
     private let remoteStaticKey: Data
     private let introKey: Data
     private let ephemeral = Curve25519.KeyAgreement.PrivateKey()
@@ -201,9 +206,12 @@ final class SSU2InitiatorHandshake {
 
     init(localStaticKey: Curve25519.KeyAgreement.PrivateKey,
          remoteStaticKey: Data, introKey: Data,
-         remoteMLKEMKey: I2PMLKEMPublicKey? = nil) {
+         remoteMLKEMKey: I2PMLKEMPublicKey? = nil,
+         localStaticPublicKey: Data? = nil) {
         precondition(remoteStaticKey.count == 32 && introKey.count == 32)
         self.localStaticKey = localStaticKey
+        self.localStaticPublicKey = localStaticPublicKey
+            ?? localStaticKey.publicKey.rawRepresentation
         self.remoteStaticKey = remoteStaticKey
         self.introKey = introKey
         // The PQ leg is offered only when the peer advertises an ML-KEM
@@ -255,7 +263,7 @@ final class SSU2InitiatorHandshake {
         // The encrypted static-key section is exactly 48 bytes on the wire
         // (32-byte ciphertext + 16-byte tag of the key alone, per the spec
         // SessionRequest layout the receiver slices at 64..<112).
-        let staticPlain = localStaticKey.publicKey.rawRepresentation
+        let staticPlain = localStaticPublicKey
         packet.append(try chain.encrypt(staticPlain))
         let ss = try localStaticKey.sharedSecretFromKeyAgreement(with: responderStatic)
         chain.mixKey(ss.withUnsafeBytes { Data($0) })
@@ -397,6 +405,10 @@ final class SSU2ResponderHandshake {
 
     private var chain = NTCP2NoiseChain()
     private let localStaticKey: Curve25519.KeyAgreement.PrivateKey
+    /// The static-key encoding this router publishes as its SSU2 `s` option:
+    /// the SessionCreated static section carries exactly these bytes, and the
+    /// ephemeral-region obfuscation keys off the same encoding.
+    private let localStaticPublicKey: Data
     private let introKey: Data
     private let localConnectionID: Data
     private let tokenManager: SSU2TokenManager
@@ -408,8 +420,11 @@ final class SSU2ResponderHandshake {
     init(localStaticKey: Curve25519.KeyAgreement.PrivateKey, localConnectionID: Data,
          introKey: Data, tokenManager: SSU2TokenManager,
          localMLKEMSecretKey: I2PMLKEMSecretKey? = nil,
-         localRouterInfoData: Data = Data()) {
+         localRouterInfoData: Data = Data(),
+         localStaticPublicKey: Data? = nil) {
         self.localStaticKey = localStaticKey
+        self.localStaticPublicKey = localStaticPublicKey
+            ?? localStaticKey.publicKey.rawRepresentation
         self.localConnectionID = localConnectionID
         self.introKey = introKey
         self.tokenManager = tokenManager
@@ -458,7 +473,7 @@ final class SSU2ResponderHandshake {
         var masked = Data(packet)
         try SSU2HeaderProtection.unmaskHeader(&masked, phase: .sessionRequest, introKey: introKey)
         try SSU2HeaderProtection.obfuscateEphemeralRegion(&masked, introKey: introKey,
-                                                          responderStaticKey: localStaticKey.publicKey.rawRepresentation)
+                                                          responderStaticKey: localStaticPublicKey)
         let header = try SSU2PacketHeader.parse(masked)
         guard header.type == .sessionRequest, header.isLong,
               let source = header.sourceConnectionID, let token = header.token else {
@@ -538,7 +553,7 @@ final class SSU2ResponderHandshake {
         let ee = try ephemeral.sharedSecretFromKeyAgreement(with: aliceEphemeral)
         chain.mixKey(ee.withUnsafeBytes { Data($0) })
         // 48-byte encrypted static-key section: 32-byte ciphertext + tag.
-        let staticPlain = localStaticKey.publicKey.rawRepresentation
+        let staticPlain = localStaticPublicKey
         packet.append(try chain.encrypt(staticPlain))
 
         let aliceStatic = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: aliceStaticPub!)
@@ -562,7 +577,7 @@ final class SSU2ResponderHandshake {
         }
 
         try SSU2HeaderProtection.obfuscateEphemeralRegion(&packet, introKey: introKey,
-                                                          responderStaticKey: localStaticKey.publicKey.rawRepresentation)
+                                                          responderStaticKey: localStaticPublicKey)
         try SSU2HeaderProtection.maskHeader(&packet, phase: .sessionCreated, introKey: introKey)
         return packet
     }
@@ -956,6 +971,10 @@ final class SSU2Session {
 
     private let localStaticKey: Curve25519.KeyAgreement.PrivateKey
     private let remoteStaticKey: Data?
+    /// Our published SSU2 static-key encoding (the RouterInfo `s` option): the
+    /// handshake carries exactly these bytes, and the responder demultiplex
+    /// connection ID derives from them.
+    private let localStaticPublicKey: Data
     private let introKey: Data
     /// Our ML-KEM capability for accepting hybrid sessions (responder side).
     private let localMLKEMSecretKey: I2PMLKEMSecretKey?
@@ -980,9 +999,16 @@ final class SSU2Session {
     private var lastActivity = Date()
     private var terminationPacket: Data?
     private(set) var establishedAt: Date?
+    /// I2NP payload bytes carried in each direction on the established session.
+    private(set) var bytesIn = 0
+    private(set) var bytesOut = 0
     private(set) var outbox: [(data: Data, endpoint: SSU2Endpoint?)] = []
 
     var isEstablished: Bool { state == .established }
+
+    /// The peer's router hash, learned from the RouterInfo the handshake
+    /// exchanged (SessionCreated payload or SessionConfirmed).
+    var remoteRouterHash: Data? { remoteRouterInfo?.identity.hash }
 
     /// The negotiated hybrid leg for this session
     /// (nil = the handshake completed classically).
@@ -998,9 +1024,12 @@ final class SSU2Session {
          tokenManager: SSU2TokenManager = SSU2TokenManager(),
          publishedEndpoint: SSU2Endpoint? = nil,
          mlKemSecretKey: I2PMLKEMSecretKey? = nil,
-         remoteMLKEMKeyData: Data? = nil) {
+         remoteMLKEMKeyData: Data? = nil,
+         localStaticPublicKey: Data? = nil) {
         self.role = role
         self.localStaticKey = localStaticKey
+        self.localStaticPublicKey = localStaticPublicKey
+            ?? localStaticKey.publicKey.rawRepresentation
         self.remoteStaticKey = remoteStaticKey
         self.introKey = remoteIntroKey
         self.localMLKEMSecretKey = mlKemSecretKey
@@ -1012,7 +1041,7 @@ final class SSU2Session {
             // The responder's local connection ID derives from its own static
             // key so inbound handshake packets demultiplex without prior state.
             localConnectionID = SSU2InitiatorHandshake.responderConnectionID(
-                for: localStaticKey.publicKey.rawRepresentation)
+                for: self.localStaticPublicKey)
         } else {
             localConnectionID = SSU2PacketHeader.randomConnectionID()
         }
@@ -1046,7 +1075,8 @@ final class SSU2Session {
         }
         let engine = SSU2InitiatorHandshake(localStaticKey: localStaticKey,
                                             remoteStaticKey: remoteStaticKey, introKey: introKey,
-                                            remoteMLKEMKey: remoteMLKEMKey)
+                                            remoteMLKEMKey: remoteMLKEMKey,
+                                            localStaticPublicKey: localStaticPublicKey)
         initiator = engine
         let token: Data?
         if forceInvalidToken {
@@ -1184,7 +1214,8 @@ final class SSU2Session {
                                                    localConnectionID: localConnectionID,
                                                    introKey: introKey, tokenManager: tokenManager,
                                                    localMLKEMSecretKey: localMLKEMSecretKey,
-                                                   localRouterInfoData: localRouterInfoData)
+                                                   localRouterInfoData: localRouterInfoData,
+                                                   localStaticPublicKey: localStaticPublicKey)
             }
             switch header.type {
             case .tokenRequest:
@@ -1343,6 +1374,7 @@ final class SSU2Session {
         for block in blocks {
             switch block {
             case .dataFragment(let messageID, let fragmentIndex, let totalFragments, let fragment):
+                bytesIn += fragment.count
                 if totalFragments == 1 {
                     delegate?.session(self, didReceiveData: fragment)
                     continue
@@ -1407,6 +1439,7 @@ final class SSU2Session {
             throw SSU2Error.notEstablished
         }
         nextMessageID = nextMessageID &+ 1
+        bytesOut += i2np.count
         let fragments = try SSU2MessageFragmenter.split(i2np, messageID: nextMessageID,
                                                         maximumFragmentPayload: 1200)
         for fragment in fragments {
@@ -1554,13 +1587,21 @@ protocol SSU2TransportDelegate: AnyObject {
 /// session pool keyed by remote endpoint, and connected UDP flows for outbound
 /// sessions. Inbound handshake packets demultiplex by the responder connection
 /// ID (derived from the local static key) and spawn responder sessions.
+/// Established sessions are additionally indexed by the peer's router hash, so
+/// I2NP delivery and tunnel builds can address a peer the way they address one
+/// over NTCP2.
 final class SSU2Transport {
     weak var delegate: SSU2TransportDelegate?
 
     private let localStaticKey: Curve25519.KeyAgreement.PrivateKey
+    /// The static-key encoding this router publishes as its SSU2 `s` option;
+    /// every session handshakes with exactly these bytes.
+    private let localStaticPublicKey: Data
     private let introKey: Data
-    private let localRouterInfo: I2PRouterInfo
-    private let publishedEndpoint: SSU2Endpoint?
+    /// The RouterInfo new sessions carry to peers. Replaced on republish, so a
+    /// session created after the address changed advertises the fresh one.
+    private var localRouterInfo: I2PRouterInfo
+    private var publishedEndpoint: SSU2Endpoint?
     /// Our ML-KEM capability for hybrid sessions; spawned responder sessions
     /// accept hybrid offers, and initiator sessions carry it for symmetry.
     private let mlKemSecretKey: I2PMLKEMSecretKey?
@@ -1569,17 +1610,47 @@ final class SSU2Transport {
     private var listener: NWListener?
     private var flows: [String: NWConnection] = [:]
     private var sessionsByEndpoint: [String: SSU2Session] = [:]
+    /// Established sessions keyed by the peer's router hash.
+    private var sessionsByHash: [Data: SSU2Session] = [:]
     private(set) var listenerPort: UInt16?
     private var tokenManager = SSU2TokenManager()
 
     init(localStaticKey: Curve25519.KeyAgreement.PrivateKey, introKey: Data,
          localRouterInfo: I2PRouterInfo, publishedEndpoint: SSU2Endpoint? = nil,
-         mlKemSecretKey: I2PMLKEMSecretKey? = nil) {
+         mlKemSecretKey: I2PMLKEMSecretKey? = nil,
+         localStaticPublicKey: Data? = nil) {
         self.localStaticKey = localStaticKey
         self.introKey = introKey
+        self.localStaticPublicKey = localStaticPublicKey
+            ?? localStaticKey.publicKey.rawRepresentation
         self.localRouterInfo = localRouterInfo
         self.publishedEndpoint = publishedEndpoint
         self.mlKemSecretKey = mlKemSecretKey
+    }
+
+    /// Replaces the RouterInfo new sessions present to peers. The router
+    /// re-signs its RouterInfo whenever its reachable address or capabilities
+    /// change; without this a later session would still advertise the bootstrap
+    /// address. Established sessions keep their negotiated state.
+    func updateLocalRouterInfo(_ info: I2PRouterInfo) {
+        lock.lock()
+        localRouterInfo = info
+        lock.unlock()
+    }
+
+    /// Sets the endpoint our peer tests report as observed-ours. A router that
+    /// only learned its public address after the listener bound updates it here.
+    func updatePublishedEndpoint(_ endpoint: SSU2Endpoint?) {
+        lock.lock()
+        publishedEndpoint = endpoint
+        lock.unlock()
+    }
+
+    /// A consistent snapshot of what a new session advertises.
+    private func advertisedState() -> (routerInfo: I2PRouterInfo, endpoint: SSU2Endpoint?) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (localRouterInfo, publishedEndpoint)
     }
 
     /// Starts the UDP listener; port 0 binds an ephemeral port.
@@ -1618,10 +1689,14 @@ final class SSU2Transport {
                  remoteMLKEMKey: Data? = nil,
                  sessionDelegate: SSU2SessionDelegate? = nil) throws -> SSU2Session {
         let endpoint = SSU2Endpoint(host: host, port: port)
+        let advertised = advertisedState()
         let session = SSU2Session(role: .initiator, localStaticKey: localStaticKey,
                                   remoteStaticKey: remoteStaticKey, remoteIntroKey: remoteIntroKey,
-                                  localRouterInfo: localRouterInfo, publishedEndpoint: publishedEndpoint,
-                                  mlKemSecretKey: mlKemSecretKey, remoteMLKEMKeyData: remoteMLKEMKey)
+                                  localRouterInfo: advertised.routerInfo,
+                                  publishedEndpoint: advertised.endpoint,
+                                  mlKemSecretKey: mlKemSecretKey,
+                                  remoteMLKEMKeyData: remoteMLKEMKey,
+                                  localStaticPublicKey: localStaticPublicKey)
         // Install the observer before starting traffic: loopback peers can
         // complete the handshake before `connect` returns.
         session.delegate = sessionDelegate ?? self
@@ -1653,10 +1728,81 @@ final class SSU2Transport {
         return sessionsByEndpoint[endpoint.description] != nil
     }
 
+    // MARK: Router-hash addressing (the running router's send path)
+
+    /// Whether an established session to that peer exists.
+    func hasSession(forRouterHash routerHash: Data) -> Bool {
+        lock.lock()
+        let session = sessionsByHash[routerHash]
+        lock.unlock()
+        return session?.isEstablished ?? false
+    }
+
+    /// Sends an I2NP message over the established session to that peer,
+    /// fragmenting it across data packets exactly as NTCP2 frames it.
+    func send(toRouterHash routerHash: Data, data: Data) throws {
+        lock.lock()
+        let session = sessionsByHash[routerHash]
+        lock.unlock()
+        guard let session, session.isEstablished else {
+            throw SSU2Error.notEstablished
+        }
+        try session.sendData(data)
+    }
+
+    /// Established sessions, one row per peer: the readings the dashboard's
+    /// transport card and the peer inspector show beside NTCP2's.
+    func sessionSummaries() -> [(hash: Data, establishedAt: Date, bytesIn: Int, bytesOut: Int)] {
+        lock.lock()
+        let sessions = Array(sessionsByHash.values)
+        lock.unlock()
+        var seen: Set<Data> = []
+        var out: [(hash: Data, establishedAt: Date, bytesIn: Int, bytesOut: Int)] = []
+        for session in sessions {
+            guard session.isEstablished,
+                  let hash = session.remoteRouterHash,
+                  !seen.contains(hash) else { continue }
+            seen.insert(hash)
+            out.append((hash, session.establishedAt ?? Date(), session.bytesIn, session.bytesOut))
+        }
+        return out
+    }
+
+    /// The count of established peer sessions (the dashboard's SSU2 reading).
+    func establishedSessionCount() -> Int {
+        sessionSummaries().count
+    }
+
+    /// The peers this transport currently holds an established session to.
+    func connectedRouterHashes() -> [Data] {
+        sessionSummaries().map(\.hash)
+    }
+
+    /// Gracefully closes the session to a peer (the peer blocklist's sweep).
+    func closeSession(forRouterHash routerHash: Data) {
+        lock.lock()
+        let session = sessionsByHash[routerHash]
+        lock.unlock()
+        guard let session else { return }
+        do {
+            try session.close()
+        } catch {
+            session.abort()
+        }
+    }
+
+    /// The last endpoints a session was opened to, for diagnostics.
+    func recentPeerEndpoints(limit: Int = 5) -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return Array(sessionsByEndpoint.keys.suffix(limit))
+    }
+
     func shutdown() {
         lock.lock()
         let all = Array(sessionsByEndpoint.values)
         sessionsByEndpoint.removeAll()
+        sessionsByHash.removeAll()
         flows.values.forEach { $0.cancel() }
         flows.removeAll()
         listener?.cancel()
@@ -1707,17 +1853,19 @@ final class SSU2Transport {
         }
         // Unknown peer: does the datagram address our responder connection ID?
         let responderID = SSU2InitiatorHandshake.responderConnectionID(
-            for: localStaticKey.publicKey.rawRepresentation)
+            for: localStaticPublicKey)
         guard SSU2HeaderProtection.detectPhase(datagram, introKey: introKey,
                                                expectedDestinationConnectionID: responderID) != nil else {
             return // unauthenticated noise drops silently
         }
+        let advertised = advertisedState()
         let session = SSU2Session(role: .responder, localStaticKey: localStaticKey,
                                   remoteStaticKey: nil, remoteIntroKey: introKey,
-                                  localRouterInfo: localRouterInfo,
+                                  localRouterInfo: advertised.routerInfo,
                                   tokenManager: tokenManager,
-                                  publishedEndpoint: publishedEndpoint,
-                                  mlKemSecretKey: mlKemSecretKey)
+                                  publishedEndpoint: advertised.endpoint,
+                                  mlKemSecretKey: mlKemSecretKey,
+                                  localStaticPublicKey: localStaticPublicKey)
         session.delegate = self
         lock.lock()
         sessionsByEndpoint[key] = session
@@ -1751,6 +1899,13 @@ extension SSU2Transport: SSU2SessionDelegate {
             sessionsByEndpoint[endpoint.description] = session
             lock.unlock()
         }
+        // Index by the peer's identity so I2NP delivery and tunnel builds can
+        // address it by router hash, the way they address an NTCP2 session.
+        if let hash = remoteRouterInfo?.identity.hash {
+            lock.lock()
+            sessionsByHash[hash] = session
+            lock.unlock()
+        }
         delegate?.transport(self, sessionEstablished: session)
     }
 
@@ -1761,9 +1916,14 @@ extension SSU2Transport: SSU2SessionDelegate {
     func session(_ session: SSU2Session, didClose error: Error?) {
         if let endpoint = session.remoteEndpoint {
             lock.lock()
-            sessionsByEndpoint.removeValue(forKey: endpoint.description)
+            if sessionsByEndpoint[endpoint.description] === session {
+                sessionsByEndpoint.removeValue(forKey: endpoint.description)
+            }
             lock.unlock()
         }
+        lock.lock()
+        sessionsByHash = sessionsByHash.filter { $0.value !== session }
+        lock.unlock()
         delegate?.transport(self, sessionDidClose: session)
     }
 }

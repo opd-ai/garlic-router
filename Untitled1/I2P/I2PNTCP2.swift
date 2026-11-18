@@ -747,11 +747,16 @@ final class NTCP2Transport {
         return listener?.port?.rawValue
     }
 
+    /// Opens an outbound session toward a peer. The session is handed back so a
+    /// probe can read how that one attempt ended (its close reason names a
+    /// refused connect, a hang-up after SessionRequest or a handshake timeout);
+    /// every existing caller ignores the result.
+    @discardableResult
     func connect(host: String, port: UInt16, remoteRouterHash: Data,
-                 remoteStaticKey: Data, remoteIV: Data?) {
+                 remoteStaticKey: Data, remoteIV: Data?) -> NTCP2Session? {
         lock.lock()
         defer { lock.unlock() }
-        guard let nwPort = NWEndpoint.Port(rawValue: port) else { return }
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else { return nil }
         let connection = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .tcp)
         let session = NTCP2Session(role: .initiator,
                                    connection: connection,
@@ -767,6 +772,7 @@ final class NTCP2Transport {
         session.delegate = self
         register(session)
         session.start()
+        return session
     }
 
     func sessionCount() -> Int {

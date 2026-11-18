@@ -160,18 +160,22 @@ struct I2NPMessage {
     /// back (rather than regenerating one) is what makes inbound traffic from
     /// Java I2P / i2pd peers readable at all.
     static func parseShort(_ data: Data) throws -> I2NPMessage {
-        guard data.count >= 9, let type = I2NPMessageType(rawValue: data[0]) else {
+        // `Data` carries its own index base, so a slice whose startIndex is not
+        // zero would trap on `data[0]` and mis-slice `subdata`. Rebase first:
+        // this parser is fed straight from the network.
+        let bytes = Array(data)
+        guard bytes.count >= 9, let type = I2NPMessageType(rawValue: bytes[0]) else {
             throw I2NPError.unsupportedType
         }
-        let messageID = (UInt32(data[1]) << 24) | (UInt32(data[2]) << 16)
-                        | (UInt32(data[3]) << 8) | UInt32(data[4])
-        let seconds = (UInt32(data[5]) << 24) | (UInt32(data[6]) << 16)
-                      | (UInt32(data[7]) << 8) | UInt32(data[8])
+        let messageID = (UInt32(bytes[1]) << 24) | (UInt32(bytes[2]) << 16)
+                        | (UInt32(bytes[3]) << 8) | UInt32(bytes[4])
+        let seconds = (UInt32(bytes[5]) << 24) | (UInt32(bytes[6]) << 16)
+                      | (UInt32(bytes[7]) << 8) | UInt32(bytes[8])
         return I2NPMessage(
             type: type,
             messageID: messageID,
             expiration: Date(timeIntervalSince1970: TimeInterval(seconds)),
-            payload: data.subdata(in: 9..<data.count)
+            payload: Data(bytes[9...])
         )
     }
 
@@ -179,7 +183,10 @@ struct I2NPMessage {
     /// the full 9-byte header). Transport receivers use this to distinguish
     /// mainnet short-header messages from raw non-I2NP payloads.
     static func looksLikeShortHeaderMessage(_ data: Data) -> Bool {
-        data.count >= 9 && I2NPMessageType(rawValue: data[0]) != nil
+        // `Array(data)` rebases the same way `parseShort` does, so a slice never
+        // indexes out of bounds.
+        let bytes = Array(data)
+        return bytes.count >= 9 && I2NPMessageType(rawValue: bytes[0]) != nil
     }
 
     /// Typed payload parsing for every standard message type.
@@ -198,7 +205,7 @@ struct I2NPMessage {
             let ms = try r.long()
             return .deliveryStatus(messageID: id, timestamp: Date(timeIntervalSince1970: Double(ms) / 1000))
         case .dataMessage:
-            return .dataMessage(payload)
+            return .dataMessage(try I2NPDataMessage.parse(payload))
         case .garlic:
             return .garlic(payload)
         case .tunnelData:
@@ -269,14 +276,21 @@ struct I2PTunnelDataPayload {
     }
 }
 
-/// TunnelGateway payload: a tunnel ID plus the I2NP message it delivers.
+/// TunnelGateway payload per the I2NP spec:
+/// `tunnelId (4) | length (2) | data ($length bytes, one I2NP message with a
+/// standard 16-byte header)`. The 2-byte length is part of the contract — a
+/// reference gateway reads it as the first two bytes after the tunnel ID, so
+/// leaving it out makes every message we deliver unparseable, and its absence
+/// is invisible to a round trip through this same codec.
 struct I2PTunnelGatewayPayload {
     let gatewayID: UInt32
+    /// One complete I2NP message, its 16-byte header included.
     let message: Data
 
     func serialize() -> Data {
         var w = I2PWriter()
         w.integer(gatewayID)
+        w.short(UInt16(clamping: message.count))
         w.raw(message)
         return w.data
     }
@@ -284,8 +298,36 @@ struct I2PTunnelGatewayPayload {
     static func parse(_ data: Data) throws -> (gatewayID: UInt32, message: Data) {
         var r = I2PReader(data)
         let id = try r.integer()
-        let message = try r.raw(r.remaining)
+        let length = Int(try r.short())
+        let message = try r.raw(length)
+        guard r.remaining == 0 else { throw I2PWireError.trailingData }
         return (id, message)
+    }
+}
+
+/// I2NP `Data` message body per the spec: a 4-byte big-endian length followed by
+/// exactly that many payload bytes. It is the generic carrier used inside garlic
+/// cloves — stream data and datagrams ride it — so the length is part of the
+/// body rather than something the transport supplies.
+struct I2NPDataMessage {
+    let payload: Data
+
+    func serialize() -> Data {
+        var w = I2PWriter()
+        w.integer(UInt32(clamping: payload.count))
+        w.raw(payload)
+        return w.data
+    }
+
+    /// The payload of one `Data` body. A length that does not account for the
+    /// whole body is rejected rather than trimmed, so a malformed message never
+    /// reaches a reader half-stripped.
+    static func parse(_ data: Data) throws -> Data {
+        var r = I2PReader(data)
+        let length = Int(try r.integer())
+        let payload = try r.raw(length)
+        guard r.remaining == 0 else { throw I2PWireError.trailingData }
+        return payload
     }
 }
 

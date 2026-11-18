@@ -207,6 +207,13 @@ enum I2PCrypto {
     static func ed25519PurePublicKey(fromSeed seed: Data) -> Data {
         Data(Ed25519Pure.publicKey(seed: Array(seed)))
     }
+
+    /// Whether a 32-byte Ed25519 public-key encoding is canonical per RFC 8032
+    /// §5.1.3: the y coordinate (high bit masked off) must be below p = 2^255−19.
+    /// Bit 255 itself is the sign of x and is free for any real key.
+    static func ed25519IsCanonicalPublicKey(_ key: Data) -> Bool {
+        Ed25519Pure.isCanonicalEncoding(Array(key))
+    }
 }
 
 // MARK: - Modern crypto policy (legacy removal audit + regression guard)

@@ -39,6 +39,9 @@ struct I2PRouterStatusSnapshot {
     let peerCount: Int
     // Transport
     let ntcp2SessionCount: Int
+    let ssu2SessionCount: Int
+    /// Peers the dial paths are currently holding back after a failed handshake.
+    let handshakeHeldBackCount: Int
     // Network database
     let routerInfoCount: Int
     let leaseSetCount: Int
@@ -83,6 +86,9 @@ struct I2PPeerSummary: Identifiable {
     let isFloodfill: Bool
     /// nil when the peer takes no part in one of our tunnels.
     let tunnelRole: String?
+    /// The peer's last failed dial and when its next attempt is due; nil when
+    /// nothing has failed against this peer since the router started.
+    let handshakeBackoff: I2PPeerHandshakeBackoffReading?
 }
 
 /// Aggregated netdb reading served by the network database actor.
@@ -92,6 +98,123 @@ struct I2PNetDBStatus {
     let floodfillCount: Int
     let peerCount: Int
     let isLocalFloodfill: Bool
+}
+
+// MARK: - Plain-language status
+
+/// A plain-language reading of the running router, derived only from facts the
+/// status snapshot carries. It never claims connectivity the router does not
+/// have — zero live sessions reads as "looking for peers", not "connected" —
+/// and it names the next useful action instead of protocol detail, so the
+/// dashboard's first line answers "is it working?" without I2P vocabulary.
+struct I2PRouterPlainStatus: Equatable {
+    /// How the reading should look: off, waiting on the network, or good.
+    enum Tone: Equatable {
+        case off
+        case waiting
+        case good
+    }
+
+    /// The single action the reading offers, when one would help.
+    enum Action: Equatable {
+        case start
+        case findPeers
+    }
+
+    let tone: Tone
+    let headline: String
+    let detail: String
+    let action: Action?
+
+    /// The facts the reading is derived from.
+    struct Facts: Equatable {
+        let sessionCount: Int
+        let distinctPeerCount: Int
+        let tunnelCount: Int
+        let routerInfoCount: Int
+        let uptime: TimeInterval
+    }
+
+    /// The reading shown while the router is stopped.
+    static let stopped = I2PRouterPlainStatus(
+        tone: .off,
+        headline: "Router is off",
+        detail: "Nothing is sent or received until you start it. It runs while this app is open.",
+        action: .start
+    )
+
+    /// The window after start in which opening the first connections is normal,
+    /// so the copy explains the wait instead of suggesting a retry.
+    static let warmUpWindow: TimeInterval = 45
+
+    static func reading(_ facts: Facts) -> I2PRouterPlainStatus {
+        let peers = max(facts.distinctPeerCount, facts.sessionCount)
+        if facts.sessionCount == 0 {
+            if facts.uptime < warmUpWindow {
+                let detail = facts.routerInfoCount > 1
+                    ? "\(count(facts.routerInfoCount, "router")) in the network database — connecting to the closest ones."
+                    : "Opening connections. Finding the first peers usually takes under a minute."
+                return I2PRouterPlainStatus(
+                    tone: .waiting,
+                    headline: "Starting…",
+                    detail: detail,
+                    action: nil
+                )
+            }
+            return I2PRouterPlainStatus(
+                tone: .waiting,
+                headline: "Looking for peers",
+                detail: "No live peer yet. The router keeps trying; a slow connection can take a few minutes.",
+                action: .findPeers
+            )
+        }
+        if facts.tunnelCount == 0 {
+            return I2PRouterPlainStatus(
+                tone: .waiting,
+                headline: "Connected to \(count(peers, "peer"))",
+                detail: "Building the first tunnels. Until one is up, nothing can be sent over the network.",
+                action: nil
+            )
+        }
+        return I2PRouterPlainStatus(
+            tone: .good,
+            headline: "Connected",
+            detail: "\(count(peers, "peer")) · \(count(facts.tunnelCount, "tunnel")) · up \(uptimeText(facts.uptime))",
+            action: nil
+        )
+    }
+
+    /// The reading for a live snapshot of the running router.
+    static func reading(for snapshot: I2PRouterStatusSnapshot) -> I2PRouterPlainStatus {
+        reading(
+            Facts(
+                sessionCount: snapshot.ntcp2SessionCount + snapshot.ssu2SessionCount,
+                distinctPeerCount: snapshot.peers.count,
+                tunnelCount: snapshot.pools.reduce(0) { $0 + $1.tunnels.count },
+                routerInfoCount: snapshot.routerInfoCount,
+                uptime: snapshot.uptime
+            )
+        )
+    }
+
+    /// "1 peer" / "4 peers".
+    static func count(_ value: Int, _ noun: String) -> String {
+        "\(value) \(noun)\(value == 1 ? "" : "s")"
+    }
+
+    /// "42s", "12m 5s", "1h 04m" — short enough for a status line.
+    static func uptimeText(_ seconds: TimeInterval) -> String {
+        let total = max(0, Int(seconds))
+        if total >= 3600 {
+            return "\(total / 3600)h \(String(format: "%02d", (total % 3600) / 60))m"
+        }
+        if total >= 60 { return "\(total / 60)m \(total % 60)s" }
+        return "\(total)s"
+    }
+
+    /// One sentence for VoiceOver, so the card is read as a statement rather
+    /// than as fragments (a dot, a word, then a caption).
+    var accessibilitySummary: String { "\(headline). \(detail)" }
 }
 
 // MARK: - Netdb <-> I2NP bridging
@@ -165,8 +288,14 @@ actor DemandDialTracker {
 /// resulting session — so netdb lookups, stores and exploratory round-trips
 /// work against any signature-verified peer the netdb knows, not just the few
 /// dialed at bootstrap.
+///
+/// Although its name predates the second transport, this is the router's single
+/// delivery path: a peer with no NTCP2 session (or no NTCP2 address at all) is
+/// reached over an SSU2 session, which carries the same I2NP envelopes.
 final class I2PNTCP2DeliveryTransport: I2PDeliveryTransport {
     weak var ntcp2: NTCP2Transport?
+    /// The UDP transport used when NTCP2 holds no session to the peer.
+    weak var ssu2: SSU2Transport?
     var onSent: ((Int) -> Void)?
     /// Demand-dial hook: resolves the endpoint for a router hash and initiates
     /// the NTCP2 connect. Wired by the running router context.
@@ -180,22 +309,41 @@ final class I2PNTCP2DeliveryTransport: I2PDeliveryTransport {
     }
 
     func deliver(_ i2npBytes: Data, to routerHash: Data) async throws {
-        guard let ntcp2 else { throw NTCP2Error.notEstablished }
-        if !ntcp2.hasSession(for: routerHash), dialPeer != nil {
+        guard ntcp2 != nil || ssu2 != nil else { throw NTCP2Error.notEstablished }
+        if !hasSession(for: routerHash), dialPeer != nil {
             _ = await dialPeer?(routerHash)
             await waitForSession(to: routerHash)
         }
         // Outbound bandwidth cap: the send waits for its tokens, so the cap
         // takes effect on the running router as soon as it is configured.
         await I2PBandwidthGovernor.shared.admitOutbound(bytes: i2npBytes.count)
-        try ntcp2.send(to: routerHash, data: i2npBytes)
+        try send(i2npBytes, to: routerHash)
         onSent?(i2npBytes.count)
     }
 
+    /// Whether either transport holds a live session to the peer.
+    func hasSession(for routerHash: Data) -> Bool {
+        (ntcp2?.hasSession(for: routerHash) ?? false)
+            || (ssu2?.hasSession(forRouterHash: routerHash) ?? false)
+    }
+
+    /// Sends over whichever transport holds the session: NTCP2 first, so an
+    /// established stream stays the preferred path, SSU2 otherwise.
+    private func send(_ i2npBytes: Data, to routerHash: Data) throws {
+        if let ntcp2, ntcp2.hasSession(for: routerHash) {
+            try ntcp2.send(to: routerHash, data: i2npBytes)
+            return
+        }
+        if let ssu2, ssu2.hasSession(forRouterHash: routerHash) {
+            try ssu2.send(toRouterHash: routerHash, data: i2npBytes)
+            return
+        }
+        throw NTCP2Error.noSession(forHash: routerHash)
+    }
+
     private func waitForSession(to routerHash: Data) async {
-        guard let ntcp2 else { return }
         let deadline = Date().addingTimeInterval(dialTimeout)
-        while !ntcp2.hasSession(for: routerHash), Date() < deadline {
+        while !hasSession(for: routerHash), Date() < deadline {
             try? await Task.sleep(for: .milliseconds(250))
         }
     }
@@ -209,6 +357,7 @@ final class I2PNTCP2DeliveryTransport: I2PDeliveryTransport {
 final class I2PRouterStatusEngine {
     private weak var netDB: I2PNetworkDatabase?
     private weak var ntcp2: NTCP2Transport?
+    private weak var ssu2: SSU2Transport?
     private weak var tunnelPool: I2PTunnelPool?
     let localRouterHash: Data
     /// Optional SSU2 session source: once the SSU2 transport is wired into the
@@ -218,6 +367,12 @@ final class I2PRouterStatusEngine {
     /// Optional participation surface: the live count of tunnels this router
     /// currently carries for other participants (the share's measured side).
     var participatingTunnels: (() -> Int)?
+    /// Optional handshake-backoff surface: how many peers a failed dial is
+    /// currently holding back, read for the transport card.
+    var heldBackPeerCount: (() -> Int)?
+    /// Optional per-peer handshake failure reading, keyed by identity hex, read
+    /// for the peer inspector.
+    var handshakeBackoffReading: ((String) -> I2PPeerHandshakeBackoffReading?)?
 
     private let startedAt = Date()
     private let lock = NSLock()
@@ -255,6 +410,16 @@ final class I2PRouterStatusEngine {
     func attach(netDB: I2PNetworkDatabase) { self.netDB = netDB }
     func attach(ntcp2: NTCP2Transport) { self.ntcp2 = ntcp2 }
     func attach(tunnelPool: I2PTunnelPool) { self.tunnelPool = tunnelPool }
+
+    /// Attaches the UDP transport: its established sessions join the transport
+    /// card's counts and the peer inspector beside NTCP2's, exactly as they do
+    /// for the TCP transport.
+    func attach(ssu2: SSU2Transport) {
+        self.ssu2 = ssu2
+        ssu2PeerSummaries = { [weak ssu2] in
+            ssu2?.sessionSummaries() ?? []
+        }
+    }
 
     /// Attaches the tunnel participant so the participation screen can read how
     /// many tunnels the router currently carries for other participants.
@@ -374,6 +539,8 @@ final class I2PRouterStatusEngine {
 
         return sample(netDBStatus: netDBStatus,
                       ntcp2SessionCount: ntcp2?.sessionCount() ?? 0,
+                      ssu2SessionCount: ssu2?.establishedSessionCount() ?? 0,
+                      heldBackPeerCount: heldBackPeerCount?() ?? 0,
                       pools: pools,
                       tunnelBuilds: tunnelBuilds,
                       peers: peers)
@@ -420,7 +587,8 @@ final class I2PRouterStatusEngine {
                 xorDistanceHex: Self.hex(distance),
                 kademliaBucket: Self.leadingZeroBits(distance),
                 isFloodfill: floodfill,
-                tunnelRole: roles[session.hash]
+                tunnelRole: roles[session.hash],
+                handshakeBackoff: handshakeBackoffReading?(Self.hex(session.hash))
             ))
         }
         return result
@@ -440,6 +608,8 @@ final class I2PRouterStatusEngine {
     /// Synchronous sampling of the counters (kept sync for lock safety).
     private func sample(netDBStatus: I2PNetDBStatus?,
                         ntcp2SessionCount: Int,
+                        ssu2SessionCount: Int,
+                        heldBackPeerCount: Int,
                         pools: [I2PRouterStatusSnapshot.PoolSummary],
                         tunnelBuilds: [I2PTunnelBuildRecord],
                         peers: [I2PPeerSummary]) -> I2PRouterStatusSnapshot {
@@ -464,6 +634,8 @@ final class I2PRouterStatusEngine {
             floodfillCount: netDBStatus?.floodfillCount ?? 0,
             peerCount: netDBStatus?.peerCount ?? 0,
             ntcp2SessionCount: ntcp2SessionCount,
+            ssu2SessionCount: ssu2SessionCount,
+            handshakeHeldBackCount: heldBackPeerCount,
             routerInfoCount: netDBStatus?.routerInfoCount ?? 0,
             leaseSetCount: netDBStatus?.leaseSetCount ?? 0,
             uptime: now.timeIntervalSince(startedAt),
@@ -664,6 +836,86 @@ enum I2PRouterStatusSelfTest {
             throw I2PWireError.invalidFormat
         }
         return "1 RI, 1 floodfill, \(snapshot.messagesIn) routed msgs, outbound pool 2 hops; stream emitted \(received)"
+    }
+}
+
+/// The plain-language status model is pure and cheap to test: every case below
+/// pins one honest reading, so a change that would make the dashboard claim
+/// more than the router knows fails here first.
+enum I2PRouterPlainStatusSelfTest {
+    static func runAll() -> [I2PSelfTestResult] {
+        var results: [I2PSelfTestResult] = []
+        func check(_ name: String, _ body: () -> String?) {
+            if let detail = body() {
+                results.append(I2PSelfTestResult(name: name, passed: true, detail: detail))
+            } else {
+                results.append(I2PSelfTestResult(
+                    name: name,
+                    passed: false,
+                    detail: "plain status did not match the expected reading"))
+            }
+        }
+
+        check("Plain status: a fresh start explains the wait, no retry offered") {
+            let reading = I2PRouterPlainStatus.reading(.init(
+                sessionCount: 0, distinctPeerCount: 0, tunnelCount: 0,
+                routerInfoCount: 0, uptime: 5))
+            guard reading.tone == .waiting,
+                  reading.headline == "Starting…",
+                  reading.action == nil else { return nil }
+            return reading.headline
+        }
+
+        check("Plain status: zero sessions after the start window is 'looking for peers'") {
+            let reading = I2PRouterPlainStatus.reading(.init(
+                sessionCount: 0, distinctPeerCount: 0, tunnelCount: 0,
+                routerInfoCount: 40, uptime: 600))
+            guard reading.tone == .waiting,
+                  reading.headline == "Looking for peers",
+                  reading.action == .findPeers,
+                  reading.detail.contains("keeps trying") else { return nil }
+            return reading.headline
+        }
+
+        check("Plain status: a live session without tunnels says tunnels are building") {
+            let reading = I2PRouterPlainStatus.reading(.init(
+                sessionCount: 4, distinctPeerCount: 4, tunnelCount: 0,
+                routerInfoCount: 120, uptime: 90))
+            guard reading.headline == "Connected to 4 peers",
+                  reading.tone == .waiting,
+                  reading.action == nil,
+                  reading.detail.contains("tunnels") else { return nil }
+            return reading.detail
+        }
+
+        check("Plain status: sessions and tunnels read as connected, honestly counted") {
+            let reading = I2PRouterPlainStatus.reading(.init(
+                sessionCount: 1, distinctPeerCount: 1, tunnelCount: 1,
+                routerInfoCount: 120, uptime: 125))
+            guard reading.headline == "Connected",
+                  reading.tone == .good,
+                  reading.action == nil,
+                  reading.detail == "1 peer · 1 tunnel · up 2m 5s" else { return nil }
+            return reading.detail
+        }
+
+        check("Plain status: the stopped reading offers start and says it is off") {
+            let reading = I2PRouterPlainStatus.stopped
+            guard reading.tone == .off,
+                  reading.action == .start,
+                  reading.headline == "Router is off",
+                  !reading.accessibilitySummary.isEmpty else { return nil }
+            return reading.headline
+        }
+
+        check("Plain status: uptime formatting stays short") {
+            guard I2PRouterPlainStatus.uptimeText(42) == "42s",
+                  I2PRouterPlainStatus.uptimeText(125) == "2m 5s",
+                  I2PRouterPlainStatus.uptimeText(3725) == "1h 02m" else { return nil }
+            return "42s / 2m 5s / 1h 02m"
+        }
+
+        return results
     }
 }
 

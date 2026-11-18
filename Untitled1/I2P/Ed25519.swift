@@ -377,6 +377,24 @@ struct GePoint {
         return result
     }
 
+    /// RFC 8032 §5.1.3: an encoding is canonical only when its y coordinate —
+    /// little-endian, high bit masked off — is below p = 2^255 − 19. Without
+    /// this check the same point could be written as y + p and decode to the
+    /// same point, so one key would have more than one valid byte string,
+    /// which RFC 8032 forbids (and which makes signatures mutable).
+    static func isCanonicalEncoding(_ bytes: [UInt8]) -> Bool {
+        guard bytes.count == 32 else { return false }
+        var y = bytes
+        y[31] &= 127
+        // p = 2^255 − 19, little-endian.
+        let p: [UInt8] = [0xed] + [UInt8](repeating: 0xff, count: 30) + [0x7f]
+        for index in stride(from: 31, through: 0, by: -1) {
+            if y[index] != p[index] { return y[index] < p[index] }
+        }
+        // y == p is not a field element: not canonical.
+        return false
+    }
+
     func encode() -> [UInt8] {
         let zInv = Fe.invert(Z)
         let x = Fe.mul(X, zInv)
@@ -394,6 +412,7 @@ struct GePoint {
     /// Point decompression per RFC 8032 §5.1.3.
     init?(compressed bytes: [UInt8]) {
         guard bytes.count == 32 else { return nil }
+        guard GePoint.isCanonicalEncoding(bytes) else { return nil }
         var yBytes = bytes
         let sign = (yBytes[31] >> 7) & 1
         yBytes[31] &= 127
@@ -554,6 +573,13 @@ enum Ed25519Pure {
         let h = sha512(seed)
         let a = clampScalar(Array(h[0..<32]))
         return GePoint.multiply(Ed25519Curve.base, a).encode()
+    }
+
+    /// Whether a 32-byte public-key (or R) encoding is canonical per RFC 8032
+    /// §5.1.3: the masked y coordinate is below p. Exposed so the spec
+    /// conformance audit can pin the rule instead of guessing at it.
+    static func isCanonicalEncoding(_ bytes: [UInt8]) -> Bool {
+        GePoint.isCanonicalEncoding(bytes)
     }
 
     static func sign(message: [UInt8], seed: [UInt8], prehashed: Bool) -> [UInt8]? {

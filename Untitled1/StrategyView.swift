@@ -16,8 +16,15 @@ struct StrategyView: View {
     @State private var expandedPhases: Set<Int> = []
     @State private var showAssumptions = false
 
+    /// True when the screen is presented as a sheet, so it carries its own way
+    /// out instead of relying on the swipe-down gesture alone.
+    var showsClose: Bool = false
+
+    @Environment(\.dismiss) private var dismiss
+
     private let accent = Color(red: 0.47, green: 0.44, blue: 0.97)
     private let background = Color(red: 0.055, green: 0.06, blue: 0.09)
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         NavigationStack {
@@ -42,6 +49,13 @@ struct StrategyView: View {
             .background(background.ignoresSafeArea())
             .navigationTitle("Strategy")
             .navigationBarTitleDisplayMode(.large)
+            .toolbar {
+                if showsClose {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button("Done") { dismiss() }
+                    }
+                }
+            }
         }
         .preferredColorScheme(.dark)
     }
@@ -151,7 +165,7 @@ struct StrategyView: View {
         let isExpanded = expandedImprovements.contains(item.id)
         VStack(alignment: .leading, spacing: 6) {
             Button {
-                withAnimation(.easeInOut(duration: 0.2)) {
+                withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) {
                     if isExpanded {
                         expandedImprovements.remove(item.id)
                     } else {
@@ -276,7 +290,7 @@ struct StrategyView: View {
         let isExpanded = expandedPhases.contains(phase.id)
         VStack(alignment: .leading, spacing: 6) {
             Button {
-                withAnimation(.easeInOut(duration: 0.2)) {
+                withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) {
                     if isExpanded {
                         expandedPhases.remove(phase.id)
                     } else {
@@ -443,7 +457,7 @@ struct StrategyView: View {
     private var assumptionsCard: some View {
         card(title: "Assumptions") {
             Button {
-                withAnimation(.easeInOut(duration: 0.2)) {
+                withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) {
                     showAssumptions.toggle()
                 }
             } label: {

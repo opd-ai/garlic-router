@@ -215,6 +215,11 @@ final class I2PSAMServer {
                        keys: I2PSAMDestinationKeys,
                        encryptedPublication: Bool = false) async throws -> I2PSAMSession {
         guard dispatcher.hasSession(nickname) == false else { throw I2PSAMError.duplicatedID }
+        // Each session carries its own bandwidth ceiling, saved per session
+        // key: arm the governor's per-session bucket before the first send.
+        I2PBandwidthGovernor.shared.configureSession(
+            nickname,
+            bytesPerSecond: I2PSAMSessionCaps.shared.capKBps(for: nickname) * 1024)
         let pool = I2PTunnelPool(localRouterHash: core.routerHash,
                                  participant: core.participant,
                                  transport: core.buildTransport,
@@ -261,6 +266,42 @@ final class I2PSAMServer {
 
     func sessionSummaries() -> [I2PSAMSessionSummary] {
         sessionSnapshot().map { $0.summary() }
+    }
+
+    /// The live reading behind one session's detail screen, with the bridge log
+    /// lines that belong to it. Nil when the session is no longer running.
+    func sessionDetail(named nickname: String) -> I2PSAMSessionDetail? {
+        guard let session = session(named: nickname) else { return nil }
+        return session.detail(logLines: logLines(for: nickname))
+    }
+
+    /// The bridge log lines that belong to one session: every line the session
+    /// itself reported (they carry its nickname prefix) plus the bridge's own
+    /// lines about its creation, cap edits and closure.
+    func logLines(for nickname: String, limit: Int = 10) -> [String] {
+        lock.lock()
+        let lines = log
+        lock.unlock()
+        let own = "\(nickname): "
+        let about = "session \(nickname) "
+        let matching = lines.filter { line in
+            guard let close = line.firstIndex(of: "]") else { return false }
+            let text = line[line.index(after: close)...]
+                .trimmingCharacters(in: .whitespaces)
+            return text.hasPrefix(own) || text.hasPrefix(about)
+        }
+        return Array(matching.suffix(limit))
+    }
+
+    /// Sets (or clears, with 0) a running session's own bandwidth ceiling and
+    /// saves it under the session key. The governor's per-session bucket is
+    /// re-armed immediately, so the new ceiling shapes the very next send.
+    func setSessionCapKBps(_ capKBps: Int, for nickname: String) {
+        let cap = I2PSAMSessionCaps.clamp(capKBps)
+        I2PSAMSessionCaps.shared.setCapKBps(cap, for: nickname)
+        I2PBandwidthGovernor.shared.configureSession(nickname, bytesPerSecond: cap * 1024)
+        note("session \(nickname) cap → \(I2PSAMBandwidthFormat.cap(cap))")
+        onChange?()
     }
 
     // MARK: b33 hosts

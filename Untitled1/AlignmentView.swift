@@ -18,9 +18,20 @@ struct AlignmentView: View {
     @State private var lastRunAt: Date?
     @State private var isRunning = false
     @State private var expandedRowIDs: Set<String> = []
+    /// One sheet slot for this screen: iOS presents one sheet per view
+    /// reliably, so the audit report and the product roadmap share it.
+    @State private var sheet: Sheet?
+
+    private enum Sheet: String, Identifiable {
+        case auditReport
+        case roadmap
+
+        var id: String { rawValue }
+    }
 
     private let accent = Color(red: 0.47, green: 0.44, blue: 0.97)
     private let background = Color(red: 0.055, green: 0.06, blue: 0.09)
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// Component sections in report order.
     private let components: [I2PSpecComponent] = [
@@ -32,6 +43,7 @@ struct AlignmentView: View {
             ScrollView {
                 VStack(spacing: 14) {
                     summaryCard
+                    auditCard
                     ForEach(components, id: \.self) { component in
                         componentSection(component)
                     }
@@ -44,6 +56,25 @@ struct AlignmentView: View {
             .navigationTitle("Alignment")
             .navigationBarTitleDisplayMode(.large)
             .onAppear { adoptStoredResultsIfAvailable() }
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        sheet = .roadmap
+                    } label: {
+                        Image(systemName: "map")
+                    }
+                    .accessibilityLabel("Product roadmap")
+                    .accessibilityHint("The product, growth and commercial plan")
+                }
+            }
+            .sheet(item: $sheet) { which in
+                switch which {
+                case .auditReport:
+                    AuditReportView()
+                case .roadmap:
+                    StrategyView(showsClose: true)
+                }
+            }
         }
     }
 
@@ -101,6 +132,7 @@ struct AlignmentView: View {
 
             runStateLine
             runButton
+            shareControl
         }
     }
 
@@ -158,6 +190,31 @@ struct AlignmentView: View {
         .disabled(isRunning)
     }
 
+    // MARK: - Export
+
+    /// The screen's share control: the report as it currently stands — coverage,
+    /// the last run, every truth-table row and any failing test — as plain text
+    /// in the system share sheet.
+    private var shareControl: some View {
+        let payload = I2PAlignmentReportShare.payload(results: results,
+                                                      lastRunAt: lastRunAt)
+        return ShareLink(item: payload.text,
+                         subject: Text(payload.subject)) {
+            HStack(spacing: 8) {
+                Image(systemName: "square.and.arrow.up")
+                Text("Share report as text")
+            }
+            .font(.subheadline.weight(.semibold))
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 10)
+            .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
+        }
+        .buttonStyle(.plain)
+        .tint(accent)
+        .accessibilityLabel("Share alignment report as text")
+        .accessibilityHint("Exports the coverage, every truth-table row and any failing tests")
+    }
+
     private func chip(_ label: String, count: Int, color: Color) -> some View {
         VStack(spacing: 2) {
             Text("\(count)")
@@ -170,6 +227,46 @@ struct AlignmentView: View {
         .frame(maxWidth: .infinity)
         .padding(.vertical, 8)
         .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    // MARK: - Audit report
+
+    /// Entry point to the written end-to-end audit: an independent assessment
+    /// of the table below, the tests actually executed, and the open findings.
+    private var auditCard: some View {
+        card(title: "Independent audit") {
+            Text(I2PAuditReport.title)
+                .font(.subheadline.weight(.semibold))
+            Text("garlic-router · \(I2PAuditReport.date)")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 8) {
+                chip("high", count: I2PAuditReport.highSeverity, color: .red)
+                chip("medium", count: I2PAuditReport.mediumSeverity, color: .orange)
+                chip("low", count: I2PAuditReport.lowSeverity, color: .gray)
+            }
+
+            Text(I2PAuditReport.headline)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Button {
+                sheet = .auditReport
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "doc.text.magnifyingglass")
+                    Text("Read audit report")
+                }
+                .font(.subheadline.weight(.semibold))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 10)
+                .background(accent.opacity(0.18), in: RoundedRectangle(cornerRadius: 12))
+            }
+            .buttonStyle(.plain)
+            .tint(accent)
+        }
     }
 
     // MARK: - Component sections
@@ -248,7 +345,7 @@ struct AlignmentView: View {
     private func deviationDisclosure(row: I2PSpecRow, deviation: I2PDeviationRecord) -> some View {
         let isExpanded = expandedRowIDs.contains(row.id)
         Button {
-            withAnimation(.easeInOut(duration: 0.2)) {
+            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) {
                 if isExpanded {
                     expandedRowIDs.remove(row.id)
                 } else {

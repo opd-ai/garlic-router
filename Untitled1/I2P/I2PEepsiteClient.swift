@@ -689,7 +689,10 @@ final class I2PEepsiteClientSession {
         garlicHandler.addLocalConsumer { [weak self] message, _ in
             guard let self,
                   message.type == .dataMessage,
-                  let frame = I2PSAMFrame.parse(message.payload) else { return }
+                  // A Data message body is a 4-byte length then the payload; a
+                  // body whose length does not account for it is dropped here.
+                  let body = try? I2NPDataMessage.parse(message.payload),
+                  let frame = I2PSAMFrame.parse(body) else { return }
             self.assembler.ingest(frame)
         }
         // Inbound garlic for this destination arrives on the router's body
@@ -941,7 +944,9 @@ final class I2PEepsiteClientSession {
                                     chunkCount: UInt16(chunks.count),
                                     chunk: chunk,
                                     attached: index == 0 ? attached : Data())
-            try await transport.send(I2NPMessage(type: .dataMessage, payload: frame.serialize()),
+            try await transport.send(I2NPMessage(type: .dataMessage,
+                                                 payload: I2NPDataMessage(
+                                                    payload: frame.serialize()).serialize()),
                                      to: lease,
                                      garlicSession: garlic,
                                      pool: pool)

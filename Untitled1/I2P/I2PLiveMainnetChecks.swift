@@ -305,8 +305,15 @@ enum I2PExternalAddressDiscovery {
 /// demand-dial hook wired, a build toward a hop we hold no session for resolves
 /// the hop's RouterInfo (netdb cache-first), dials it, and retries the send
 /// until the handshake completes — so tunnel builds reach any known hop.
+///
+/// A hop reached over SSU2 takes the same envelopes on the UDP transport: the
+/// build messages are identical I2NP bodies, so only the session they ride
+/// differs.
 final class I2PNTCP2TunnelBuildTransport: I2PTunnelBuildTransport {
     private weak var ntcp2: NTCP2Transport?
+    /// The UDP transport that carries builds to hops with no NTCP2 session (or
+    /// no NTCP2 address at all).
+    weak var ssu2: SSU2Transport?
     /// Demand-dial hook: resolves the endpoint for a router hash and initiates
     /// the NTCP2 connect. Wired by the running router context.
     var dialPeer: ((Data) async -> Bool)?
@@ -332,7 +339,7 @@ final class I2PNTCP2TunnelBuildTransport: I2PTunnelBuildTransport {
         sendAfterDial(envelope.serialize(), to: routerHash)
     }
 
-    /// The NTCP2 transport carries tunnel data, so an outbound endpoint's reply
+    /// The transports carry tunnel data, so an outbound endpoint's reply
     /// can ride the creator's inbound tunnel: the OutboundTunnelBuildReply is
     /// wrapped in a TunnelGateway addressed to the reply route's tunnel ID and
     /// delivered to that tunnel's gateway. Without this a creator behind NAT can
@@ -349,25 +356,42 @@ final class I2PNTCP2TunnelBuildTransport: I2PTunnelBuildTransport {
         sendAfterDial(envelope.serialize(), to: gatewayRouterHash)
     }
 
+    /// Whether either transport holds a live session to the hop.
+    private func hasSession(for routerHash: Data) -> Bool {
+        (ntcp2?.hasSession(for: routerHash) ?? false)
+            || (ssu2?.hasSession(forRouterHash: routerHash) ?? false)
+    }
+
+    /// Sends over whichever transport holds a session; NTCP2 first, SSU2 when
+    /// the hop has no TCP session.
+    @discardableResult
+    private func sendIfPossible(_ i2npBytes: Data, to routerHash: Data) -> Bool {
+        if let ntcp2, ntcp2.hasSession(for: routerHash) {
+            try? ntcp2.send(to: routerHash, data: i2npBytes)
+            return true
+        }
+        if let ssu2, ssu2.hasSession(forRouterHash: routerHash) {
+            try? ssu2.send(toRouterHash: routerHash, data: i2npBytes)
+            return true
+        }
+        return false
+    }
+
     /// Sends immediately over an established session; otherwise dials and
     /// retries inside the dial window so a fresh handshake can carry the build.
     private func sendAfterDial(_ i2npBytes: Data, to routerHash: Data) {
-        guard let ntcp2 else { return }
-        if ntcp2.hasSession(for: routerHash) {
-            try? ntcp2.send(to: routerHash, data: i2npBytes)
-            return
-        }
+        guard ntcp2 != nil || ssu2 != nil else { return }
+        if sendIfPossible(i2npBytes, to: routerHash) { return }
         Task { [weak self] in
             guard let self else { return }
             if let dialPeer {
                 _ = await dialPeer(routerHash)
             }
             let deadline = Date().addingTimeInterval(dialTimeout)
-            while !ntcp2.hasSession(for: routerHash), Date() < deadline {
+            while !hasSession(for: routerHash), Date() < deadline {
                 try? await Task.sleep(for: .milliseconds(300))
             }
-            guard ntcp2.hasSession(for: routerHash) else { return }
-            try? ntcp2.send(to: routerHash, data: i2npBytes)
+            sendIfPossible(i2npBytes, to: routerHash)
         }
     }
 }
@@ -398,6 +422,21 @@ final class I2PMainnetTunnelPeerProvider: I2PTunnelPeerProvider {
     var isConnected: ((Data) -> Bool)? {
         get { selector.isConnected }
         set { selector.isConnected = newValue }
+    }
+
+    /// Whether the user blocked a peer; forwarded to the selector so a blocked
+    /// peer is never offered as a hop.
+    var isBlocked: ((Data) -> Bool)? {
+        get { selector.isBlocked }
+        set { selector.isBlocked = newValue }
+    }
+
+    /// Whether a dial to a peer is still inside its handshake backoff; forwarded
+    /// to the selector so a peer that is failing right now is not offered as a
+    /// hop.
+    var isHandshakeHeldBack: ((Data) -> Bool)? {
+        get { selector.isHandshakeHeldBack }
+        set { selector.isHandshakeHeldBack = newValue }
     }
 
     init(netDB: I2PNetworkDatabase, selector: I2PTunnelPeerSelector = I2PTunnelPeerSelector()) {
