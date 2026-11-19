@@ -1612,7 +1612,16 @@ final class SSU2Transport {
     private var sessionsByEndpoint: [String: SSU2Session] = [:]
     /// Established sessions keyed by the peer's router hash.
     private var sessionsByHash: [Data: SSU2Session] = [:]
-    private(set) var listenerPort: UInt16?
+    /// The bound UDP port. Written by the listener's state handler on the
+    /// Network framework's queue and read from `startListener` and from probes,
+    /// so it is only ever touched under `lock` — an unsynchronised `UInt16?`
+    /// here was a real data race (ThreadSanitizer, 2026-11-18).
+    private var _listenerPort: UInt16?
+    var listenerPort: UInt16? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _listenerPort
+    }
     private var tokenManager = SSU2TokenManager()
 
     init(localStaticKey: Curve25519.KeyAgreement.PrivateKey, introKey: Data,
@@ -1658,7 +1667,7 @@ final class SSU2Transport {
     func startListener(port: UInt16 = 0) throws -> UInt16 {
         lock.lock()
         defer { lock.unlock() }
-        guard listener == nil else { return listenerPort ?? port }
+        guard listener == nil else { return _listenerPort ?? port }
         let nwListener = try NWListener(using: NWParameters.udp,
                                         on: NWEndpoint.Port(rawValue: port) ?? .any)
         // The ephemeral binding completes asynchronously (notably slower on
@@ -1666,7 +1675,7 @@ final class SSU2Transport {
         nwListener.stateUpdateHandler = { [weak self, weak nwListener] state in
             guard state == .ready, let self, let nwListener else { return }
             self.lock.lock()
-            self.listenerPort = nwListener.port?.rawValue ?? self.listenerPort
+            self._listenerPort = nwListener.port?.rawValue ?? self._listenerPort
             self.lock.unlock()
         }
         nwListener.newConnectionHandler = { [weak self] connection in
@@ -1678,8 +1687,8 @@ final class SSU2Transport {
         }
         nwListener.start(queue: queue)
         listener = nwListener
-        listenerPort = nwListener.port?.rawValue ?? port
-        return listenerPort ?? port
+        _listenerPort = nwListener.port?.rawValue ?? port
+        return _listenerPort ?? port
     }
 
     /// Opens an outbound session toward a peer; the token-request path runs

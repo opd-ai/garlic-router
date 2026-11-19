@@ -673,9 +673,14 @@ partially patched.
 
 ## Out-of-scope observations (logged, not fixed)
 
-- `I2PTunnel` inbound build path ordering follows this router's internal
+- ~~`I2PTunnel` inbound build path ordering follows this router's internal
   convention; real I2P sends the inbound build along the reverse data path.
-  Needs live-hop validation with the new records.
+  Needs live-hop validation with the new records.~~ **Retracted 2026-11-18
+  (BUG-054):** the ECIES tunnel-creation spec's message-flow diagram sends an
+  inbound build to the IBGW first and along the new tunnel's path from there —
+  the same order this builder uses — so there is no ordering deviation to
+  validate. What remains unproven is whether real hops *adopt* our builds
+  (21 starts, 0 adopted).
 - NTCP2 `NTCP2Block.aligned` and data-block option fields were not re-audited
   beyond the type table.
 - SSU2 is implemented as a module (handshake, packets, UDP transport) but is not
@@ -1721,3 +1726,264 @@ nothing.
   assert the rule they name.
 - Verification: `--all` → 190 passed, 0 failed (was 181/9).
 - Status: fixed.
+
+
+## BUG-052 — Build records went out in path order, unpadded, with no inbound decoy
+
+- Component: `I2PTunnel.swift` (`I2PTunnelBuilder.buildTunnel`, `BuildContext`,
+  `consume`, `openReplySlot`).
+- Symptom (static, against the ECIES tunnel-creation spec, §Implementation
+  Notes): the message leaked exactly the facts the spec says it must hide. Records
+  were sent in build-path order, so every hop knew its position; a two-hop tunnel
+  sent two records, exposing the hop count where the spec says "the recommended
+  minimum number of build records is 4"; and an inbound build carried no fake
+  record for the originating router, so the hop nearest the originator could tell
+  it sat beside the tunnel's endpoint.
+- Root cause: the builder treated the record array as the hop list. Every test
+  round-tripped that shape through itself, so nothing caught it.
+- Fix:
+  - `I2PTunnelBuilder.buildLayout` places each hop's record in a random slot of a
+    4–8 record message (`min(8, max(4, hops + inbound ? 1 : 0))`), keeping every
+    slot distinct and reserving a free one for the inbound decoy.
+  - `originatorDecoyRecord` builds that decoy as this router's truncated identity
+    hash (16) + a fresh X25519 public key (32) + random filler, per the spec's
+    "correct 16-byte hash prefix and a real X25519 ephemeral key".
+  - `BuildContext` now carries reply material **per wire slot** (`replyMaterials`)
+    plus the hop-order materials and the slot of each hop; `openReplySlot` opens a
+    slot by its position and, for a walk-back rejection, peels the hops that
+    precede it **in build-path order**. `consume` checks the endpoint's own slot
+    rather than "the last slot", and the record count match now covers filler.
+- Tests added: `T4-TN-RECORD-ECIES-LAYOUT` (cross-validation, tagged to the
+  `TN-RECORD-ECIES` truth-table row) and "Build records randomized, padded and
+  decoyed per the spec" in the tunnel suite. Both assert the 4-record minimum, a
+  permutation of distinct slots, that order is actually randomized across 24
+  layouts, that inbound builds reserve a free decoy slot, and that the decoy's
+  prefix is the originator's hash with a valid X25519 key.
+- Verification: Mac harness built from the real sources — self-test **212/212**,
+  alignment **73/74** (the one failure remains `T4-ND-SU3-SIGNER`, which needs the
+  app bundle's `Resources/reseed-certs` and cannot run in a `swiftc` binary),
+  tunnel suite **6/6** across three runs; simulator build clean.
+- Status: fixed. Live build **adoption** is still unproven — the last mainnet run
+  recorded 21 build starts with 0 tunnels adopted — so the next step remains a
+  reference router with a debug log on a non-production netId.
+
+
+
+## BUG-053 — The off-device harness skipped the eepsite browser's suites
+
+- Component: `EepsiteBrowserView.swift`, new `I2P/I2PEepsiteNavigation.swift`,
+  `SelfTestProbe/ProbeStubs.swift` (deleted).
+- Symptom: `I2PSelfTest.runAll()` calls `I2PEepsiteVisitStackSelfTest` and
+  `I2PEepsiteShareSelfTest`, but both lived inside a SwiftUI view file that the
+  `swiftc` probe build cannot compile. `ProbeStubs.swift` supplied empty
+  stand-ins, so off-device the two suites returned zero results and their
+  assertions never ran outside the app and the unit-test target.
+- Fix: the visit/share types and both suites moved to
+  `Untitled1/I2P/I2PEepsiteNavigation.swift`; the stub file is deleted and every
+  documented harness command drops it (probe header, `NetDiag`, `LiveProbe`,
+  `INTEROP_REPORT.md`).
+- Verification: `--all` now reports 214 results (was 212) and both eepsite
+  suites pass in the probe build.
+- Status: fixed.
+
+## BUG-054 — A logged "inbound build ordering" deviation was not one
+
+- Component: `I2PTunnel.swift` (`makeTunnel` doc comment), `BUGLOG.md`
+  out-of-scope list.
+- Symptom (documentation): the list said "real I2P sends the inbound build along
+  the reverse data path", and `makeTunnel` said the inbound data path was the
+  reversed build-message path. Neither matched the code, and neither matches the
+  spec, so the next reader is invited to "fix" a correct ordering.
+- Evidence: the ECIES tunnel-creation spec's message-flow diagram ("Inbound
+  Build D-E-F — Sent through existing outbound A-B-C") sends the ShortTunnelBuild
+  to the IBGW first and then along the new tunnel's path; the data path runs the
+  same way. This builder already does that: record 0 carries the inbound-gateway
+  flag, the message is sent to `hops[0]`, and the last record points at the
+  creator.
+- Fix: comment corrected, BUGLOG entry retracted with the spec reference. No code
+  change — the ordering was right.
+- Verification: static, against the spec page; the tunnel suite is unchanged and
+  green.
+- Status: fixed (documentation).
+
+## BUG-055 — The off-device suite is intermittently non-deterministic, and has segfaulted
+
+- Component: `SelfTestProbe/main.swift`, `I2PSelfTest.runAll(progress:)`,
+  `I2PTunnelPool` maintenance.
+- Symptom (measured this pass, remote build Mac): across ~60 runs of the same
+  binary, 3 runs ended in `SIGSEGV` (exit 139) and 2 runs reported failures the
+  next run passed:
+  - `Tunnel pool: staggered builds, expiry, prebuilding, selection` —
+    "maintenance left 0 outbound (0 young) / 0 inbound";
+  - `SAM load: 3 concurrent streams · latency + throughput` — timeout.
+  A crash loses every result, because the probe prints only after `runAll`
+  returns.
+- Why it matters: CI runs `xcodebuild test` against the same suites. A suite that
+  sometimes traps or fails a 15-second wait is not a gate yet.
+- Not fixed in this pass: the crash is not localised. A segfault in a
+  Foundation/CryptoKit process running concurrent suites most often means a data
+  race, and the Swift 6 compiler already flags `NSLock.lock()`/`unlock()` in
+  async contexts (e.g. `I2PTunnel.swift`'s build timeout path) as an error in
+  that language mode.
+- Mitigation shipped: `I2PSelfTest.runAll(progress:)` calls back with each suite
+  group's name immediately before it runs, and `SelfTestProbe --progress` writes
+  each name to stdout unbuffered, so the next crash names the group it died in
+  instead of losing the run.
+- Verification of the mitigation: 28 `--all --progress` runs, 0 crashes,
+  0 failures (the fault is rare, not gone).
+- Next step: loop `--progress` until a crash, take the last group named, and
+  audit that group's shared mutable state (and its async-context `NSLock` use).
+- Status: **root-caused and fixed** — see BUG-056 (four data races, found with
+  ThreadSanitizer) and BUG-057 (the tunnel-pool maintenance defects the flaky pool
+  test exposed). After those fixes ThreadSanitizer reports 0 warnings (exit 0) and
+  30 consecutive `--all` runs, 40 `--tunnel` runs and 20 `--sam` runs are clean.
+
+
+
+## BUG-056 — Four concurrent-state data races behind the segfaults
+
+- Component: `I2PIRCSnoozes.swift`, `I2PSSU2.swift`, `I2PSAMServer.swift`,
+  `I2PNTCP2.swift`.
+- Symptom: `-sanitize=thread` on `--all` reported 10 warnings; the same binary
+  segfaulted 3 times in ~60 runs (BUG-055). TSan named the pairs precisely.
+- Findings and fixes:
+  1. **Snooze store.** The expiry `Task { @MainActor }` read `records` while the
+     caller (SwiftUI, or a suite) mutated it. Fixed with one recursive lock around
+     every record accessor and the `revision`/`minuteTick` bumps
+     (`NSRecursiveLock`, because the entry points re-enter their own readers).
+  2. **`SSU2Transport.listenerPort`.** The `NWListener` state handler wrote it
+     under `lock`, but `startListener` and probes read the stored property
+     without it. Fixed: private `_listenerPort` plus a lock-taking computed
+     property, the same shape `NTCP2Transport` already used.
+  3. **`I2PSAMServer.state`.** Written by the listener's state handler on the
+     Network queue, read by the SAM screen and the conformance suite. Fixed: a
+     private `_state` plus a lock-taking computed `state`; the four write sites
+     use `_state` inside their existing locked regions.
+  4. **`NTCP2Session`.** `close(reason:)` (and `send`) ran on the caller's thread
+     and touched `state`, the frame codecs and the receive buffer while the
+     session's queue owned them in the receive path. Fixed with `onQueue`: inline
+     when already on the network queue (tracked with a `DispatchSpecificKey`),
+     `queue.sync` otherwise, so `send`/`close` keep their synchronous meaning.
+     `isEstablished` reads under the same rule.
+     That fix exposed an inverted lock order: `NTCP2Transport.send(to:data:)` and
+     `closeSession(for:)` held the transport lock while calling into the session,
+     and the session queue calls back into the transport (`didEstablish`,
+     `didClose`) which takes that same lock. Both now take the session out under
+     the lock, release it, and only then call the session — the deadlock that
+     ordering could produce.
+- Verification: ThreadSanitizer `--all` → 0 warnings, exit 0; 30 consecutive
+  plain `--all` runs → 214/214 and no crashes.
+- Status: fixed.
+
+## BUG-057 — Tunnel-pool maintenance built constantly, leaked contexts, and serialised both directions
+
+- Component: `I2PTunnelPool.swift` (`maintain`, `buildReplacements`),
+  `I2PTunnel.swift` (`buildTunnel` context lifecycle), `I2PTunnelTests.swift`.
+- Findings and fixes:
+  1. **A build every tick with nothing needed.** `for _ in 0..<max(1, needed)`
+     built one replacement per maintenance tick even when the pool was full and
+     nothing was expiring. With the default 2 s tick and a 15-minute lifetime a
+     three-tunnel pool would accumulate hundreds of tunnels, every one a real
+     ShortTunnelBuild sent to real hops. Fixed: `0..<needed`.
+  2. **Build contexts never released.** A context was removed only on timeout, so
+     every later reply scanned every build the router had ever started. Fixed:
+     the context is dropped on any terminal result.
+  3. **One slow direction stalled the other.** `maintain()` built inbound then
+     outbound sequentially, so a single build timeout (20 s by default) held the
+     other direction's replacement back while the pool drained. Fixed: the two
+     directions build concurrently (`async let`), each capped at its shortfall.
+  4. **The test could not distinguish slow from drained.** It used a 10 s build
+     timeout inside a 15 s wait window. Fixed: 2 s timeout, 25 s window, and the
+     failure line now names the build count, failures and builds still in flight.
+- Verification: 40 consecutive `--tunnel` runs clean (previously ~2 in 20 failed
+  with "maintenance left 0 outbound / 0 inbound").
+- Status: fixed.
+
+## BUG-058 — Two rare harness races: a lease read too early, and a bootstrap round short
+
+- Component: `I2PSAMConformanceTest.swift` (`crossPublish`),
+  `I2PNetDBTests.swift` (`testBootstrap`).
+- Symptom, after BUG-056/057: one failure in ~25 full runs, either
+  `SAM STREAM CONNECT/ACCEPT … destinationNotFound` / `SAM load … destinationNotFound`,
+  or `NetDB bootstrapping discovery — invalidFormat`.
+- Root cause (SAM): a session answers `SESSION STATUS RESULT=OK` before its
+  LeaseSet publication lands (the tunnel pool must build first). `crossPublish`
+  looked once, so the harness occasionally reported the lease missing before it
+  existed. Fixed: poll the source netdb for up to 5 s, as a client waits for a
+  destination to become resolvable.
+- Root cause (NetDB): `bootstrap` runs at most 6 rounds, and the loopback hub
+  delivers DatabaseLookup answers asynchronously, so a round can land after the
+  next one starts; six rounds occasionally finished one peer short of nine. Fixed:
+  12 rounds — the loop exits as soon as the target is reached, so the extra
+  rounds cost nothing when replies are prompt.
+- Verification: 30 consecutive `--all` runs clean.
+- Status: fixed.
+
+
+
+## BUG-059 — A SAM session could answer OK with no usable tunnels or lease
+
+- Component: `I2PSAMServer.createSession`, `I2PTunnelPool.fillPools`, the SAM
+  conformance tests.
+- Symptom: `SAM DATAGRAM SEND fragmentation + reassembly` failed about once in 30
+  runs with `destinationNotFound`, and `SAM load` with a 20 s read timeout. The
+  bridge log showed the failing session answering `SESSION STATUS RESULT=OK` in
+  the same second it was created.
+- Root cause: `createSession` called `pool.fillPools()` and then
+  `publishLeaseSet()` exactly once. `fillPools` gives up on a direction after
+  three failed build attempts, and the SAM pool's maintenance interval is 30 s,
+  so one transient build failure left the session with an empty outbound pool (a
+  send then failed with `tunnel_selection_failed:noTunnels`) or with no inbound
+  lease (`publishLeaseSet` returned false and nothing retried until the 5-minute
+  renewal loop). Clients saw "destination not found" or a send that never landed.
+- Fix: after `fillPools`, `createSession` waits (bounded at 10 s, retrying
+  `fillPools`) until both directions hold a tunnel, and logs the pool state and
+  build failures if they never do; publication is retried for a bounded window
+  when it found no lease.
+- Verification: 60 isolated datagram runs clean after the fix.
+- Status: fixed.
+
+## BUG-060 — Stream chunks were sent concurrently, racing one garlic session
+
+- Component: `I2PSAMServer.pumpClientBytes` (the stream data path).
+- Symptom: after BUG-059, the full suite still failed `SAM load: 3 concurrent
+  streams` about once in ten runs — a 20 s `readBytes` timeout on one stream while
+  the others were fine.
+- Root cause: one client write was split into chunks and each chunk was sent in
+  its own `Task`, i.e. concurrently. All chunks of a session share one garlic
+  session toward the peer (tag/ratchet state), so concurrent sends can interleave
+  or lose a chunk; the receiver's ordered reassembler then holds every later
+  sequence behind the missing one — a silent 20 s stall. The code's own comment
+  already warned that "a dropped chunk leaves a permanent sequence gap".
+- Fix: the frames for one write are built up front and sent sequentially inside a
+  single task; a send error still aborts the stream loudly.
+- Verification: `SAM_ONLY=LOAD` 40/40 and `SAM_ONLY=DATAGRAM` 40/40 clean; 25
+  consecutive full `--all` runs clean (214/214); ThreadSanitizer 0 warnings.
+- Status: fixed.
+
+
+
+## BUG-061 — Rare load-case stall in full-suite runs (open)
+
+- Component: `I2PSAMConformanceTest.loadTest` and whatever else in the process
+  competes with it.
+- Symptom: after BUG-059 and BUG-060, `SAM load: 3 concurrent streams` still
+  stalls about once in 25 full `--all` runs — a 20 s `readBytes` timeout on one
+  stream while the other two pass. The same case is 40/40 clean when run alone
+  (`SAM_ONLY=LOAD`), and 25 consecutive full runs in one batch were clean.
+- What is ruled out: session readiness (BUG-059), concurrent chunk sends
+  (BUG-060), lease resolution/publication waits, and the chunker/assembler
+  arithmetic. The failure's bridge log shows the sessions created and the other
+  pairs established, so it is a data-plane stall on one stream, not a setup
+  failure.
+- Not yet known: which frame is missing. The load case has `SAM_TRACE=1`
+  tracing ("pair N established", "stream N probe R ok", "bulk …"), but the one
+  failing run captured so far kept only the beginning of the bridge log.
+- Next step: run the full suite with `SAM_TRACE=1` in a loop and, on failure,
+  take the last "stream N probe R ok" index per stream — that names the first
+  missing frame. In parallel, check whether the global
+  `I2PRouterAppContext.shared` that several earlier suites construct (netdb,
+  transports, tunnel pool) leaves background work that competes with the load
+  phase, and give the self-test runner a teardown hook for it if so.
+- Status: **open** (rare; every deterministic suite passes, and the two causes
+  found so far are fixed).

@@ -6,7 +6,7 @@
 // provides the entry point and the compiler rejects an `@main` type here.
 //
 //    swiftc -swift-version 5 -o .probe-build/netdiag \
-//        Untitled1/I2P/*.swift SelfTestProbe/ProbeStubs.swift NetDiag/main.swift
+//        Untitled1/I2P/*.swift NetDiag/main.swift
 //    ./.probe-build/netdiag
 
 import Foundation

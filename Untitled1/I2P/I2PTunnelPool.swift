@@ -383,22 +383,30 @@ final class I2PTunnelPool {
 
     /// Maintenance: prune expired tunnels, then pre-build replacements for
     /// tunnels nearing expiration so the pool never drains.
+    ///
+    /// The two directions are built concurrently. Sequentially, one direction's
+    /// build that times out (20 s by default) held the other direction's
+    /// replacement back for the whole timeout, and the pool drained in the
+    /// meantime. An outbound build that finds no live inbound tunnel falls back
+    /// to a local reply endpoint, so it does not need to wait for the inbound
+    /// replacement to finish.
     func maintain() async {
         pruneExpired()
-        // Inbound first, then outbound: a replacement outbound tunnel needs a
-        // live inbound tunnel to answer through, and one may have just expired.
-        for direction in [I2PTunnel.Direction.inbound, .outbound] {
-            let active = activeCount(direction)
-            let expiring = expiringCount(direction)
-            let needed = min(2, max(0, targetCount(direction) + expiring - active))
-            // One failed build per tick is retried with a fresh hop set instead
-            // of deferring the whole direction to the next maintenance pass.
-            for _ in 0..<max(1, needed) {
-                let before = activeCount(direction)
-                await buildOne(direction)
-                guard activeCount(direction) > before else { break }
-                if activeCount(direction) >= targetCount(direction) { break }
-            }
+        async let inboundReplacements = buildReplacements(.inbound)
+        async let outboundReplacements = buildReplacements(.outbound)
+        _ = await (inboundReplacements, outboundReplacements)
+    }
+
+    /// Builds at most the replacements one direction is short of.
+    private func buildReplacements(_ direction: I2PTunnel.Direction) async {
+        let active = activeCount(direction)
+        let expiring = expiringCount(direction)
+        let needed = min(2, max(0, targetCount(direction) + expiring - active))
+        for _ in 0..<needed {
+            let before = activeCount(direction)
+            await buildOne(direction)
+            guard activeCount(direction) > before else { break }
+            if activeCount(direction) >= targetCount(direction) { break }
         }
     }
 

@@ -99,7 +99,17 @@ final class I2PSAMServer {
     let queue = DispatchQueue(label: "i2p.sam.server")
     private let lock = NSLock()
     private var listener: NWListener?
-    private(set) var state: State = .stopped
+    /// The listener's state. The Network framework's state handler writes it on
+    /// the listener's queue while the SAM screen and the conformance suite read
+    /// it from their own threads, so it is stored privately and only ever
+    /// touched under `lock` — a plain stored property here was a real data race
+    /// (ThreadSanitizer, 2026-11-18).
+    private var _state: State = .stopped
+    var state: State {
+        lock.lock()
+        defer { lock.unlock() }
+        return _state
+    }
     private var connections: [I2PSAMConnection] = []
     private var sessions: [String: I2PSAMSession] = [:]
     private(set) var addressbook: [String: I2PDestination] = [:]
@@ -147,12 +157,12 @@ final class I2PSAMServer {
                 case .ready:
                     self.lock.lock()
                     let bound = self.listener?.port?.rawValue ?? self.configuredPort
-                    self.state = .listening(port: bound)
+                    self._state = .listening(port: bound)
                     self.lock.unlock()
                     self.note("SAM listener ready on 127.0.0.1:\(bound)")
                     self.startRenewalLoop()
                 case .failed(let error):
-                    self.lock.lock(); self.state = .failed(String(describing: error)); self.lock.unlock()
+                    self.lock.lock(); self._state = .failed(String(describing: error)); self.lock.unlock()
                     self.note("SAM listener failed: \(error)")
                 default: break
                 }
@@ -161,7 +171,7 @@ final class I2PSAMServer {
             lock.lock(); self.listener = listener; lock.unlock()
             listener.start(queue: queue)
         } catch {
-            lock.lock(); state = .failed(String(describing: error)); lock.unlock()
+            lock.lock(); _state = .failed(String(describing: error)); lock.unlock()
             note("SAM listener error: \(error)")
         }
         onChange?()
@@ -183,7 +193,7 @@ final class I2PSAMServer {
         connections.forEach { $0.shutdown() }
         sessions.values.forEach { $0.shutdown() }
         renewal?.cancel()
-        lock.lock(); state = .stopped; lock.unlock()
+        lock.lock(); _state = .stopped; lock.unlock()
         note("SAM listener stopped")
         onChange?()
     }
@@ -232,7 +242,47 @@ final class I2PSAMServer {
         dispatcher.register(session)
         pool.start()
         await pool.fillPools()
-        await session.publishLeaseSet()
+        // Both directions must exist before the session is usable: a datagram
+        // or stream send with no outbound tunnel fails with
+        // "tunnel_selection_failed:noTunnels", and a lease needs an inbound
+        // one. A first build that fails leaves `fillPools` after its retries and
+        // the pool stays short until the maintenance tick (30 s in the SAM
+        // config), so wait for readiness here, bounded, and say what happened if
+        // it never arrives.
+        let readyDeadline = Date().addingTimeInterval(10)
+        while (pool.outboundTunnels.isEmpty || pool.inboundTunnels.isEmpty),
+              Date() < readyDeadline {
+            try? await Task.sleep(for: .milliseconds(200))
+            await pool.fillPools()
+        }
+        if pool.outboundTunnels.isEmpty || pool.inboundTunnels.isEmpty {
+            let history = pool.buildHistory()
+            let failures = history.filter { !$0.succeeded }
+            let reasons = failures.prefix(3).map { record in
+                record.returnCode.map { "code \($0)" } ?? "timeout"
+            }
+            note("session \(nickname): pool not ready (outbound \(pool.outboundTunnels.count),"
+                 + " inbound \(pool.inboundTunnels.count)); \(history.count) build(s),"
+                 + " \(failures.count) failed \(reasons.joined(separator: "/"))")
+        }
+        var published = await session.publishLeaseSet()
+        if !published {
+            // A session answers SESSION STATUS as soon as it exists, but a
+            // LeaseSet needs at least one inbound lease. When the first build
+            // did not land, publishing here found nothing and the session stayed
+            // unresolvable until the 5-minute renewal loop — every client read
+            // that as "destination not found". Retry for a bounded window, and
+            // say so in the bridge log.
+            note("session \(nickname): first LeaseSet publication found no lease"
+                 + " (inbound \(pool.inboundTunnels.count), outbound \(pool.outboundTunnels.count)); retrying")
+            let deadline = Date().addingTimeInterval(10)
+            while !published, Date() < deadline {
+                try? await Task.sleep(for: .milliseconds(200))
+                if pool.inboundTunnels.isEmpty { await pool.fillPools() }
+                published = await session.publishLeaseSet()
+            }
+            note("session \(nickname): LeaseSet \(published ? "published on retry" : "still unpublished")")
+        }
         for tunnel in pool.inboundTunnels {
             transport.installInboundGlueIfNeeded(tunnel)
         }
@@ -909,20 +959,28 @@ final class I2PSAMConnection {
         // client write larger than one chunk (the load test's 8 KiB bulk
         // transfer) stalled forever.
         let sequence = context.nextSequence()
-        for (index, chunk) in chunks.enumerated() {
-            let frame = I2PSAMFrame(streamID: context.localID, flags: [], sequence: sequence,
-                                    fromPort: 0, toPort: 0,
-                                    chunkIndex: UInt16(index), chunkCount: UInt16(chunks.count),
-                                    chunk: chunk, attached: Data())
-            Task { [weak self] in
-                guard let self, let session = self.boundSession() else { return }
+        let frames = chunks.enumerated().map { index, chunk in
+            I2PSAMFrame(streamID: context.localID, flags: [], sequence: sequence,
+                        fromPort: 0, toPort: 0,
+                        chunkIndex: UInt16(index), chunkCount: UInt16(chunks.count),
+                        chunk: chunk, attached: Data())
+        }
+        // Sequential, not one Task per chunk: concurrent sends share the one
+        // garlic session toward the peer (tag/ratchet state) and can interleave
+        // or lose a chunk. A lost chunk is a permanent gap in the receiver's
+        // ordered reassembly, so the stream stalls until the client times out —
+        // the rare 20 s read timeout the load case saw.
+        Task { [weak self] in
+            guard let self, let session = self.boundSession() else { return }
+            for (index, frame) in frames.enumerated() {
                 do {
                     try await session.send(frame, to: context.lease, remote: context.remote)
                 } catch {
                     // A dropped chunk leaves a permanent sequence gap, so the
                     // peer would hold every later frame forever. Fail the
                     // stream loudly instead of hanging.
-                    self.abortStream("send of \(chunk.count)B chunk \(index)/\(chunks.count) failed: \(error)")
+                    self.abortStream("send of \(frame.chunk.count)B chunk \(index)/\(frames.count) failed: \(error)")
+                    return
                 }
             }
         }

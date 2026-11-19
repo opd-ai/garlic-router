@@ -5,18 +5,33 @@
 //  reproduced without the simulator. See INTEROP_REPORT.md for the workflow.
 //
 //    swiftc -swift-version 5 -o .probe-build/selftestprobe \
-//        Untitled1/I2P/*.swift SelfTestProbe/ProbeStubs.swift SelfTestProbe/main.swift
+//        Untitled1/I2P/*.swift SelfTestProbe/main.swift
 //    ./.probe-build/selftestprobe --all
 //
-//  ProbeStubs.swift stands in for the two self-test suites that live inside a
-//  SwiftUI view file and so cannot be compiled here.
+//  Every suite the app runs now lives under I2P/ — including the eepsite
+//  browser's navigation and share suites — so this harness covers all of them
+//  and needs no stand-ins.
 //
 
 import Foundation
 
 var results: [I2PSelfTestResult] = []
+
+// `--progress` names each suite group before it runs and writes it straight out,
+// so when the process traps or segfaults mid-run the group it died in is visible
+// instead of the whole run's output being lost with the buffered results.
+let progress: ((String) -> Void)? = CommandLine.arguments.contains("--progress")
+    ? { name in FileHandle.standardOutput.write(Data("· \(name)\n".utf8)) }
+    : nil
+
 if CommandLine.arguments.contains("--all") {
-    results += await I2PSelfTest.runAll()
+    results += await I2PSelfTest.runAll(progress: progress)
+}
+if CommandLine.arguments.contains("--netdb") {
+    results += await I2PNetDBSelfTest.runAll()
+}
+if CommandLine.arguments.contains("--ntcp2") {
+    results += await I2PNTCP2SelfTest.runAll()
 }
 if CommandLine.arguments.contains("--tunnel") {
     results += await I2PTunnelSelfTest.runAll()

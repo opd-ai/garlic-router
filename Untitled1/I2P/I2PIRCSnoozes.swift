@@ -147,6 +147,13 @@ final class I2PIRCSnoozeBook: ObservableObject {
     /// The countdown that lifts timed snoozes by itself and keeps the time left
     /// ticking while one runs.
     private var expiryTask: Task<Void, Never>? = nil
+    /// Serialises the record. The expiry clock runs on the main actor while
+    /// SwiftUI and the self-test suites call in from their own threads, and a
+    /// dictionary read on one thread while another mutates it is undefined
+    /// behaviour — ThreadSanitizer reported exactly that access race on
+    /// 2026-11-18. Recursive because every entry point re-enters its own
+    /// readers (`entries` → `liveEntries`, `snooze` → `scheduleExpiry`).
+    private let stateLock = NSRecursiveLock()
 
     init(defaults: UserDefaults = .standard,
          storageKey: String = I2PIRCSnoozeBook.defaultsKey) {
@@ -163,7 +170,9 @@ final class I2PIRCSnoozeBook: ObservableObject {
 
     /// The snoozed conversations of one server, as they stand at `now`.
     func entries(for serverID: UUID, at now: Date = Date()) -> [I2PIRCSnoozeEntry] {
-        liveEntries(for: serverID.uuidString, at: now)
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return liveEntries(for: serverID.uuidString, at: now)
     }
 
     /// The conversation keys a server has snoozed right now.
@@ -185,6 +194,8 @@ final class I2PIRCSnoozeBook: ObservableObject {
                at now: Date = Date()) -> I2PIRCSnoozeEntry? {
         let key = I2PIRCName.key(conversationID)
         guard !key.isEmpty else { return nil }
+        stateLock.lock()
+        defer { stateLock.unlock() }
         return liveEntries(for: serverID.uuidString, at: now).first { $0.key == key }
     }
 
@@ -199,6 +210,8 @@ final class I2PIRCSnoozeBook: ObservableObject {
                 at now: Date = Date()) -> Bool {
         let key = I2PIRCName.key(conversationID)
         guard !key.isEmpty else { return false }
+        stateLock.lock()
+        defer { stateLock.unlock() }
         let serverKey = serverID.uuidString
         var entries = liveEntries(for: serverKey, at: now)
         let entry = I2PIRCSnoozeEntry(key: key, endsAt: duration.end(from: now))
@@ -211,7 +224,7 @@ final class I2PIRCSnoozeBook: ObservableObject {
         entries.sort { $0.key < $1.key }
         records[serverKey] = entries
         persist()
-        revision &+= 1
+        bumpRevision()
         scheduleExpiry()
         return true
     }
@@ -224,6 +237,8 @@ final class I2PIRCSnoozeBook: ObservableObject {
                      at now: Date = Date()) -> Bool {
         let key = I2PIRCName.key(conversationID)
         guard !key.isEmpty else { return false }
+        stateLock.lock()
+        defer { stateLock.unlock() }
         let serverKey = serverID.uuidString
         let entries = liveEntries(for: serverKey, at: now)
         guard entries.contains(where: { $0.key == key }) else { return false }
@@ -234,7 +249,7 @@ final class I2PIRCSnoozeBook: ObservableObject {
             records[serverKey] = kept
         }
         persist()
-        revision &+= 1
+        bumpRevision()
         scheduleExpiry()
         return true
     }
@@ -248,6 +263,8 @@ final class I2PIRCSnoozeBook: ObservableObject {
     /// Drops every snooze whose time has run out. A silent tidy-up: whoever has
     /// something to tell bumps the revision itself.
     private func prune(at now: Date = Date()) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
         var changed = false
         for (serverKey, entries) in records {
             let live = entries.filter { I2PIRCSnoozeRule.isLive($0.endsAt, at: now) }
@@ -265,7 +282,23 @@ final class I2PIRCSnoozeBook: ObservableObject {
     /// The earliest end of a timed snooze still to come, which is when the clock
     /// next has something to do.
     private func nearestEndsAt(at now: Date = Date()) -> Date? {
-        records.values.flatMap { $0 }.compactMap(\.endsAt).filter { $0 > now }.min()
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return records.values.flatMap { $0 }.compactMap(\.endsAt).filter { $0 > now }.min()
+    }
+
+    /// The revision is read by SwiftUI and written by both the callers and the
+    /// expiry clock, so its writes go through the same lock as the record.
+    private func bumpRevision() {
+        stateLock.lock()
+        revision &+= 1
+        stateLock.unlock()
+    }
+
+    private func bumpMinuteTick() {
+        stateLock.lock()
+        minuteTick &+= 1
+        stateLock.unlock()
     }
 
     /// Runs the clock: a tick every twenty seconds so a chip's time left follows
@@ -283,9 +316,9 @@ final class I2PIRCSnoozeBook: ObservableObject {
                 guard !Task.isCancelled else { return }
                 if Date() >= nearest {
                     book.prune()
-                    book.revision &+= 1
+                    book.bumpRevision()
                 } else {
-                    book.minuteTick &+= 1
+                    book.bumpMinuteTick()
                 }
             }
         }

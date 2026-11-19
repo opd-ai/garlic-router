@@ -44,6 +44,28 @@ final class NTCP2Session: NSObject {
     private let expectedRemoteIV: Data?
     private let queue: DispatchQueue
 
+    /// Marks a network queue of ours, so `onQueue` can tell whether it is
+    /// already running on one and must not `sync` onto it again (which would
+    /// deadlock).
+    private static let queueKey = DispatchSpecificKey<Bool>()
+
+    /// Runs `body` on the session's queue.
+    ///
+    /// The receive path, the state handler and the handshake timers all mutate
+    /// `state`, the frame codecs and the receive buffer on that queue. Callers
+    /// on other threads — a probe closing a session, the transport's maintenance,
+    /// a router delivery sending a message — must not touch the same state
+    /// directly: ThreadSanitizer caught `close(reason:)` racing the receive
+    /// path's frame codec on 2026-11-18. Inline when already on the queue,
+    /// `sync` otherwise, so reads stay synchronous and `send`/`close` keep their
+    /// meaning.
+    private func onQueue<T>(_ body: () throws -> T) rethrows -> T {
+        if DispatchQueue.getSpecific(key: Self.queueKey) != nil {
+            return try body()
+        }
+        return try queue.sync(execute: body)
+    }
+
     private var initiator: NTCP2InitiatorHandshake?
     private var responder: NTCP2ResponderHandshake?
     private var sendCodec: NTCP2FrameCodec?
@@ -136,7 +158,7 @@ final class NTCP2Session: NSObject {
         }
     }
 
-    var isEstablished: Bool { state == .established }
+    var isEstablished: Bool { onQueue { state == .established } }
 
     init(role: Role,
          connection: NWConnection,
@@ -164,6 +186,7 @@ final class NTCP2Session: NSObject {
         // live audit's session-endings line reads.
         if role == .initiator { self.remoteRouterHash = remoteRouterHash }
         self.queue = queue
+        queue.setSpecific(key: Self.queueKey, value: true)
     }
 
     func start() {
@@ -430,6 +453,10 @@ final class NTCP2Session: NSObject {
     // MARK: - Send / close
 
     func send(_ data: Data) throws {
+        try onQueue { try sendOnQueue(data) }
+    }
+
+    private func sendOnQueue(_ data: Data) throws {
         guard state == .established, let codec = sendCodec else {
             throw NTCP2Error.notEstablished
         }
@@ -463,6 +490,10 @@ final class NTCP2Session: NSObject {
 
     /// Graceful termination: a termination block, then TCP close.
     func close(reason: UInt8 = 0) {
+        onQueue { closeOnQueue(reason: reason) }
+    }
+
+    private func closeOnQueue(reason: UInt8) {
         guard state == .established, let codec = sendCodec else {
             connection.cancel()
             return
@@ -482,7 +513,7 @@ final class NTCP2Session: NSObject {
 
     /// Immediate teardown without the termination exchange.
     func abort() {
-        connection.cancel()
+        onQueue { connection.cancel() }
     }
 
     private func finish(error: Error?) {
@@ -814,8 +845,14 @@ final class NTCP2Transport {
 
     func send(to routerHash: Data, data: Data) throws {
         lock.lock()
-        defer { lock.unlock() }
-        guard let session = sessionsByHash[routerHash], session.isEstablished else {
+        let session = sessionsByHash[routerHash]
+        lock.unlock()
+        // Never hold the transport lock across a call into the session. The
+        // session runs its state on the network queue, and that queue calls
+        // back into this transport (didEstablish / didClose), which takes this
+        // same lock — holding it here inverted the two locks and deadlocked
+        // the pair.
+        guard let session, session.isEstablished else {
             throw NTCP2Error.noSession(forHash: routerHash)
         }
         try session.send(data)
@@ -823,8 +860,9 @@ final class NTCP2Transport {
 
     func closeSession(for routerHash: Data) {
         lock.lock()
-        defer { lock.unlock() }
-        sessionsByHash[routerHash]?.close()
+        let session = sessionsByHash[routerHash]
+        lock.unlock()
+        session?.close()
     }
 
     func shutdown() {

@@ -433,7 +433,12 @@ enum I2PNetDBSelfTest {
     private static func testBootstrap() async throws -> String {
         let mesh = try await makeMesh(nodeCount: 10, floodfillCount: 3)
         let seeds = Array(mesh.hashes.prefix(3))
-        let discovered = await mesh.nodes[9].bootstrap(seedFloodfills: seeds, targetPeers: 9, maxRounds: 6)
+        // Iterative discovery: each round's DatabaseLookup answers are delivered
+        // asynchronously by the loopback hub, so a round can land after the next
+        // one starts. Six rounds occasionally finished a peer short; the loop
+        // stops as soon as the target is reached, so extra rounds cost nothing
+        // when every reply is prompt.
+        let discovered = await mesh.nodes[9].bootstrap(seedFloodfills: seeds, targetPeers: 9, maxRounds: 12)
         guard discovered >= 9 else { throw I2PWireError.invalidFormat }
         let floodfills = await mesh.nodes[9].floodfillCount()
         guard floodfills >= 3 else { throw I2PWireError.invalidFormat }

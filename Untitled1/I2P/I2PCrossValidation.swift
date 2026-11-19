@@ -129,6 +129,9 @@ enum I2PCrossValidation {
         run("T4-ST-MAPPING-ORDER", rowID: "ST-MAPPING", "Mapping: canonical sorted-key encoding, insertion-order independent") {
             try mappingCanonicalOrder()
         }
+        run("T4-ST-MAPPING-BOUNDS", rowID: "ST-MAPPING", "Mapping: wire-bounded keys/values and a near-64 KiB body re-encode byte-identically, so no parsed mapping can reach the writer's length-field preconditions") {
+            try mappingWireBounds()
+        }
 
         // MARK: I2NP — header and message bodies
 
@@ -233,6 +236,9 @@ enum I2PCrossValidation {
         }
         run("T4-TN-RECORD-ECIES-RT", rowID: "TN-RECORD-ECIES", "218-byte short record box: encrypt/decrypt round trip; wrong key/hop/tamper rejected") {
             try buildRecordEncryption()
+        }
+        run("T4-TN-RECORD-ECIES-LAYOUT", rowID: "TN-RECORD-ECIES", "Build record placement: order randomized, message padded to the spec's four-record minimum, inbound build carries the originator decoy (own truncated hash + real X25519 key)") {
+            try buildRecordLayout()
         }
         run("T4-TN-BREPLY-RT", rowID: "TN-BREPLY", "Short build reply record: round trip across return codes; wrong hop/index rejected") {
             try buildReplyRecordRoundTrip()
@@ -1056,6 +1062,48 @@ enum I2PCrossValidation {
             throw I2PCrossValidationError.unexpectedSuccess
         }
         return "truncated strings/mappings/hashes rejected, zero dates decode as none, trailing data rejected"
+    }
+
+    private static func mappingWireBounds() throws -> String {
+        // The writer's length fields are one byte per key and per value and two
+        // bytes for the body, so an over-long mapping would trap. Nothing that
+        // came off the wire can be over-long: the reader derived every key and
+        // value from a one-byte length and the body from a two-byte one. Pin
+        // that, because it is what makes those preconditions unreachable from
+        // network data: a maximal-length mapping parses and re-encodes
+        // byte-identically.
+        let maxKey = String(repeating: "k", count: 255)
+        let maxValue = String(repeating: "v", count: 255)
+        var writer = I2PWriter()
+        writer.mapping([maxKey: maxValue])
+        var reader = I2PReader(writer.data)
+        let parsed = try reader.mapping()
+        guard reader.remaining == 0, parsed == [maxKey: maxValue] else {
+            throw I2PWireError.invalidFormat
+        }
+        var again = I2PWriter()
+        again.mapping(parsed)
+        guard again.data == writer.data else { throw I2PWireError.invalidFormat }
+
+        // The largest body the two-byte length can address: 268 pairs of
+        // 120-byte keys and values is a 65,392-byte body.
+        var large: [String: String] = [:]
+        for index in 0..<268 {
+            let key = String(format: "%03d", index) + String(repeating: "a", count: 117)
+            large[key] = String(repeating: "b", count: 120)
+        }
+        var largeWriter = I2PWriter()
+        largeWriter.mapping(large)
+        guard largeWriter.data.count > 60_000, largeWriter.data.count <= 65_537 else {
+            throw I2PWireError.invalidFormat
+        }
+        var largeReader = I2PReader(largeWriter.data)
+        let largeParsed = try largeReader.mapping()
+        guard largeParsed == large else { throw I2PWireError.invalidFormat }
+        var largeAgain = I2PWriter()
+        largeAgain.mapping(largeParsed)
+        guard largeAgain.data == largeWriter.data else { throw I2PWireError.invalidFormat }
+        return "255-byte keys and values, and a \(largeWriter.data.count)-byte body, round-trip byte-identically; a parsed mapping can never exceed the writer's one-byte and two-byte length fields"
     }
 
     private static func mappingCanonicalOrder() throws -> String {
@@ -2107,6 +2155,44 @@ enum I2PCrossValidation {
             throw I2PWireError.invalidFormat
         }
         return "IBGW/OBEP flags and the end marker round trip; reserved bytes enforced zero; padding normalized"
+    }
+
+    private static func buildRecordLayout() throws -> String {
+        // The spec requires randomized record order, a recommended minimum of
+        // four records per build message, and — for an inbound build — one fake
+        // record addressed to the originating router's own hash.
+        var sawShuffledOrder = false
+        var slotsUsed: Set<Int> = []
+        for _ in 0..<24 {
+            let layout = I2PTunnelBuilder.buildLayout(hopCount: 2, direction: .outbound)
+            guard layout.slotCount >= 4, layout.slotCount <= 8,
+                  layout.positions.count == 2,
+                  Set(layout.positions).count == 2,
+                  layout.positions.allSatisfy({ $0 >= 0 && $0 < layout.slotCount }),
+                  layout.originatorSlot == nil else {
+                throw I2PCrossValidationError.failed(
+                    "invalid outbound placement: slots=\(layout.slotCount) \(layout.positions)")
+            }
+            slotsUsed.formUnion(layout.positions)
+            if layout.positions != [0, 1] { sawShuffledOrder = true }
+        }
+        guard sawShuffledOrder, slotsUsed.contains(where: { $0 > 1 }) else {
+            throw I2PCrossValidationError.failed("record order was never randomized over 24 layouts")
+        }
+
+        let inbound = I2PTunnelBuilder.buildLayout(hopCount: 2, direction: .inbound)
+        guard inbound.slotCount >= 4, let decoySlot = inbound.originatorSlot,
+              !inbound.positions.contains(decoySlot) else {
+            throw I2PCrossValidationError.failed("inbound build has no free originator slot")
+        }
+        let routerHash = I2PCrypto.randomBytes(32)
+        let record = I2PTunnelBuilder.originatorDecoyRecord(localRouterHash: routerHash)
+        guard record.count == I2PTunnelBuildRequestRecord.wireLength,
+              Array(record.prefix(16)) == Array(routerHash.prefix(16)),
+              (try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: Data(record[16..<48]))) != nil else {
+            throw I2PCrossValidationError.failed("originator decoy record is not a plausible short record")
+        }
+        return "record order randomized across \(slotsUsed.count) distinct slots in 4-8 slots; inbound decoy carries the originator's hash prefix and a real X25519 key"
     }
 
     private static func buildRecordEncryption() throws -> String {

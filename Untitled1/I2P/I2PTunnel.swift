@@ -572,12 +572,57 @@ final class I2PTunnelBuilder {
         let receiveIDs: [UInt32]
         let layerKeys: [Data]
         let ivKeys: [Data]
-        /// Per-hop reply material (reply key, handshake hash, record index),
-        /// the originator's side of the short-build record KDF.
-        let replyMaterials: [I2PTunnelBuildReplyMaterial]
+        /// Per-hop reply material in hop order: the originator's side of the
+        /// short-build record KDF, and the key order a walk-back reply peels in.
+        let hopReplyMaterials: [I2PTunnelBuildReplyMaterial]
+        /// Per-slot reply material in wire order; nil for a fake record.
+        let replyMaterials: [I2PTunnelBuildReplyMaterial?]
+        /// The wire slot each hop's record was placed in, in hop order.
+        let positions: [Int]
+        /// The slot holding the message-path end's record (the outbound
+        /// endpoint, or the inbound build's hop nearest the originator).
+        let endpointSlot: Int
         let originatorEndpointID: UInt32
         let sentAt: Date
         let lifetime: TimeInterval
+    }
+
+    /// Where each hop's record sits in a build message.
+    struct BuildLayout: Equatable {
+        /// Records the message carries: the real hops plus the spec's fake
+        /// records, and never fewer than four.
+        let slotCount: Int
+        /// The wire slot of each hop's record, in hop order.
+        let positions: [Int]
+        /// The free slot given to an inbound build's originator decoy.
+        let originatorSlot: Int?
+    }
+
+    /// The tunnel-creation spec's build-record layout: "Build record order must
+    /// be randomized", "the recommended minimum number of build records is 4",
+    /// and for an inbound build "there must always be one 'fake' record for the
+    /// originating router". Real records land on random slots and the rest are
+    /// filler, so a hop can infer neither its own position nor the hop count.
+    static func buildLayout(hopCount: Int, direction: I2PTunnel.Direction) -> BuildLayout {
+        let required = hopCount + (direction == .inbound ? 1 : 0)
+        let slotCount = min(8, max(4, required))
+        var free = Array(0..<slotCount).shuffled()
+        let positions = [Int](free.prefix(hopCount))
+        free.removeFirst(positions.count)
+        return BuildLayout(slotCount: slotCount,
+                           positions: positions,
+                           originatorSlot: direction == .inbound ? free.first : nil)
+    }
+
+    /// The inbound build's mandatory decoy record: an X25519 ephemeral public key
+    /// under this router's own truncated identity hash, so the hop nearest the
+    /// originator cannot tell that the tunnel's endpoint is right beside it. The
+    /// remainder is filler no hop can open.
+    static func originatorDecoyRecord(localRouterHash: Data) -> Data {
+        var record = Data(localRouterHash.prefix(16))
+        record.append(Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation)
+        record.append(I2PCrypto.randomBytes(I2PTunnelBuildRequestRecord.wireLength - record.count))
+        return record
     }
 
     enum BuildResult {
@@ -604,8 +649,9 @@ final class I2PTunnelBuilder {
     /// Builds a unidirectional tunnel through the given peers, listed in
     /// tunnel data-path order: the first hop is the tunnel's gateway; for an
     /// inbound tunnel the last hop is the one nearest the originator. The
-    /// build message follows this same order, so each hop's state, layer key
-    /// and next-hop info describe the data path it will actually process.
+    /// records' *contents* follow this order, but their positions on the wire do
+    /// not: each record is placed in a random slot of a message padded to the
+    /// spec's minimum four records, so no hop learns its place in the path.
     ///
     /// `replyRoute` is where an outbound build's endpoint sends its build reply:
     /// per the spec's message flow, "Reply through existing inbound D-E-F" — an
@@ -624,6 +670,9 @@ final class I2PTunnelBuilder {
         let messageID = UInt32.random(in: 1...UInt32.max)
         let receiveIDs = hops.map { _ in UInt32.random(in: 1...UInt32.max) }
         let originatorEndpointID = UInt32.random(in: 1...UInt32.max)
+        // Slots are chosen up front so each record is sealed with the reply index
+        // its hop will answer at.
+        let layout = Self.buildLayout(hopCount: hops.count, direction: direction)
 
         var records: [Data] = []
         var materials: [I2PTunnelBuildReplyMaterial] = []
@@ -685,10 +734,26 @@ final class I2PTunnelBuilder {
                 record.serialize(),
                 to: peer.encryptionPublicKey,
                 hopHash: peer.routerHash,
-                recordIndex: UInt8(index)
+                recordIndex: UInt8(layout.positions[index])
             )
             records.append(encrypted.wire)
             materials.append(encrypted.material)
+        }
+
+        // Place the real records at their randomized slots and fill the rest with
+        // fake records: that is what hides the tunnel's hop count and each hop's
+        // position from its neighbours.
+        var wireRecords = (0..<layout.slotCount).map { _ in
+            I2PCrypto.randomBytes(I2PTunnelBuildRequestRecord.wireLength)
+        }
+        var wireMaterials = [I2PTunnelBuildReplyMaterial?](repeating: nil,
+                                                          count: layout.slotCount)
+        for (index, slot) in layout.positions.enumerated() {
+            wireRecords[slot] = records[index]
+            wireMaterials[slot] = materials[index]
+        }
+        if let decoySlot = layout.originatorSlot {
+            wireRecords[decoySlot] = Self.originatorDecoyRecord(localRouterHash: localRouterHash)
         }
 
         let context = BuildContext(
@@ -697,7 +762,10 @@ final class I2PTunnelBuilder {
             receiveIDs: receiveIDs,
             layerKeys: materials.map(\.layerKey),
             ivKeys: materials.map(\.ivKey),
-            replyMaterials: materials,
+            hopReplyMaterials: materials,
+            replyMaterials: wireMaterials,
+            positions: layout.positions,
+            endpointSlot: layout.positions[hops.count - 1],
             originatorEndpointID: originatorEndpointID,
             sentAt: Date(),
             lifetime: lifetime
@@ -706,11 +774,17 @@ final class I2PTunnelBuilder {
         contexts[messageID] = context
         lock.unlock()
 
-        transport.sendBuild(I2PTunnelBuildMessage(messageID: messageID, records: records), to: hops[0].routerHash)
+        transport.sendBuild(I2PTunnelBuildMessage(messageID: messageID, records: wireRecords),
+                            to: hops[0].routerHash)
 
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if let result = takeResult(messageID) {
+                // The context is done either way. Leaving it behind made every
+                // later reply scan every build this router had ever started.
+                lock.lock()
+                contexts[messageID] = nil
+                lock.unlock()
                 switch result {
                 case .success(let tunnel):
                     return tunnel
@@ -742,19 +816,23 @@ final class I2PTunnelBuilder {
     /// came through the creator's reply tunnel has no such layers — only the
     /// endpoint wrote a record — and opens as it arrived.
     private static func openReplySlot(_ records: [Data],
-                                      index: Int,
-                                      materials: [I2PTunnelBuildReplyMaterial]) -> I2PTunnelBuildReplyRecord? {
-        guard index < records.count, index < materials.count else { return nil }
-        let material = materials[index]
-        let recordIndex = UInt8(index)
+                                      slot: Int,
+                                      context: BuildContext) -> I2PTunnelBuildReplyRecord? {
+        guard slot < records.count, slot < context.replyMaterials.count,
+              let material = context.replyMaterials[slot] else { return nil }
+        let recordIndex = UInt8(slot)
         if let record = try? I2PTunnelBuildCrypto.decryptReplyRecord(
-            records[index], material: material, recordIndex: recordIndex) {
+            records[slot], material: material, recordIndex: recordIndex) {
             return record
         }
-        var peeled = records[index]
-        for earlier in 0..<index {
+        // A rejection walks back along the *build path*: the hops before this
+        // one in that path have already laid their keystreams over this record.
+        guard let hop = context.positions.firstIndex(of: slot) else { return nil }
+        var peeled = records[slot]
+        for earlier in 0..<hop {
             peeled = I2PTunnelBuildCrypto.reencryptReplyRecord(
-                peeled, material: materials[earlier], recordIndex: recordIndex)
+                peeled, material: context.hopReplyMaterials[earlier],
+                recordIndex: recordIndex)
         }
         return try? I2PTunnelBuildCrypto.decryptReplyRecord(
             peeled, material: material, recordIndex: recordIndex)
@@ -782,11 +860,11 @@ final class I2PTunnelBuilder {
         for (id, context) in contexts
         where context.replyMaterials.count == reply.encryptedRecords.count {
             // Any slot can carry this context's record: the reply's author is the
-            // endpoint (last slot) on an acceptance and the refusing hop on a
-            // rejection, and only the AEAD decides which slot belongs to us.
-            for index in 0..<context.replyMaterials.count {
-                if Self.openReplySlot(reply.encryptedRecords, index: index,
-                                      materials: context.replyMaterials) != nil {
+            // endpoint on an acceptance and the refusing hop on a rejection, and
+            // only the AEAD decides which slot belongs to us.
+            for slot in 0..<context.replyMaterials.count {
+                if Self.openReplySlot(reply.encryptedRecords, slot: slot,
+                                      context: context) != nil {
                     matched = (id, context)
                     break
                 }
@@ -802,18 +880,18 @@ final class I2PTunnelBuilder {
 
         var rejection: UInt8?
         var endpointAccepted = false
-        let lastIndex = matched.context.replyMaterials.count - 1
-        for index in 0..<matched.context.replyMaterials.count {
+        let endpointSlot = matched.context.endpointSlot
+        for slot in 0..<matched.context.replyMaterials.count {
             guard let record = Self.openReplySlot(reply.encryptedRecords,
-                                                  index: index,
-                                                  materials: matched.context.replyMaterials) else {
+                                                  slot: slot,
+                                                  context: matched.context) else {
                 continue // filler: this hop never wrote a reply into the slot
             }
             if record.returnCode != I2PTunnelBuildReturnCode.accepted.rawValue {
                 rejection = record.returnCode
                 break
             }
-            if index == lastIndex { endpointAccepted = true }
+            if slot == endpointSlot { endpointAccepted = true }
         }
         if let rejection {
             storeResult(matched.id, .failed(code: rejection))
@@ -835,9 +913,12 @@ final class I2PTunnelBuilder {
         lock.unlock()
     }
 
-    /// Assembles the tunnel in data-path order. Outbound: message path equals
-    /// data path. Inbound: the data path is the reversed build message path
-    /// (the gateway is the last hop in the message path).
+    /// Assembles the tunnel in data-path order for both directions: the first
+    /// hop is the gateway and the last is the message-path end (the outbound
+    /// endpoint, or the hop nearest the originator on an inbound build). The
+    /// build message travels that same order — the ECIES tunnel-creation spec's
+    /// message-flow diagram sends an inbound build to the IBGW first and along
+    /// the new tunnel's path from there — so no reversal is applied here.
     private func makeTunnel(_ context: BuildContext, completedAt: Date) -> I2PTunnel {
         let count = context.peerHashes.count
         var hops: [I2PTunnelHop] = []

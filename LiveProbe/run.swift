@@ -8,7 +8,7 @@
 //  that are named main.swift carry top-level code instead.
 //
 //    swiftc -swift-version 5 -o .probe-build/live \
-//        Untitled1/I2P/*.swift SelfTestProbe/ProbeStubs.swift LiveProbe/run.swift
+//        Untitled1/I2P/*.swift LiveProbe/run.swift
 //    ./.probe-build/live
 //
 

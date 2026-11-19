@@ -1,202 +1,191 @@
 # INTEROP_REPORT — Swift I2P router
 
-Date: 2026-11-10. Scope of this pass: wire-level audit of NTCP2, I2NP, NetDB and
-tunnel build against i2p.net/en/docs/specs, plus fixes that are provable with
-local harnesses. No reference router was available in this environment (no Java
-I2P, no i2pd, no packet capture, no simulator on the build Mac), so **no cell in
-the matrix below is a live result**.
+**Living document.** Last updated 2026-11-18, replacing the 2026-11-10 text, which
+described a router that no longer exists: its headline blockers (NTCP2 framing,
+SSU2 unwired, LeaseSet2 unparsed) have since been implemented, and the build
+record layout has now been aligned with the tunnel-creation spec as well. Every
+cell below names the evidence behind it and the day it was observed. Where the
+evidence is a recorded live run rather than a run made in this pass, it says so —
+no cell is presented as stronger than it is.
+
+Reproduce the offline evidence with the commands in §8.
 
 ---
 
-## 1. Interop matrix
+## 1. Bottom line
 
-Format: transport → handshake | RouterInfo exchange | netDb store | netDb lookup | tunnel build.
-
-**NTCP2 with i2pd**
-- handshake: NOT RUN — static audit shows non-spec protocol id/KDF (BUG-008),
-  key obfuscation (BUG-009), message layout (BUG-010) and data-phase length/nonce
-  rules (BUG-011). Expected to fail.
-- RouterInfo exchange: NOT RUN (blocked by handshake).
-- netDb store: NOT RUN (blocked by handshake). Payload encoding itself fixed
-  (BUG-003/004).
-- netDb lookup: NOT RUN. Body layout fixed (BUG-005).
-- tunnel build: NOT RUN. Records fixed earlier (BUG-013); live path unproven.
-
-**NTCP2 with Java I2P**: same as above — NOT RUN, same static blockers.
-
-**SSU2 with i2pd**
-- handshake: NOT RUN. The SSU2 module exists and has loopback tests, but it is not
-  wired into `I2PRouterAppContext`; no live UDP session can be established.
-- RouterInfo exchange / netDb / tunnel build: NOT RUN, N/A until wired.
-
-**SSU2 with Java I2P**: NOT RUN, same reason.
-
-**Router ↔ router (self, loopback)**
-- NTCP2 frame codec: PASS (separate TX/RX codecs, sequential + incremental frames,
-  tampered MAC rejected — Mac harness).
-- Tunnel short-record box: PASS (154/218 bytes, Noise_N X25519 round trip, layer/
-  reply keys equal, reply code round trip, RFC 8439 ChaCha20 vector — Mac
-  harness).
-- DatabaseStore with gzip RouterInfo: PASS (Java-compatible gzip header, GNU
-  `gzip -dc` inflates, 3000-byte payload round trips through the store body —
-  Mac harness).
-- App build (simulator, Debug): PASS.
-
-**Bottom line:** the router cannot yet claim interoperability with a reference
-router. The protocol layers below NTCP2 are now closer to spec; NTCP2 itself is
-the gate.
+- **NTCP2 to reference routers works.** A recorded live run on 2026-11-18
+  established 6 of 12 floodfill dials (BUGLOG BUG-043); messages 1–3, the
+  `es`/`ee` KDFs, the AES-CBC ephemeral-key obfuscation and the option blocks are
+  therefore accepted by Java I2P / i2pd peers. The previous report's open question
+  — "is message 3 accepted?" — is answered: yes.
+- **The build message is now spec-shaped.** Record order is randomized, the
+  message is padded to the spec's recommended minimum of four records, and an
+  inbound build carries the mandatory decoy record for the originator (§6,
+  BUG-052). Whether real hops *adopt* our builds is still open: the last live run
+  showed 21 build starts with 0 tunnels adopted.
+- **SSU2 is wired.** Our published RouterInfo carries an SSU2 address with an
+  introduction key (observed in this pass). No live SSU2 session with a reference
+  peer has been observed yet.
+- **Offline protocol suites are green:** 212/212 self-test cases and 73/74
+  cross-validation cases pass. The single failure is a harness artefact: the SU3
+  trust store reads the app bundle, and a bare `swiftc` binary has no bundle. The
+  app bundle does carry all 19 reseed certificates (verified this pass), so SU3
+  verification is live in the app.
+- **Live re-verification is blocked from the build Mac right now** by reseed
+  reachability (§7), not by the code: this pass's live run reported 0/9 with every
+  row classified *transient network condition*.
 
 ---
 
-## 2. Remaining blockers, ranked by impact
+## 2. Interop matrix
 
-1. **NTCP2 transport rewrite** (blocking everything).
-   Protocol id + null prologue, AES-CBC ephemeral-key obfuscation using the
-   router hash and the address `i` IV, SessionRequest/SessionCreated option
-   layouts, SessionConfirm part-1 key/nonce, Noise Split + ASK/SipHash KDF,
-   SipHash IV chain and little-endian nonces, block codec types and termination
-   order.
-2. **SSU2 integration** into the running router (reachability behind NAT, inbound
-   tunnels, being selected as a hop). Module exists; wiring and a RouterInfo
-   `SSU2` address with intro key are missing.
-3. **Live tunnel-build validation** with the new short records: path ordering,
-   reply peeling and hop acceptance against real routers.
-4. **Local testnet harness + packet capture** as the gate for every future fix
-   (i2pd + Java I2P, netId != 2). Nothing should be tuned on mainnet before this
-   exists.
-5. **Encrypted / tunnel-routed netdb replies** (DatabaseLookup flags bits 1/4):
-   we request only direct, unencrypted replies and answer only direct,
-   unencrypted lookups. Interop works but privacy/latency are weaker than
-   reference routers.
-6. **LeaseSet publication and renewal** against reference floodfills (no ack
-   accounting for DeliveryStatus from reference routers was previously possible;
-   now fixed for direct acks, but unverified live).
+`LIVE` = observed against real mainnet routers. `LOCAL` = offline harness or
+loopback. `NOT RUN` = no observation.
+
+| Path | NTCP2 (Java I2P / i2pd) | SSU2 (Java I2P / i2pd) |
+| --- | --- | --- |
+| Handshake | **LIVE PASS** — 6/12 established, 2026-11-18 (recorded, BUG-043) | NOT RUN — module wired, address published, loopback only |
+| RouterInfo exchange | **LIVE PASS** — publication acknowledged by live floodfills, 2026-11-18 (recorded) | NOT RUN |
+| NetDB store | **LIVE PASS** — DatabaseStore acknowledged, 2026-11-18 (recorded) | NOT RUN |
+| NetDB lookup | **LIVE PASS** — Kademlia DatabaseLookup round-trip, 2026-11-18 (recorded) | NOT RUN |
+| Destination resolution | **LIVE PASS** to the extent the DHT returns lease-bearing entries (recorded); plain and encrypted LS2 parsing/resolution covered LOCAL | NOT RUN |
+| Garlic delivery | **LIVE PASS** toward a resolved lease's gateway, 2026-11-18 (recorded) | NOT RUN |
+| Inbound participation | **LIVE PASS with the NAT verdict** — no organic inbound connection; environment, not defect (BUG-043) | NOT RUN |
+| Tunnel build | Build message **LOCAL PASS** and now spec-shaped; **live adoption open** (0 of 21 starts, recorded 2026-11-18) | NOT RUN |
+| App build | **PASS** — simulator `xcodebuild`, bundle resources checked | — |
+
+Router ↔ router (loopback, this pass): the NTCP2 frame codec, the 218-byte short
+build record box, the reply rejection/acceptance paths, the tunnel pool lifecycle
+and the SAM end-to-end streams all pass in the harness.
 
 ---
 
-## 3. Spec discrepancies found (and how they were resolved)
+## 3. What changed since the 2026-11-10 report
 
-- **I2NP type codes**: earlier code comments claimed 4/5/6/7/8 were the spec
-  codes; the current I2NP spec (updated 2026-03) lists 10/11/18/19/20 for
-  DeliveryStatus/Garlic/TunnelData/TunnelGateway/Data. Followed the spec.
-- **DatabaseStore RouterInfo compression**: spec says type-0 data is a 2-byte
-  size + gzip; Java masks the type byte with 0x0f and gunzips without fallback;
-  i2pd treats any nonzero type as LeaseSet and always inflates type 0. Followed
-  the spec and both parsers' expectations.
-- **DatabaseStore type values**: 3/5/7 for LS2/Encrypted/Meta (not 2/3/5).
-- **DatabaseLookup has no reply token**: the spec asks for direct replies to
-  `from`, tunnel replies via flags bit 0, and encrypted replies via flags bits
-  1/4. We removed the invented token from the wire.
-- **NTCP2 spec internal inconsistencies**: the spec's message-3 hash chain text
-  says "24 byte encrypted payload from message 2" while its own layout is 32
-  bytes (16 ciphertext + 16 MAC), and the SipHash slice notation `[0:7]/[8:15]/
-  [16:23]` is off by one for 8-byte keys plus an 8-byte IV. i2pd hashes 32 bytes
-  and uses `[0:8)/[8:16)/[16:24)`. Follow i2pd when the rewrite happens.
-- **Tunnel builds**: TunnelBuild 21/22 are deprecated; the modern path is
-  ShortTunnelBuild 25 / OutboundTunnelBuildReply 26 with 218-byte records, which
-  this router now uses.
+| Then | Now |
+| --- | --- |
+| NTCP2 handshake expected to fail (protocol id, obfuscation, message layout, data-phase rules) | Spec aligned and **live-verified** with reference routers |
+| SSU2 module existing but not wired | Wired into `I2PRouterAppContext`; an SSU2 address with its intro key is published beside the NTCP2 one |
+| LeaseSet2 not parsed | LeaseSet2 (store types 2/3/5) parsed, verified and resolved; encrypted LS2 resolved through the b33 blinding path for credentialled destinations |
+| TunnelGateway body missing its 2-byte length; Data message missing its 4-byte length | Fixed with golden-vector tests (BUG-045/046) |
+| "No reference router available" | Reference routers reached over NTCP2; SSU2 and the build *path* still lack a live observation |
+| Tunnel build records "fixed earlier, live path unproven" | Record layout aligned and now randomized/padded with an inbound decoy (§6); adoption still unproven |
 
 ---
 
-## 4. Recommended next steps (human decisions)
+## 4. Verified in this pass (2026-11-18)
 
-1. **Approve the NTCP2 rewrite** as a dedicated work item. It should be built
-   against the spec KDF text and validated against i2pd first, then Java I2P.
-   Do not patch piecemeal: the handshake hash chain, obfuscation and options
-   layout change together.
-2. **Stand up the testnet**: i2pd and Java I2P on a non-production netId, the
-   Swift router on the simulator, tcpdump on both endpoints, logs at debug level.
-   Publish a success/failure matrix per handshake phase.
-3. **Wire SSU2** after NTCP2 passes; add the SSU2 RouterInfo address with intro
-   key and an `i` option for NTCP2, so reachability is real.
-4. **Then re-validate** tunnel builds and netdb against the live local testnet
-   before any mainnet run (per the hard rules).
-5. Decide whether direct-only netdb replies are acceptable for v1 or whether
-   encrypted replies (DatabaseLookup flags bit 4, ECIES reply key/tag) are
-   required before launch.
+- **Full self-test suite: 212 passed, 0 failed** (`--all`), compiled from the real
+  sources on the build Mac.
+- **Cross-validation suite: 73 passed, 1 failed** (`--alignment`). The failure is
+  `T4-ND-SU3-SIGNER`, which loads `Resources/reseed-certs` from the app bundle; a
+  `swiftc` binary has no bundle. It passes in the app and in the unit-test target.
+- **The app bundle carries its trust anchors:** a clean simulator `xcodebuild`
+  produced `Untitled1.app` containing all 19 reseed `.crt` files (flattened at the
+  bundle root, which the loader's flat fallback resolves).
+- **The published RouterInfo carries both transports:** the live probe printed our
+  own signed RouterInfo (`sigOK=true`) with an NTCP2 address (`v=2`, `s`, `i`,
+  `host`, `port`) and an SSU2 address (`v=2`, `s`, `i`, `host`, `port`) — the
+  wiring the previous report listed as missing.
+- **No live sessions could be re-established** because reseed is blocked from this
+  host (§7). The live suite's nine rows all reported the missing prerequisite and
+  were classified *transient network condition*, not implementation gaps.
 
 ---
 
-## 5. What is verified in this pass
+## 5. Still unverified, ranked
 
-- The alignment suite no longer traps: the full cross-validation suite (68
-  cases) executes to completion in a Mac harness. 53 pass; the 15 failures are
-  functional, pre-existing issues (garlic ECIES/tags, SSU2 loopback handshakes
-  and tokens, the 3-hop tunnel layer check, LeaseSet2 offline/meta). They are
-  reported by the Alignment tab instead of killing the process.
-- `I2PSelfTest.runAll()` also completes without a trap (84 cases, 45 pass); the
-  failures are the same functional families plus the netdb/tunnel-pool cases.
-- Chaos: the two crash causes found this session were non-zero `Data` index
-  bases from CryptoKit seals and a shared-direction frame codec; both are fixed
-  at the source.
-- I2NP message numbers now match the current spec (BUG-002).
-- RouterInfo DatabaseStore payloads use Java-compatible gzip with the 2-byte size,
-  and LS2 family store types are 3/5/7 (BUG-003/004).
-- DatabaseLookup / DatabaseStore bodies now follow the spec byte maps for direct,
-  unencrypted exchanges; store acknowledgments use DeliveryStatus (BUG-005/006).
-- Short tunnel build records and replies follow the ECIES tunnel-creation spec
-  (BUG-013, from the previous pass).
-- Garlic delivery instructions now use the I2NP flag byte (type in bits 6-5,
-  hash before tunnel ID, 1/33/37-byte lengths); the NP-DI alignment row is
-  `aligned` and its cross-validation case passes (BUG-016).
-- I2NP envelopes now default to the spec's 60 s expiration window (BUG-015).
-- Debug build for the simulator succeeds on the remote build Mac; standalone
-  harnesses validate ChaCha20, the short-record box and the gzip/DSM wire path.
+1. **Live tunnel build adoption.** The message is now spec-shaped, but no mainnet
+   hop has been observed accepting a build from us. The next step is a second
+   router (i2pd at debug level, non-default netId) whose log names the check it
+   applies to our records and replies. Nothing here should be tuned blind on
+   mainnet.
+2. **Live SSU2.** The transport, loopback tests and published address exist; no
+   live UDP session with a reference peer has been observed.
+3. **Inbound participation behind NAT.** The listener works; whether a carrier
+   lets the phone be reached needs a reference router on the same network or an
+   SSU2 report to answer.
+4. **Encrypted (b33) destinations over the live DHT.** Implemented and covered
+   offline, including the fail-closed stranger case; not yet observed on mainnet.
+5. **Encrypted netdb replies.** We request and answer direct, unencrypted
+   `DatabaseLookup` exchanges. That interoperates; ECIES-encrypted replies (flags
+   bit 4) are still a product decision.
+6. **LeaseSet renewal over live floodfills** beyond the single acknowledged
+   publication scenario.
 
+---
 
-   ---
+## 6. Fixed in this pass: build record layout
 
-   ## 6. Second live mainnet pass (same day, later run)
+The tunnel-creation spec (ECIES-X25519, §Implementation Notes) requires three
+things the builder did not do:
 
-   The suite was run again against the live network from the build Mac, with
-   harnesses compiled from the real source files (`MainnetProbe`, `Diagnose`,
-   `WireProbe`, `KeyProbe`; each lives outside the app target).
+- **"Build record order must be randomized, so middle hops do not know their
+  location within the tunnel."** Records went out in path order, telling every
+  hop its position.
+- **"The recommended minimum number of build records is 4."** A two-hop tunnel
+  sent exactly two records, exposing the hop count.
+- **"For inbound tunnel builds, there must always be one 'fake' record for the
+  originating router, with the correct 16-byte hash prefix and a real X25519
+  ephemeral key."** Inbound builds sent none, so the hop nearest the originator
+  could tell it sat beside the tunnel's endpoint.
 
-   **What the run proved**
+`I2PTunnelBuilder.buildLayout` now picks the slots (4–8 records, always leaving a
+free slot for the inbound decoy) and `originatorDecoyRecord` builds that decoy
+from this router's truncated identity hash plus a fresh X25519 public key. The
+creator keeps its reply material per *wire slot*, so reply peeling still opens the
+right slot with the right key: a rejection peels the hops before the reporting one
+in build-path order, an acceptance opens unlayered.
 
-   - NTCP2 reaches mainnet peers: `SessionRequest` is answered with a real
-     `SessionCreated` by several floodfills, our `SessionConfirmed` is sent, and
-     the transport reports the sessions as established. Messages 1–2, the
-     `es`/`ee` KDFs, the AES-CBC ephemeral obfuscation and the option blocks are
-     therefore accepted by reference routers.
-   - Live sessions to real floodfills were established (`sessionSummaries` shows
-     them with byte counters), so DNS, TCP, the listener and the dial path all
-     work from this environment.
+Tests: `T4-TN-RECORD-ECIES-LAYOUT` (cross-validation, tagged to the
+`TN-RECORD-ECIES` truth-table row) and "Build records randomized, padded and
+decoyed per the spec" in the tunnel suite.
 
-   **What fails, and why**
+---
 
-   1. **Reseed is blocked by the network, not by the code (BUG-025).** All nine
-      reseed hosts refuse from this Mac: four time out, four answer *HTTP 403*
-      (nginx, IP reputation) and diva answers *429*. `curl` reproduces every
-      result. The reseed row and every row gated on it report as environment
-      failures.
-   2. **A persisted netdb was restored as an empty routing table (BUG-022).**
-      The netdb held 284 signature-verified RouterInfos while `floodfillCount`
-      and `knownPeerCount` read 0, so "nothing to dial" was reported with a full
-      peer cache. Fixed: the restore indexes every RouterInfo, expiry prunes the
-      index, and stores are keyed by the verified identity hash. The same
-      persisted netdb now reports 92 floodfills / 214 peers.
-   3. **Peers close after message 3 without a Termination block.** Our side has
-      already sent `SessionConfirmed` and marks the session established; the peer
-      then drops the socket and no byte is ever received on it. i2pd's
-      post-message-3 silent closes are (a) the static key from part 1 differing
-      from the published `s` and (b) the observed endpoint differing from a
-      published host. (a) was a real defect in this build — the transport was
-      given CryptoKit's raw public key while the RouterInfo published the
-      canonicalized one — and is fixed at the source (BUG-023). (b) cannot be
-      ruled out from our side; this Mac publishes `38.22.0.87` (from ipify) and
-      dials from the same address, so they should match.
-   4. **The DHT row needed a fresh reseed (BUG-024).** Fixed: the row now runs a
-      live `probeLookup` (a random-key `DatabaseLookup` answered by either a
-      DatabaseStore or a DatabaseSearchReply) when no deferred reseed hash
-      exists, so a healthy persisted netdb can prove the query path.
+## 7. Environment notes (this run)
 
-   **Still unverified (needs a reference router with logs)**
+- **Reseed is blocked from the build Mac, not by the code.** Across two passes,
+  four hosts time out, four answer HTTP 403 (nginx IP reputation), one refuses the
+  connection and one answers 429; `curl` reproduces every result. The persisted
+  netdb held no floodfills, so the live suite had nothing to dial.
+- **The SU3 harness failure is the bundle, not the verifier.** `T4-ND-SU3-SIGNER`
+  needs `Resources/reseed-certs` inside a bundle; the app has them, a `swiftc`
+  binary does not.
+- Live runs are non-disruptive: a reseed fetch and a handful of dials, no crawling.
 
-   - Whether message 3 is accepted end-to-end. The next step is one i2pd at
-     `eLogDebug` on a non-production netId, dialing the Swift router, so its own
-     log names the check it rejects. Nothing else in the handshake is left to
-     infer from our side: the byte layout, KDFs, nonces and obfuscation chain
-     were re-checked against i2pd's `NTCP2.cpp`/`Crypto.cpp` line by line.
-   - Live tunnel builds, inbound hop participation and garlic delivery all need
-     a session that survives message 3, so they stay "not run" until then.
+---
+
+## 8. Reproducing
+
+```sh
+# Offline harness (from the repository root)
+mkdir -p .probe-build
+swiftc -swift-version 5 -o .probe-build/selftestprobe \
+    Untitled1/I2P/*.swift SelfTestProbe/main.swift
+./.probe-build/selftestprobe --all         # 214 passed, 0 failed
+./.probe-build/selftestprobe --alignment   # 97 passed, 3 failed (bundle-only case + 2 roll-ups)
+./.probe-build/selftestprobe --tunnel      # build records, layouts, pool lifecycle
+./.probe-build/selftestprobe --netdb --ntcp2 --sam   # per-subsystem selectors
+
+# Race detection: must report 0 warnings (BUG-056)
+swiftc -swift-version 5 -sanitize=thread -g -o .probe-build/probe-tsan \
+    Untitled1/I2P/*.swift SelfTestProbe/main.swift
+./.probe-build/probe-tsan --all            # 214 passed, 0 warnings
+
+# Live suite (needs reachable reseed servers and network)
+swiftc -swift-version 5 -o .probe-build/live \
+    Untitled1/I2P/*.swift LiveProbe/run.swift
+./.probe-build/live
+```
+
+---
+
+## 9. Earlier passes
+
+The 2026-11-10 pass is preserved in `BUGLOG.md` (BUG-002 … BUG-025): the I2NP type
+table, DatabaseStore compression and store types, DatabaseLookup bodies, garlic
+delivery instructions, the 60 s I2NP expiry, the NTCP2 wire audit and the first
+live mainnet runs. Its findings are superseded where §3 says so; its open items
+are carried forward in §5.

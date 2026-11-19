@@ -39,12 +39,21 @@ struct I2PWriter {
 
     mutating func raw(_ bytes: Data) { data.append(bytes) }
 
+    /// I2P Hash: exactly 32 bytes.
+    ///
+    /// The precondition is a programmer-error detector, not an input check:
+    /// every caller passes a computed SHA-256, and no value that came off the
+    /// wire reaches it at another length (`I2PReader.hash()` always reads 32).
     mutating func hash(_ value: Data) {
         precondition(value.count == 32, "I2P hash is 32 bytes")
         data.append(value)
     }
 
     /// I2P String: 1-byte length prefix followed by UTF-8 data.
+    ///
+    /// The 255-byte precondition is likewise a programmer-error detector: a
+    /// parsed string's length came from that one byte, so re-encoding a value
+    /// read off the wire can never exceed it.
     mutating func string(_ value: String) {
         let utf8 = Array(value.utf8)
         precondition(utf8.count <= 255, "I2P string length exceeds 255 bytes")
@@ -56,6 +65,11 @@ struct I2PWriter {
     /// `[len][key]=[len][value];` pairs (keys sorted for deterministic
     /// encoding). The '=' and ';' separators are part of the wire format —
     /// without them every real RouterInfo/LeaseSet2 options mapping mis-parses.
+    ///
+    /// Keys and values are limited to 255 bytes and the body to 65,535 by those
+    /// on-wire length fields, so a mapping parsed from the wire always
+    /// re-encodes within them — pinned by `T4-ST-MAPPING-BOUNDS`. Only a
+    /// locally built mapping that broke those limits could trap here.
     mutating func mapping(_ value: [String: String]) {
         var body = Data()
         for key in value.keys.sorted() {

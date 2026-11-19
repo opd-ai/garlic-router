@@ -100,6 +100,9 @@ enum I2PTunnelSelfTest {
         await run("Tunnel build record encryption (218-byte short ECIES)") {
             try await recordEncryptionTest()
         }
+        await run("Build records randomized, padded and decoyed per the spec") {
+            try buildLayoutTest()
+        }
         await run("Outbound tunnel build through 2 hops") {
             try await outboundBuildTest()
         }
@@ -113,6 +116,56 @@ enum I2PTunnelSelfTest {
             try await poolLifecycleTest()
         }
         return results
+    }
+
+    private static func buildLayoutTest() throws -> String {
+        // Two hops: the tunnel-creation spec's recommended minimum of four
+        // records applies, and no hop's record may be left where its position
+        // would name the hop's place in the path every time.
+        var sawShuffledOrder = false
+        var slotsUsed: Set<Int> = []
+        for _ in 0..<24 {
+            let layout = I2PTunnelBuilder.buildLayout(hopCount: 2, direction: .outbound)
+            guard layout.slotCount >= 4, layout.slotCount <= 8 else {
+                throw I2PTunnelTestFailure(
+                    "outbound build carries \(layout.slotCount) records, expected 4-8")
+            }
+            guard layout.positions.count == 2,
+                  Set(layout.positions).count == 2,
+                  layout.positions.allSatisfy({ $0 >= 0 && $0 < layout.slotCount }),
+                  layout.originatorSlot == nil else {
+                throw I2PTunnelTestFailure("invalid outbound placement \(layout)")
+            }
+            slotsUsed.formUnion(layout.positions)
+            if layout.positions != [0, 1] { sawShuffledOrder = true }
+        }
+        guard sawShuffledOrder else {
+            throw I2PTunnelTestFailure("record order was never randomized over 24 layouts")
+        }
+        guard slotsUsed.contains(where: { $0 > 1 }) else {
+            throw I2PTunnelTestFailure("records never left the first two slots")
+        }
+
+        let inbound = I2PTunnelBuilder.buildLayout(hopCount: 2, direction: .inbound)
+        guard inbound.slotCount >= 4, let decoySlot = inbound.originatorSlot,
+              !inbound.positions.contains(decoySlot) else {
+            throw I2PTunnelTestFailure("inbound build has no free originator slot: \(inbound)")
+        }
+        // The decoy has to look like a record addressed to a real hop: the
+        // originator's truncated identity hash, then a real X25519 ephemeral key.
+        let routerHash = I2PCrypto.randomBytes(32)
+        let record = I2PTunnelBuilder.originatorDecoyRecord(localRouterHash: routerHash)
+        guard record.count == I2PTunnelBuildRequestRecord.wireLength else {
+            throw I2PTunnelTestFailure("decoy record is \(record.count) bytes")
+        }
+        guard Array(record.prefix(16)) == Array(routerHash.prefix(16)) else {
+            throw I2PTunnelTestFailure("decoy record does not carry the originator hash prefix")
+        }
+        let ephemeral = Data(record[16..<48])
+        guard (try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: ephemeral)) != nil else {
+            throw I2PTunnelTestFailure("decoy record's ephemeral key is not a valid X25519 key")
+        }
+        return "layouts randomized in 4-8 slots, inbound decoy carries the originator hash and a real X25519 key"
     }
 
     private static func recordEncryptionTest() async throws -> String {
@@ -324,7 +377,10 @@ private static func rejectTest() async throws -> String {
         config.staggerInterval = 0.5
         config.prebuildThreshold = 1
         config.maintenanceInterval = 0.4
-        config.buildTimeout = 10
+        // A loopback build answers in milliseconds; a 10 s timeout only made a
+        // single lost reply look like a drained pool, because it exceeded the
+        // window the assertion below waits in.
+        config.buildTimeout = 2
         let pool = I2PTunnelPool(
             localRouterHash: originator.routerHash,
             participant: originator.participant,
@@ -460,19 +516,28 @@ private static func rejectTest() async throws -> String {
         pool.start()
         let youngThreshold: TimeInterval = 1.2
         do {
-            try await tunnelTestWaitUntil(timeout: 15) {
+            try await tunnelTestWaitUntil(timeout: 25) {
                 pool.outboundCount >= 2
                     && pool.outboundTunnels.filter { $0.remainingLifetime() > youngThreshold }.count >= 2
                     && pool.inboundCount >= 2
                     && pool.inboundTunnels.filter { $0.remainingLifetime() > youngThreshold }.count >= 2
             }
         } catch {
+            let history = pool.buildHistory()
+            let failedBuilds = history.filter { !$0.succeeded }
+            let reasons = failedBuilds.prefix(4).map { record in
+                record.returnCode.map { "code \($0)" } ?? "timeout"
+            }
             throw I2PTunnelTestFailure(String(
-                format: "maintenance left %d outbound (%d young) / %d inbound (%d young)",
+                format: "maintenance left %d outbound (%d young) / %d inbound (%d young); %d build(s), %d failed %@, %d in flight",
                 pool.outboundCount,
                 pool.outboundTunnels.filter { $0.remainingLifetime() > youngThreshold }.count,
                 pool.inboundCount,
-                pool.inboundTunnels.filter { $0.remainingLifetime() > youngThreshold }.count))
+                pool.inboundTunnels.filter { $0.remainingLifetime() > youngThreshold }.count,
+                history.count,
+                failedBuilds.count,
+                reasons.joined(separator: "/"),
+                pool.buildingCount(.outbound) + pool.buildingCount(.inbound)))
         }
         pool.stop()
         return String(

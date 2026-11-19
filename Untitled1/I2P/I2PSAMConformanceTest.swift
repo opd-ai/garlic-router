@@ -383,10 +383,23 @@ private func destinationFromB64(_ text: String) throws -> I2PDestination {
 }
 
 /// Cross-publishes one rig's owner session LeaseSet into the other rig's netdb.
+///
+/// A session answers `SESSION STATUS RESULT=OK` as soon as it exists, while its
+/// LeaseSet publication (tunnel-pool build, then the store) lands shortly after.
+/// Looking once and failing made the end-to-end suites flaky — about one run in
+/// twenty reported `destinationNotFound` — so this waits for the lease the way
+/// a client waits for a destination to become resolvable.
 private func crossPublish(from source: SAMTestRig, destinationHash: Data, into target: SAMTestRig) async throws {
-    guard let entry = await source.netDB.lookup(destinationHash), let leaseSet = entry.leaseSet else {
-        throw I2PSAMError.destinationNotFound
+    let deadline = Date().addingTimeInterval(5)
+    var leaseSet: I2PLeaseSet?
+    while Date() < deadline {
+        if let entry = await source.netDB.lookup(destinationHash), let found = entry.leaseSet {
+            leaseSet = found
+            break
+        }
+        try? await Task.sleep(for: .milliseconds(50))
     }
+    guard let leaseSet else { throw I2PSAMError.destinationNotFound }
     try await target.netDB.ingestLeaseSet(leaseSet.serialize())
 }
 
@@ -819,6 +832,20 @@ enum I2PSAMConformanceTest {
         try await crossPublish(from: aliceRig, destinationHash: aliceDestKeys.hash, into: bobRig)
         let bobDestKeys = try destinationFromB64(bobDestination)
         try await crossPublish(from: bobRig, destinationHash: bobDestKeys.hash, into: aliceRig)
+
+        // The connect resolves the destination through the rig's netdb; wait
+        // until that lookup can answer, so a rare slow ingest is not reported as
+        // a connect failure.
+        let resolveDeadline = Date().addingTimeInterval(5)
+        var resolvable = false
+        while Date() < resolveDeadline {
+            if let entry = await bobRig.netDB.lookup(aliceDestKeys.hash), entry.leaseSet != nil {
+                resolvable = true
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        guard resolvable else { throw I2PSAMError.destinationNotFound }
 
         // Alice listens, Bob connects: the SYN traverses Bob's outbound tunnel,
         // Bob's lease registry, Alice's inbound tunnel and her garlic pipeline.
