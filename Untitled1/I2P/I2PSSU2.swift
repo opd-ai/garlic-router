@@ -1623,6 +1623,12 @@ final class SSU2Transport {
         return _listenerPort
     }
     private var tokenManager = SSU2TokenManager()
+    /// Lifetime totals for the dashboard's totals card, the same shape NTCP2
+    /// keeps: bytes banked when a session closes plus the live sessions'
+    /// running counters, and how many sessions reached the established state.
+    private var closedSessionBytesIn = 0
+    private var closedSessionBytesOut = 0
+    private var establishedSessionTotal = 0
 
     init(localStaticKey: Curve25519.KeyAgreement.PrivateKey, introKey: Data,
          localRouterInfo: I2PRouterInfo, publishedEndpoint: SSU2Endpoint? = nil,
@@ -1782,6 +1788,30 @@ final class SSU2Transport {
         sessionSummaries().count
     }
 
+    /// Cumulative session totals since this transport started: every closed
+    /// session's bytes banked at close plus the live sessions' running
+    /// counters, and how many sessions reached the established state. One
+    /// session sits in both indexes, so each object is counted once. Memory
+    /// only — the dashboard's totals card reads them and nothing persists.
+    func lifetimeTotals() -> (bytesIn: Int, bytesOut: Int, sessions: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        var bytesIn = closedSessionBytesIn
+        var bytesOut = closedSessionBytesOut
+        var seen: Set<ObjectIdentifier> = []
+        for session in sessionsByEndpoint.values {
+            guard seen.insert(ObjectIdentifier(session)).inserted else { continue }
+            bytesIn += session.bytesIn
+            bytesOut += session.bytesOut
+        }
+        for session in sessionsByHash.values {
+            guard seen.insert(ObjectIdentifier(session)).inserted else { continue }
+            bytesIn += session.bytesIn
+            bytesOut += session.bytesOut
+        }
+        return (bytesIn, bytesOut, establishedSessionTotal)
+    }
+
     /// The peers this transport currently holds an established session to.
     func connectedRouterHashes() -> [Data] {
         sessionSummaries().map(\.hash)
@@ -1903,11 +1933,14 @@ final class SSU2Transport {
 
 extension SSU2Transport: SSU2SessionDelegate {
     func session(_ session: SSU2Session, didEstablish remoteRouterInfo: I2PRouterInfo?) {
+        lock.lock()
         if let endpoint = session.remoteEndpoint {
-            lock.lock()
             sessionsByEndpoint[endpoint.description] = session
-            lock.unlock()
         }
+        // One established session per session object, which is what the totals
+        // card's sessions figure counts.
+        establishedSessionTotal += 1
+        lock.unlock()
         // Index by the peer's identity so I2NP delivery and tunnel builds can
         // address it by router hash, the way they address an NTCP2 session.
         if let hash = remoteRouterInfo?.identity.hash {
@@ -1931,6 +1964,10 @@ extension SSU2Transport: SSU2SessionDelegate {
             lock.unlock()
         }
         lock.lock()
+        // Bank the finished session's bytes before it leaves the index, so the
+        // cumulative totals cover every session, not only the live ones.
+        closedSessionBytesIn += session.bytesIn
+        closedSessionBytesOut += session.bytesOut
         sessionsByHash = sessionsByHash.filter { $0.value !== session }
         lock.unlock()
         delegate?.transport(self, sessionDidClose: session)

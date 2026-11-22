@@ -1691,6 +1691,7 @@ struct IRCServersView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var history = I2PIRCHistoryStore.shared
     @State private var showForm = false
+    @State private var showDeleteStorageError = false
 
     private let accent = Color(red: 0.47, green: 0.44, blue: 0.97)
     private let background = Color(red: 0.055, green: 0.06, blue: 0.09)
@@ -1728,10 +1729,22 @@ struct IRCServersView: View {
             }
         }
         .preferredColorScheme(.dark)
+        .alert("Couldn’t delete server", isPresented: $showDeleteStorageError) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("The saved password could not be removed from Keychain. Unlock the device and try again.")
+        }
     }
 
     private var list: some View {
         List {
+            if book.didDiscardLegacyPasswords {
+                Section {
+                    passwordMigrationWarning
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
+                }
+            }
             ForEach(book.entries) { entry in
                 Button {
                     onConnect(entry)
@@ -1783,7 +1796,9 @@ struct IRCServersView: View {
                 }
                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                     Button(role: .destructive) {
-                        book.remove(entry.id)
+                        if !book.remove(entry.id) {
+                            showDeleteStorageError = true
+                        }
                     } label: {
                         Label("Delete", systemImage: "trash")
                     }
@@ -1796,6 +1811,9 @@ struct IRCServersView: View {
 
     private var emptyState: some View {
         VStack(alignment: .leading, spacing: 12) {
+            if book.didDiscardLegacyPasswords {
+                passwordMigrationWarning
+            }
             Label("No IRC servers yet", systemImage: "server.rack")
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(accent)
@@ -1818,6 +1836,23 @@ struct IRCServersView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .padding(20)
     }
+
+    private var passwordMigrationWarning: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("A saved IRC password could not be moved to Keychain, so it was discarded. Re-add that server with its password.")
+                .font(.caption)
+                .foregroundStyle(Color.orange)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Dismiss") {
+                book.dismissPasswordMigrationWarning()
+            }
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(accent)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 12))
+    }
 }
 
 // MARK: - Server form
@@ -1833,6 +1868,7 @@ struct IRCServerFormView: View {
     @State private var nick = ""
     @State private var password = ""
     @State private var channelsText = "#i2p"
+    @State private var saveError: String?
 
     private let accent = Color(red: 0.47, green: 0.44, blue: 0.97)
     private let background = Color(red: 0.055, green: 0.06, blue: 0.09)
@@ -1885,6 +1921,12 @@ struct IRCServerFormView: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(draft.validationProblem != nil)
+                if let saveError {
+                    Text(saveError)
+                        .font(.caption)
+                        .foregroundStyle(Color.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             .padding(16)
         }
@@ -1938,7 +1980,10 @@ struct IRCServerFormView: View {
 
     private func save() {
         let entry = draft
-        guard book.save(entry) else { return }
+        guard book.save(entry) else {
+            saveError = "Could not securely save this server. Make sure Keychain is available, then try again."
+            return
+        }
         onSaved(entry)
         dismiss()
     }

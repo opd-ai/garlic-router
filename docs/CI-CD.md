@@ -102,10 +102,15 @@ non-secret). Both are optional.
 - Cached paths: `~/Library/Caches/org.swift.swiftpm` and the DerivedData
    `SourcePackages` directory, keyed on `Package.resolved`. The project currently
    has no Swift package dependencies, so the cache is a no-op until one is added.
-- `Untitled1/ENCRYPTED_KEYS.plist` ships with the app and is where API keys
-   entered in the app are stored as ciphertext. It is committed only as an empty
-   template. If it ever holds real entries, remove it from version control
-   (`git rm --cached`) and supply the keys at runtime instead.
+- `Untitled1/ENCRYPTED_KEYS.plist` is an empty template in this checkout. Do not
+  put credentials in it or commit populated copies. The current API-key importer
+  derives its AES-GCM key from the public bundle identifier, so that ciphertext
+  is not a security boundary against someone who can inspect the app. No app
+  feature currently reads `ApiKeyManager`; add a proper runtime Keychain entry
+  flow before shipping any feature that needs a credential.
+- `Untitled1/PrivacyInfo.xcprivacy` declares the app's observed UserDefaults and
+  app-container file-timestamp access. Revisit the manifest whenever a new
+  required-reason API or third-party SDK is added.
 
 ## Running the same checks locally
 

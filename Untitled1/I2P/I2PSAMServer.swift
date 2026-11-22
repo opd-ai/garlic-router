@@ -117,15 +117,17 @@ final class I2PSAMServer {
     var onChange: (() -> Void)?
     let transport: I2PSAMGarlicTransport
     /// Optional session key persistence for PERSISTENT=true sessions.
-    let keyStore = I2PSAMKeyStore()
+    let keyStore: I2PSAMKeyStore
     private let dispatcher: I2PSAMGarlicDispatcher
     private var renewalTask: Task<Void, Never>?
 
     init(core: I2PSAMRouterCore, port: UInt16 = 7656,
-         poolConfig: I2PTunnelPool.Config = .samDefault) {
+         poolConfig: I2PTunnelPool.Config = .samDefault,
+         keyStore: I2PSAMKeyStore = I2PSAMKeyStore()) {
         self.core = core
         self.configuredPort = port
         self.poolConfig = poolConfig
+        self.keyStore = keyStore
         self.transport = I2PSAMGarlicTransport(core: core)
         self.dispatcher = I2PSAMGarlicDispatcher()
         self.transport.onEvent = { [weak self] line in self?.note(line) }
@@ -702,20 +704,19 @@ final class I2PSAMConnection {
         let keys: I2PSAMDestinationKeys
         let persistent = options["PERSISTENT"] == "true"
         if destinationSpec == "TRANSIENT" {
-            if persistent, let saved = server.keyStore.load(nickname: id),
-               let restored = try? I2PSAMDestinationKeys.parse(saved) {
-                keys = restored
+            if persistent, let saved = try server.keyStore.load(nickname: id) {
+                keys = try I2PSAMDestinationKeys.parse(saved)
             } else {
                 keys = I2PSAMDestinationKeys.generate()
                 if persistent {
-                    server.keyStore.save(nickname: id, privateKey: keys.privateKeyData)
+                    try server.keyStore.save(nickname: id, privateKey: keys.privateKeyData)
                 }
             }
         } else if let data = I2PSAMEncoding.normalizedBase64(destinationSpec),
                   let parsed = try? I2PSAMDestinationKeys.parse(data) {
             keys = parsed
             if persistent {
-                server.keyStore.save(nickname: id, privateKey: keys.privateKeyData)
+                try server.keyStore.save(nickname: id, privateKey: keys.privateKeyData)
             }
         } else {
             throw I2PSAMError.invalidDestination

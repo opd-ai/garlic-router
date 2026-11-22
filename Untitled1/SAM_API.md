@@ -153,7 +153,7 @@ DATAGRAM SEND with reassembly, and anonymous RAW datagrams.
   command reference and the activity log.
 ## Session persistence
 
-`SESSION CREATE` accepts an optional `PERSISTENT=true` option. When set, the bridge saves the destination's private keys under the session nickname (in `Application Support/i2p-sam-keys`) and restores them on a later `SESSION CREATE` with the same nickname, giving the session a stable destination across reconnects and bridge restarts. Without the option, `TRANSIENT` always generates a fresh destination.
+`SESSION CREATE` accepts an optional `PERSISTENT=true` option. When set, the bridge stores the 64-byte destination private key in the iOS Keychain using a SHA-256 hash of the session nickname as the account. The entry uses `AfterFirstUnlockThisDeviceOnly`: it is protected by the iOS Keychain, restricted to this device, not restored from device backups, and available to the router after the first unlock following a reboot. If the Keychain is unavailable or the stored key is malformed, creation fails closed with `I2P_ERROR` rather than silently creating a different identity. Existing plaintext files from older app versions are migrated only after a successful Keychain write, then removed. Without `PERSISTENT=true`, `TRANSIENT` always generates a fresh destination.
 
 ```
 SESSION CREATE STYLE=STREAM ID=echo DESTINATION=TRANSIENT PERSISTENT=true

@@ -60,11 +60,38 @@ enum I2PCrossValidation {
 
     // MARK: Run
 
+    /// Runs the whole suite and replaces every stored result.
     @discardableResult
     static func runAll() async -> [I2PCrossValidationResult] {
+        let fresh = await runTests(onlyRows: nil)
+        let combined = commit(fresh, replacingRows: nil)
+        // One coverage sample per run feeds the alignment report's sparkline.
+        I2PAlignmentHistory.record(ranAt: lastRunAt ?? Date())
+        return combined
+    }
+
+    /// Re-runs only the tests tagged with one component's truth-table rows and
+    /// merges their outcomes into the stored results, so every other component
+    /// keeps the results it already had. Returns the combined stored results.
+    @discardableResult
+    static func run(component: I2PSpecComponent) async -> [I2PCrossValidationResult] {
+        let rowIDs = Set(I2PSpecTruthTable.rows(in: component).map(\.id))
+        let fresh = await runTests(onlyRows: rowIDs)
+        let combined = commit(fresh, replacingRows: rowIDs)
+        // A component re-run is a suite run too: it refreshes the report's
+        // coverage, so the history keeps one sample for it.
+        I2PAlignmentHistory.record(ranAt: lastRunAt ?? Date())
+        return combined
+    }
+
+    /// Executes the suite's test bodies. With `onlyRows` set, a test whose row
+    /// is not in the set is skipped instead of run and discarded, so a single
+    /// component re-run does no work for the other components.
+    private static func runTests(onlyRows: Set<String>?) async -> [I2PCrossValidationResult] {
         var results: [I2PCrossValidationResult] = []
 
         func run(_ testID: String, rowID: String, _ name: String, _ body: () throws -> String) {
+            guard onlyRows?.contains(rowID) ?? true else { return }
             do {
                 append(&results, testID: testID, rowID: rowID, name: name,
                        passed: true, detail: try body())
@@ -76,6 +103,7 @@ enum I2PCrossValidation {
 
         func runAsync(_ testID: String, rowID: String, _ name: String,
                       _ body: () async throws -> String) async {
+            guard onlyRows?.contains(rowID) ?? true else { return }
             do {
                 append(&results, testID: testID, rowID: rowID, name: name,
                        passed: true, detail: try await body())
@@ -335,17 +363,25 @@ enum I2PCrossValidation {
             try await I2PSSU2SelfTest.udpLoopbackTest()
         }
 
-        commit(results)
         return results
     }
 
-    /// Stores the run's outcomes. Kept synchronous so the lock is never taken
-    /// from an async context.
-    private static func commit(_ results: [I2PCrossValidationResult]) {
+    /// Stores a run's outcomes and returns the combined set. A component run
+    /// replaces only the rows it re-ran — a test that no longer exists for one
+    /// of those rows drops out — while a full run replaces everything. Kept
+    /// synchronous so the lock is never taken from an async context.
+    @discardableResult
+    private static func commit(_ results: [I2PCrossValidationResult],
+                               replacingRows rowIDs: Set<String>?) -> [I2PCrossValidationResult] {
         stateLock.lock()
         defer { stateLock.unlock() }
-        storedResults = results
+        if let rowIDs {
+            storedResults = storedResults.filter { !rowIDs.contains($0.rowID) } + results
+        } else {
+            storedResults = results
+        }
         storedRunAt = Date()
+        return storedResults
     }
 
     // MARK: Structured access for the alignment report

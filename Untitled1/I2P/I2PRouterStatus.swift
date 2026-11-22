@@ -60,6 +60,10 @@ struct I2PRouterStatusSnapshot {
     let outRate: Double
     let inRateHistory: [Double]
     let outRateHistory: [Double]
+    /// What this run of the router has done since it started: cumulative
+    /// traffic, sessions, tunnels and I2NP messages, recomputed from the live
+    /// components on every snapshot and never persisted.
+    let lifetime: I2PRouterLifetimeTotals
     // Network participation (participation controls)
     let participatingTunnelCount: Int
     let transitMessages: Int
@@ -89,6 +93,11 @@ struct I2PPeerSummary: Identifiable {
     /// The peer's last failed dial and when its next attempt is due; nil when
     /// nothing has failed against this peer since the router started.
     let handshakeBackoff: I2PPeerHandshakeBackoffReading?
+    /// The traffic condition this session shows right now — quiet once it has
+    /// moved no bytes for three minutes, flooding once its received rate has
+    /// held far above its own median. Derived from the traffic history each
+    /// snapshot, so it clears on its own and is never stored.
+    let trafficFlag: I2PPeerTrafficFlag?
 }
 
 /// Aggregated netdb reading served by the network database actor.
@@ -367,12 +376,20 @@ final class I2PRouterStatusEngine {
     /// Optional participation surface: the live count of tunnels this router
     /// currently carries for other participants (the share's measured side).
     var participatingTunnels: (() -> Int)?
+    /// Optional transit-role lifetime counter: how many tunnels this router has
+    /// carried as a hop since it started, read for the dashboard's totals card.
+    var lifetimeTunnelsCarried: (() -> Int)?
     /// Optional handshake-backoff surface: how many peers a failed dial is
     /// currently holding back, read for the transport card.
     var heldBackPeerCount: (() -> Int)?
     /// Optional per-peer handshake failure reading, keyed by identity hex, read
     /// for the peer inspector.
     var handshakeBackoffReading: ((String) -> I2PPeerHandshakeBackoffReading?)?
+    /// Per-peer session traffic history: every snapshot records each live
+    /// session's cumulative byte counters here and the recorder derives the
+    /// per-second rates the peer inspector charts. Memory only, so a relaunch
+    /// starts a fresh 15-minute window.
+    let peerTraffic = I2PPeerTrafficRecorder()
 
     private let startedAt = Date()
     private let lock = NSLock()
@@ -426,6 +443,9 @@ final class I2PRouterStatusEngine {
     func attach(participant: I2PTunnelParticipant) {
         participatingTunnels = { [weak participant] in
             participant?.activeHopStateCount ?? 0
+        }
+        lifetimeTunnelsCarried = { [weak participant] in
+            participant?.lifetimeCarriedTunnels ?? 0
         }
     }
 
@@ -571,15 +591,30 @@ final class I2PRouterStatusEngine {
             }
         }
 
+        // The counters a peer's traffic history is sampled from: the sum over
+        // its sessions, so a peer reached over both transports reads as one
+        // monotonic total instead of jumping as sessions come and go.
+        var totals: [Data: (bytesIn: Int, bytesOut: Int)] = [:]
+        for session in sessions {
+            let current = totals[session.hash] ?? (0, 0)
+            totals[session.hash] = (current.bytesIn + session.bytesIn,
+                                    current.bytesOut + session.bytesOut)
+        }
+
         var result: [I2PPeerSummary] = []
         var seen: Set<Data> = []
         for session in sessions.sorted(by: { $0.bytesIn + $0.bytesOut > $1.bytesIn + $1.bytesOut }) {
             guard !seen.contains(session.hash) else { continue }
             seen.insert(session.hash)
+            let total = totals[session.hash] ?? (session.bytesIn, session.bytesOut)
+            let peerID = Self.hex(session.hash)
+            peerTraffic.record(peerID: peerID,
+                               bytesIn: total.bytesIn,
+                               bytesOut: total.bytesOut)
             let distance = I2PNetworkDatabase.xorDistance(localRouterHash, session.hash)
             let floodfill = await netDB?.isFloodfill(session.hash) ?? false
             result.append(I2PPeerSummary(
-                id: Self.hex(session.hash),
+                id: peerID,
                 transport: session.transport,
                 establishedAt: session.establishedAt,
                 bytesIn: session.bytesIn,
@@ -588,10 +623,24 @@ final class I2PRouterStatusEngine {
                 kademliaBucket: Self.leadingZeroBits(distance),
                 isFloodfill: floodfill,
                 tunnelRole: roles[session.hash],
-                handshakeBackoff: handshakeBackoffReading?(Self.hex(session.hash))
+                handshakeBackoff: handshakeBackoffReading?(peerID),
+                trafficFlag: peerTraffic.flag(for: peerID)
             ))
         }
         return result
+    }
+
+    /// The peer's traffic readings, oldest first, within the recorder's
+    /// 15-minute window — the inspector's sparkline.
+    func peerTrafficSamples(for peerID: String) -> [I2PPeerTrafficSample] {
+        peerTraffic.samples(for: peerID)
+    }
+
+    /// The peer's average per-second rates over the last `seconds` (a minute
+    /// unless asked otherwise) — the reading named under the sparkline.
+    func peerTrafficAverage(for peerID: String,
+                            over seconds: TimeInterval = 60) -> I2PPeerTrafficAverage {
+        peerTraffic.average(for: peerID, over: seconds)
     }
 
     private static func leadingZeroBits(_ data: Data) -> Int {
@@ -616,6 +665,13 @@ final class I2PRouterStatusEngine {
         // The tunnel participant owns its own lock; read it before taking ours
         // so the lock order stays one-way.
         let participating = participatingTunnels?() ?? 0
+        // The same rule for every lifetime reading the totals card needs: the
+        // transports, the pool and the participant each own a lock of their
+        // own, so all of them are read before this engine's lock is taken.
+        let ntcp2Lifetime = ntcp2?.lifetimeTotals() ?? (bytesIn: 0, bytesOut: 0, sessions: 0)
+        let ssu2Lifetime = ssu2?.lifetimeTotals() ?? (bytesIn: 0, bytesOut: 0, sessions: 0)
+        let builtTunnels = tunnelPool?.lifetimeBuiltTunnels ?? 0
+        let carriedTunnels = lifetimeTunnelsCarried?() ?? 0
         lock.lock()
         defer { lock.unlock() }
         let now = Date()
@@ -627,6 +683,15 @@ final class I2PRouterStatusEngine {
         if inRateHistory.count > 12 { inRateHistory.removeFirst(inRateHistory.count - 12) }
         if outRateHistory.count > 12 { outRateHistory.removeFirst(outRateHistory.count - 12) }
         let participation = participationReadingLocked(now: now)
+        let lifetime = I2PRouterLifetimeTotals(
+            bytesIn: ntcp2Lifetime.bytesIn + ssu2Lifetime.bytesIn,
+            bytesOut: ntcp2Lifetime.bytesOut + ssu2Lifetime.bytesOut,
+            sessionsEstablished: ntcp2Lifetime.sessions + ssu2Lifetime.sessions,
+            tunnelsBuilt: builtTunnels,
+            tunnelsCarried: carriedTunnels,
+            messagesIn: messagesIn,
+            messagesOut: messagesOut
+        )
         let snapshot = I2PRouterStatusSnapshot(
             capturedAt: now,
             identityHashHex: Self.hex(localRouterHash),
@@ -649,6 +714,7 @@ final class I2PRouterStatusEngine {
             outRate: outRate,
             inRateHistory: inRateHistory,
             outRateHistory: outRateHistory,
+            lifetime: lifetime,
             participatingTunnelCount: participating,
             transitMessages: transitMessages,
             transitBytes: transitBytes,
@@ -813,6 +879,19 @@ enum I2PRouterStatusSelfTest {
         guard snapshot.floodfillCount == 1 else { throw I2PWireError.invalidFormat }
         guard snapshot.messagesIn >= 1 else { throw I2PWireError.invalidFormat }
         guard snapshot.pools.count == 2 else { throw I2PWireError.invalidFormat }
+        // The dashboard's totals card reads the same snapshot: the pool built
+        // one tunnel as its creator, the routed message is counted, and with no
+        // transport attached there are no session bytes or sessions yet.
+        guard snapshot.lifetime.tunnelsBuilt == 1,
+              snapshot.lifetime.tunnelsCarried == 0,
+              snapshot.lifetime.sessionsEstablished == 0,
+              snapshot.lifetime.bytesIn == 0,
+              snapshot.lifetime.bytesOut == 0,
+              snapshot.lifetime.messagesIn == snapshot.messagesIn,
+              snapshot.lifetime.messagesIn >= 1,
+              snapshot.lifetime.messagesOut == snapshot.messagesOut else {
+            throw I2PWireError.invalidFormat
+        }
 
         // The event stream yields snapshots.
         engine.start(interval: 0.1)
@@ -835,7 +914,7 @@ enum I2PRouterStatusSelfTest {
               outbound.buildingCount == 0 else {
             throw I2PWireError.invalidFormat
         }
-        return "1 RI, 1 floodfill, \(snapshot.messagesIn) routed msgs, outbound pool 2 hops; stream emitted \(received)"
+        return "1 RI, 1 floodfill, \(snapshot.messagesIn) routed msgs, outbound pool 2 hops, \(snapshot.lifetime.tunnelsBuilt) tunnel built; stream emitted \(received)"
     }
 }
 

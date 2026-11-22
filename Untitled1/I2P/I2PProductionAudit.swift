@@ -21,29 +21,9 @@ enum I2PProductionAudit {
     static let checkpointKey = "i2p.readinessAudit.activeProbe"
     static let checkpointTimeKey = "i2p.readinessAudit.activeProbeAt"
 
-    private static let probeLock = NSLock()
-    private static var activeProbeStorage: String?
-
-    /// The probe currently executing, read by the fatal-signal handler so the
-    /// persisted crash report names the probe that trapped. Best-effort: the
-    /// lock is held only for the instant of the pointer swap, so a trap will
-    /// essentially never arrive while it is held.
-    static var activeProbeName: String? {
-        probeLock.lock()
-        defer { probeLock.unlock() }
-        return activeProbeStorage
-    }
-
-    static func setActiveProbe(_ name: String?) {
-        probeLock.lock()
-        defer { probeLock.unlock() }
-        activeProbeStorage = name
-    }
-
     /// Persists (or retires) the timestamped active-audit-probe checkpoint.
-    /// Shared by every audit engine so a crash during ANY audit leaves a
-    /// checkpoint naming the probe that was running — and the in-memory
-    /// active-probe name rides along into the signal handler's report.
+    /// Shared by every audit engine. The signal handler never reads this state;
+    /// launch-time diagnostics associate a fresh checkpoint with its signal marker.
     static func writeCheckpoint(_ name: String?) {
         if let name {
             UserDefaults.standard.set(name, forKey: checkpointKey)
@@ -77,11 +57,8 @@ enum I2PProductionAudit {
 
         var results: [I2PSelfTestResult] = []
         for (name, probe) in probes {
-            // Persist the active probe (with a timestamp so a checkpoint from
-            // an older build is distinguishable) and expose the name to the
-            // crash reporter BEFORE the probe runs: a mid-probe trap then
-            // names the exact probe in its own report.
-            setActiveProbe(name)
+            // Persist the active probe before it runs so launch-time crash
+            // diagnostics can correlate a fresh checkpoint with the signal marker.
             writeCheckpoint(name)
             await onProgress(name, nil)
             let result: I2PSelfTestResult
@@ -99,7 +76,6 @@ enum I2PProductionAudit {
 
         // The run completed (probe errors were folded into failed results) —
         // retire the checkpoint so no stale banner survives the session.
-        setActiveProbe(nil)
         writeCheckpoint(nil)
 
         let passing = results.filter(\.passed).count

@@ -40,7 +40,6 @@ enum I2PStabilityAudit {
 
         for probe in probes {
             let checkpointName = "Stability · [\(probe.category)] \(probe.name)"
-            I2PProductionAudit.setActiveProbe(checkpointName)
             I2PProductionAudit.writeCheckpoint(checkpointName)
             await onProgress(checkpointName, nil)
             let result: I2PSelfTestResult
@@ -67,7 +66,6 @@ enum I2PStabilityAudit {
 
         // The run completed — retire the shared checkpoint so no stale
         // banner survives the session.
-        I2PProductionAudit.setActiveProbe(nil)
         I2PProductionAudit.writeCheckpoint(nil)
 
         let passing = results.filter(\.passed).count
@@ -157,11 +155,6 @@ enum I2PStabilityAudit {
         var rejected = 0
         var parsed = 0
         for input in inputs {
-            // Name the exact malformed input in the in-memory active-probe
-            // slot: if this input's parse traps, the signal handler's report
-            // names the input AND the backtrace names the parser — no blind
-            // bisecting needed.
-            I2PProductionAudit.setActiveProbe("Stability parser fuzz · \(input.name)")
             var didThrow = false
             do {
                 if input.name.hasPrefix("routerinfo") {

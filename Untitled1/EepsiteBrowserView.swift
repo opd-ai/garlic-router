@@ -9,25 +9,25 @@ import SwiftUI
 
 // MARK: - Model
 
-/// The browser screen's state: the address in the bar, the current load, the
-/// stage trail and the rendered page. All published state is mutated on the
-/// main thread; the client work runs off it.
+/// The browser screen's state: the address in the bar, the pages this browser
+/// has open, the current load, the stage trail and the rendered page. All
+/// published state is mutated on the main thread; the client work runs off it.
 final class I2PEepsiteBrowserModel: ObservableObject {
-    enum Phase {
-        case idle
-        case loading
-        case loaded(I2PEepsitePage)
-        case failed(I2PEepsiteFailure)
-        /// A kept copy read from the offline library. Nothing was fetched, so
-        /// there is no loading stage and no failure: just the copy.
-        case offline(I2PKeptPage)
-    }
+    /// What the page on screen is showing. The tabs model holds the same type
+    /// for every page it keeps, so switching tabs copies it either way.
+    typealias Phase = I2PEepsiteLoadState
 
     @Published var addressText = ""
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var currentStage: I2PEepsiteStage?
     @Published private(set) var trail: [I2PEepsiteStage] = []
     @Published private(set) var suggestions: [String] = []
+    /// The pages this browser has open in this session, with the one on screen
+    /// marked. Memory only, exactly like the visit stack: the browser screen
+    /// owns them, so closing the browser closes every tab with it.
+    @Published private(set) var tabs = I2PBrowserTabs()
+    /// Whether the sheet listing the open pages is over the browser.
+    @Published private(set) var tabsVisible = false
     /// The pages this browser has visited, and where in them it is.
     @Published private(set) var visits = I2PEepsiteVisitStack()
     /// The copy a failing host kept from its last good fetch, shown under the
@@ -42,35 +42,42 @@ final class I2PEepsiteBrowserModel: ObservableObject {
     /// The block the reader should bring on screen; nil before any step.
     @Published private(set) var findScroll: I2PEepsiteFindScroll?
     private var findScrollToken = 0
+    /// Whether the contents sheet is over the page.
+    @Published private(set) var contentsVisible = false
+    /// The heading the reader should bring on screen; nil before any jump.
+    @Published private(set) var contentsJump: I2PEepsiteContentsJump?
+    private var contentsJumpToken = 0
 
     private let client: I2PEepsiteClient
     private let savedHosts: I2PSavedHostsStore
     private let history: I2PBrowserHistoryStore
     private let offline: I2POfflinePageStore
+    private let lastReadPage: I2PLastReadPageStore
     private let suggestionProvider: () -> [String]
-    private var task: Task<Void, Never>?
-    /// Bumped by every load and by a cancel. A fetch may already be past its
-    /// last cancellation check when a newer navigation starts, so each run
-    /// carries the generation it began with and only touches the screen while
-    /// that is still the current one.
-    private var generation = 0
+    /// The fetch each open page is running, so a page keeps loading while
+    /// another is on screen and a closed page takes its run with it.
+    private var tasks: [Int: Task<Void, Never>] = [:]
+    /// Bumped by every load in a page, by a cancel and by closing the page. A
+    /// fetch may already be past its last cancellation check when a newer load
+    /// starts, so each run carries the generation its page held when it began
+    /// and only touches that page while the number still matches.
+    private var generations: [Int: Int] = [:]
 
     init(client: I2PEepsiteClient,
          savedHosts: I2PSavedHostsStore = .shared,
          history: I2PBrowserHistoryStore = .shared,
          offline: I2POfflinePageStore = .shared,
+         lastReadPage: I2PLastReadPageStore = .shared,
          suggestions: @escaping () -> [String]) {
         self.client = client
         self.savedHosts = savedHosts
         self.history = history
         self.offline = offline
+        self.lastReadPage = lastReadPage
         self.suggestionProvider = suggestions
     }
 
-    var isLoading: Bool {
-        if case .loading = phase { return true }
-        return false
-    }
+    var isLoading: Bool { phase.isLoading }
 
     func refreshSuggestions() {
         let fresh = suggestionProvider()
@@ -78,19 +85,23 @@ final class I2PEepsiteBrowserModel: ObservableObject {
     }
 
     /// Loads the address in the bar (or the one passed in, for links), pushing
-    /// the visit onto the stack first. The bar shows the pushed entry, so a
-    /// typed URL with a scheme, a port or a path settles into the browser's own
-    /// canonical form before the fetch starts.
+    /// the visit onto the open page's stack first. The bar shows the pushed
+    /// entry, so a typed URL with a scheme, a port or a path settles into the
+    /// browser's own canonical form before the fetch starts.
     func load(_ raw: String? = nil) {
         let input = (raw ?? addressText).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !input.isEmpty else { return }
+        // The browser's first load opens a page of its own, and a load after
+        // every page was closed opens a fresh one.
+        let id = ensureActiveTab()
         if let visit = I2PEepsiteVisit(rawValue: input) {
             visits.push(visit)
             addressText = visit.display
         } else {
             addressText = input
         }
-        start(input)
+        storeActiveTabState(in: id)
+        start(input, tab: id)
     }
 
     /// Re-runs the address in the bar without touching the visit stack — the
@@ -98,104 +109,281 @@ final class I2PEepsiteBrowserModel: ObservableObject {
     func reload() {
         let input = addressText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !input.isEmpty else { return }
-        start(input)
+        start(input, tab: ensureActiveTab())
     }
 
     /// Steps back one entry and re-loads it, without growing the stack.
     func goBack() {
-        open(visits.goBack())
+        guard let visit = visits.goBack() else { return }
+        open(visit)
     }
 
     /// Steps forward one entry and re-loads it, without pushing a duplicate.
     func goForward() {
-        open(visits.goForward())
+        guard let visit = visits.goForward() else { return }
+        open(visit)
     }
 
     /// Re-loads an entry the stack moved to, bar and page together.
-    private func open(_ visit: I2PEepsiteVisit?) {
-        guard let visit else { return }
+    private func open(_ visit: I2PEepsiteVisit) {
         addressText = visit.display
-        start(visit.display)
+        let id = ensureActiveTab()
+        storeActiveTabState(in: id)
+        start(visit.display, tab: id)
     }
 
-    /// Runs one fetch for the address. The visit stack is not touched here:
-    /// callers decide whether the address is a new navigation (load) or a step
-    /// through the stack (back, forward, retry).
-    private func start(_ input: String) {
-        task?.cancel()
-        generation &+= 1
-        let token = generation
+    /// Runs one fetch for the address in the page that owns it. The visit stack
+    /// is not touched here: callers decide whether the address is a new
+    /// navigation (load) or a step through the stack (back, forward, retry).
+    private func start(_ input: String, tab id: Int) {
+        tasks[id]?.cancel()
+        let token = generation(for: id) + 1
+        generations[id] = token
+        updateTab(id) { tab in
+            tab.state = .loading
+            tab.stage = .address
+            tab.trail = []
+            tab.keptCopy = nil
+            tab.fetchedAt = nil
+        }
         phase = .loading
         keptCopy = nil
         currentStage = .address
         trail = []
-        // A new load is a new page: its search starts over with it.
+        // A new load is a new page: its search starts over with it, and a
+        // contents sheet left open would outline the page that just left.
         clearFind()
+        closeContents()
         let client = self.client
         // The address in the browser's own host-and-path form, which is what a
         // kept copy is labelled with: the rendered page itself only carries the
-        // host it was fetched from.
+        // host it was fetched from. Record it as the latest browser address now;
+        // a failed load remains a useful explicit continuation, but nothing is
+        // fetched again until the user chooses one of its buttons.
         let loadedAddress = I2PEepsiteVisit(rawValue: input)?.display
-        task = Task { [weak self] in
+        if let loadedAddress { lastReadPage.recordRead(loadedAddress) }
+        tasks[id] = Task { [weak self] in
             do {
                 let page = try await client.load(input) { stage in
                     Task { @MainActor [weak self] in
-                        self?.apply(stage, generation: token)
+                        self?.apply(stage, tab: id, generation: token)
                     }
                 }
                 await MainActor.run { [weak self] in
-                    guard let self, self.generation == token else { return }
-                    self.phase = .loaded(page)
-                    self.currentStage = nil
-                    self.trail = []
-                    self.task = nil
+                    guard let self, self.generation(for: id) == token else { return }
+                    self.finish(tab: id, state: .loaded(page),
+                                address: loadedAddress ?? page.address)
                     self.savedHosts.recordFetch(page.address, result: .ok)
                     self.history.record(page.address, result: .ok)
                     // Only a saved host keeps a copy, and this success replaces
                     // whatever the host kept before.
                     self.offline.keep(page, address: loadedAddress ?? page.address)
-                    self.refreshFindForArrivedPage()
+                    if id == self.tabs.activeID { self.refreshFindForArrivedPage() }
                 }
             } catch is CancellationError {
-                // A newer load (or a cancel) owns the state now.
+                // A newer load (or a closed page) owns the state now.
             } catch let failure as I2PEepsiteFailure {
                 await MainActor.run { [weak self] in
-                    guard let self, self.generation == token else { return }
-                    self.phase = .failed(failure)
-                    self.currentStage = nil
-                    self.task = nil
+                    guard let self, self.generation(for: id) == token else { return }
                     self.savedHosts.recordFetch(input, result: failure.savedHostResult)
                     self.history.record(input, result: failure.savedHostResult)
-                    self.keptCopy = self.offline.copy(for: input)
-                    self.refreshFindForArrivedPage()
+                    self.finish(tab: id, state: .failed(failure), address: nil)
+                    if id == self.tabs.activeID { self.refreshFindForArrivedPage() }
                 }
             } catch {
                 await MainActor.run { [weak self] in
-                    guard let self, self.generation == token else { return }
+                    guard let self, self.generation(for: id) == token else { return }
                     let failure = I2PEepsiteFailure(
                         stage: .response,
                         message: "The load failed unexpectedly: \(error)")
-                    self.phase = .failed(failure)
-                    self.currentStage = nil
-                    self.task = nil
                     self.savedHosts.recordFetch(input, result: failure.savedHostResult)
                     self.history.record(input, result: failure.savedHostResult)
-                    self.keptCopy = self.offline.copy(for: input)
-                    self.refreshFindForArrivedPage()
+                    self.finish(tab: id, state: .failed(failure), address: nil)
+                    if id == self.tabs.activeID { self.refreshFindForArrivedPage() }
                 }
             }
         }
     }
 
     func cancel() {
-        generation &+= 1
-        task?.cancel()
-        task = nil
+        guard let id = tabs.activeID else { return }
+        generations[id] = generation(for: id) + 1
+        tasks[id]?.cancel()
+        tasks[id] = nil
         phase = .idle
         keptCopy = nil
         currentStage = nil
         trail = []
         clearFind()
+        closeContents()
+        storeActiveTabState(in: id, content: .idle)
+    }
+
+    // MARK: Tabs
+
+    /// The page on screen, opened on demand: the browser's first load lands in
+    /// a page of its own, and so does a load after every page was closed.
+    private func ensureActiveTab() -> Int {
+        if let id = tabs.activeID { return id }
+        return tabs.open(address: addressText).id
+    }
+
+    /// Changes one open page in place.
+    private func updateTab(_ id: Int, _ body: (inout I2PBrowserTab) -> Void) {
+        var store = tabs
+        store.mutate(id, body)
+        tabs = store
+    }
+
+    /// The generation a page's running fetch was started with; 0 before its
+    /// first load.
+    private func generation(for id: Int) -> Int { generations[id] ?? 0 }
+
+    /// Writes what is on screen into the page that holds it, so switching away
+    /// leaves that page exactly as it was left.
+    private func storeActiveTabState(in id: Int, content: Phase? = nil) {
+        let typed = addressText
+        let stack = visits
+        let state = content ?? phase
+        let kept = keptCopy
+        let stage = currentStage
+        let stages = trail
+        updateTab(id) { tab in
+            tab.addressText = typed
+            tab.visits = stack
+            tab.state = state
+            tab.keptCopy = kept
+            tab.stage = stage
+            tab.trail = stages
+        }
+    }
+
+    /// Opens the sheet listing the pages this browser has open.
+    func openTabs() {
+        saveActiveTab()
+        tabsVisible = true
+    }
+
+    /// Closes the sheet without changing the page on screen.
+    func closeTabs() {
+        guard tabsVisible else { return }
+        tabsVisible = false
+    }
+
+    /// Saves what is on screen into the page that holds it.
+    func saveActiveTab() {
+        guard let id = tabs.activeID else { return }
+        storeActiveTabState(in: id)
+    }
+
+    /// Switches to another page without fetching it again: that page puts back
+    /// what it held when it left the screen.
+    func activateTab(_ id: Int) {
+        guard id != tabs.activeID, tabs.contains(id) else { return }
+        saveActiveTab()
+        var store = tabs
+        store.activate(id)
+        tabs = store
+        restoreActiveTab()
+    }
+
+    /// Opens a fresh page with the address bar emptied, ready for a new load.
+    /// The page it was on stays open with its own stack.
+    func openNewTab() {
+        saveActiveTab()
+        var store = tabs
+        store.open(address: "")
+        tabs = store
+        addressText = ""
+        visits = I2PEepsiteVisitStack()
+        phase = .idle
+        keptCopy = nil
+        currentStage = nil
+        trail = []
+        clearFind()
+        closeContents()
+        tabsVisible = false
+    }
+
+    /// Drops a page together with its visit stack. Closing the page on screen
+    /// hands the screen to its neighbour, and closing the last page returns the
+    /// browser to its empty state.
+    func closeTab(_ id: Int) {
+        guard tabs.contains(id) else { return }
+        tasks[id]?.cancel()
+        tasks[id] = nil
+        generations[id] = generation(for: id) + 1
+        let wasActive = id == tabs.activeID
+        var store = tabs
+        store.close(id)
+        tabs = store
+        guard wasActive else { return }
+        guard !tabs.isEmpty else {
+            resetToEmptyState()
+            closeTabs()
+            return
+        }
+        restoreActiveTab()
+    }
+
+    /// Puts the page that now holds the screen back on it.
+    private func restoreActiveTab() {
+        guard let tab = tabs.active else {
+            resetToEmptyState()
+            return
+        }
+        addressText = tab.addressText
+        visits = tab.visits
+        keptCopy = tab.keptCopy
+        currentStage = tab.stage
+        trail = tab.trail
+        phase = tab.state
+        if !tab.addressText.isEmpty,
+           tab.state.isLoaded || tab.state.isOffline || (tab.state.isFailed && tab.keptCopy != nil) {
+            lastReadPage.recordRead(tab.addressText)
+        }
+        // The page on screen changed, so a search or a contents sheet that
+        // belonged to the page before it goes with it.
+        clearFind()
+        closeContents()
+    }
+
+    /// The browser with nothing on screen, as it was before its first load.
+    private func resetToEmptyState() {
+        addressText = ""
+        visits = I2PEepsiteVisitStack()
+        phase = .idle
+        keptCopy = nil
+        currentStage = nil
+        trail = []
+        clearFind()
+        closeContents()
+    }
+
+    /// Lands a finished fetch in its own page, and follows it on screen while
+    /// that page is the one on screen.
+    private func finish(tab id: Int, state: Phase, address: String?) {
+        tasks[id] = nil
+        guard let page = tabs.tab(id) else { return }
+        let addressForCopy = address ?? page.addressText
+        let arrivedAt = state.isLoaded || state.isOffline ? Date() : nil
+        let kept = state.isFailed ? offline.copy(for: addressForCopy) : nil
+        updateTab(id) { tab in
+            tab.state = state
+            tab.stage = nil
+            tab.trail = []
+            if let address { tab.addressText = address }
+            tab.keptCopy = kept
+            if let arrivedAt { tab.fetchedAt = arrivedAt }
+        }
+        guard id == tabs.activeID else { return }
+        phase = state
+        keptCopy = kept
+        if state.isLoaded || state.isOffline || (state.isFailed && kept != nil) {
+            lastReadPage.recordRead(address ?? page.addressText)
+        }
+        currentStage = nil
+        trail = []
     }
 
     /// Keeps a host as a bookmark. The page on screen already belongs to it
@@ -219,8 +407,10 @@ final class I2PEepsiteBrowserModel: ObservableObject {
     /// copy's banner sits over the page with its Retry live button, which is
     /// the only thing here that reaches for the network.
     func readOffline(_ kept: I2PKeptPage) {
-        task?.cancel()
-        generation &+= 1
+        let id = ensureActiveTab()
+        tasks[id]?.cancel()
+        tasks[id] = nil
+        generations[id] = generation(for: id) + 1
         if let visit = I2PEepsiteVisit(rawValue: kept.address) {
             visits.push(visit)
             addressText = visit.display
@@ -228,33 +418,96 @@ final class I2PEepsiteBrowserModel: ObservableObject {
             addressText = kept.address
         }
         phase = .offline(kept)
+        lastReadPage.recordRead(kept.address)
         keptCopy = nil
         currentStage = nil
         trail = []
         clearFind()
+        closeContents()
+        storeActiveTabState(in: id)
     }
 
     /// The address the browser is showing for a host: the entry being viewed
-    /// when it belongs to that host, and the bare host otherwise.
-    private func displayedAddress(for host: String) -> String {
-        guard let current = visits.current, current.host == host else { return host }
+    /// when it belongs to that host, and the fallback address otherwise.
+    private func displayedAddress(for host: String, fallback: String? = nil) -> String {
+        guard let current = visits.current, current.host == host else { return fallback ?? host }
         return current.display
     }
 
-    /// Advances the stage trail for the load that reported it. Main thread only.
-    private func apply(_ stage: I2PEepsiteStage, generation token: Int) {
-        guard generation == token, case .loading = phase else { return }
+    /// Whether the current reader page can be kept, and whether this host already
+    /// has a copy that the button will update.
+    var canKeepCurrentPageOffline: Bool { currentOfflineAddress != nil }
+
+    var isCurrentPageKeptOffline: Bool {
+        guard let address = currentOfflineAddress else { return false }
+        return offline.copy(for: address) != nil
+    }
+
+    /// Keeps or refreshes the reader page on the device. A live fetch stores its
+    /// current blocks; a page already read from a copy refreshes that same copy.
+    func keepCurrentPageOffline() {
+        guard let address = currentOfflineAddress else { return }
+        let stored: Bool
+        switch phase {
+        case .loaded(let page):
+            stored = offline.keepAny(page, address: address)
+        case .failed:
+            guard let keptCopy else { return }
+            stored = offline.keepAny(keptCopy, address: address)
+        case .offline(let kept):
+            stored = offline.keepAny(kept, address: address)
+        case .idle, .loading:
+            return
+        }
+        guard stored, let refreshed = offline.copy(for: address) else { return }
+        if phase.isOffline {
+            phase = .offline(refreshed)
+        } else if phase.isFailed {
+            keptCopy = refreshed
+        }
+        saveActiveTab()
+    }
+
+    private var currentOfflineAddress: String? {
+        switch phase {
+        case .loaded(let page):
+            let host = I2PSavedHostsStore.host(in: page.address)?.host ?? page.address
+            return displayedAddress(for: host, fallback: page.address)
+        case .failed:
+            guard let keptCopy else { return nil }
+            return displayedAddress(for: keptCopy.host, fallback: keptCopy.address)
+        case .offline(let kept):
+            return displayedAddress(for: kept.host, fallback: kept.address)
+        case .idle, .loading:
+            return nil
+        }
+    }
+
+    /// Advances the stage trail for the load that reported it, in the page that
+    /// owns the run and, while that page is on screen, in the loading card too.
+    /// Main thread only.
+    private func apply(_ stage: I2PEepsiteStage, tab id: Int, generation token: Int) {
+        guard generation(for: id) == token else { return }
+        updateTab(id) { tab in
+            guard case .loading = tab.state else { return }
+            if let current = tab.stage, current != stage, !tab.trail.contains(current) {
+                tab.trail.append(current)
+            }
+            tab.stage = stage
+        }
+        guard id == tabs.activeID, case .loading = phase else { return }
         if let current = currentStage, current != stage, !trail.contains(current) {
             trail.append(current)
         }
         currentStage = stage
     }
 
-    // MARK: Find
+    // MARK: Contents
 
-    /// The blocks the find bar searches: the reader blocks of the page on
-    /// screen — a live page, or the kept copy a failed load fell back to.
-    var findableBlocks: [I2PReadBlock] {
+    /// The blocks of the page on screen: a live page, the kept copy a failed
+    /// load fell back to, or a copy read from the offline library. The find bar
+    /// searches them and the contents sheet outlines them.
+    var readerBlocks: [I2PReadBlock] {
         switch phase {
         case .loaded(let page):
             return page.blocks
@@ -265,6 +518,62 @@ final class I2PEepsiteBrowserModel: ObservableObject {
         case .idle, .loading:
             return []
         }
+    }
+
+    /// The blocks the find bar searches.
+    var findableBlocks: [I2PReadBlock] { readerBlocks }
+
+    /// The headings of the page on screen, in document order with sub-headings
+    /// nested under their parents. Empty while nothing is on screen.
+    var contents: I2PEepsiteContents { I2PEepsiteContents.outline(readerBlocks) }
+
+    /// The host the contents control names, or nil while nothing is on screen.
+    var contentsHost: String? {
+        switch phase {
+        case .loaded(let page):
+            return page.address
+        case .failed:
+            return keptCopy?.host
+        case .offline(let kept):
+            return kept.host
+        case .idle, .loading:
+            return nil
+        }
+    }
+
+    /// The address the contents sheet is headed with: the entry being viewed
+    /// for a live page, the address the copy was taken from for a kept one.
+    var contentsAddress: String? {
+        switch phase {
+        case .loaded(let page):
+            return displayedAddress(for: page.address)
+        case .failed:
+            return keptCopy?.address
+        case .offline(let kept):
+            return kept.address
+        case .idle, .loading:
+            return nil
+        }
+    }
+
+    /// Opens the contents sheet, when the page has headings to jump between.
+    func openContents() {
+        guard contents.isAvailable else { return }
+        contentsVisible = true
+    }
+
+    /// Closes the contents sheet without moving the page.
+    func closeContents() {
+        guard contentsVisible else { return }
+        contentsVisible = false
+    }
+
+    /// Scrolls the tapped heading's block into view and closes the sheet — a
+    /// live page and a kept copy alike.
+    func jump(to entry: I2PEepsiteContentsEntry) {
+        contentsVisible = false
+        contentsJumpToken &+= 1
+        contentsJump = I2PEepsiteContentsJump(token: contentsJumpToken, block: entry.block)
     }
 
     // MARK: Share
@@ -287,6 +596,8 @@ final class I2PEepsiteBrowserModel: ObservableObject {
             return nil
         }
     }
+
+    // MARK: Find
 
     /// Opens the find bar over the page, when there is a page to search.
     func openFind() {
@@ -365,6 +676,7 @@ struct EepsiteBrowserView: View {
     @ObservedObject private var savedHosts = I2PSavedHostsStore.shared
     @ObservedObject private var browserHistory = I2PBrowserHistoryStore.shared
     @ObservedObject private var offlinePages = I2POfflinePageStore.shared
+    @ObservedObject private var lastReadPage = I2PLastReadPageStore.shared
     /// The reader's text size, shared with every other reader surface and kept
     /// across launches.
     @ObservedObject private var readerText = I2PReaderTextSizeStore.shared
@@ -401,6 +713,12 @@ struct EepsiteBrowserView: View {
                     proxy.scrollTo(request.block, anchor: .center)
                 }
             }
+            .onChange(of: model.contentsJump) { _, request in
+                guard let request else { return }
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    proxy.scrollTo(request.block, anchor: .top)
+                }
+            }
         }
         .background(background.ignoresSafeArea())
         .navigationTitle("Eepsite Browser")
@@ -412,6 +730,17 @@ struct EepsiteBrowserView: View {
         }
         .onChange(of: model.findVisible) { _, visible in
             findFocused = visible
+        }
+        .sheet(isPresented: contentsPresented) {
+            I2PEepsiteContentsSheet(address: model.contentsAddress ?? model.addressText,
+                                    contents: model.contents,
+                                    onSelect: { entry in model.jump(to: entry) },
+                                    onClose: { model.closeContents() })
+                .presentationDetents([.large])
+        }
+        .sheet(isPresented: tabsPresented) {
+            OpenTabsView(model: model)
+                .presentationDetents([.large])
         }
     }
 
@@ -580,6 +909,7 @@ struct EepsiteBrowserView: View {
                 model.goForward()
             }
             Spacer(minLength: 0)
+            tabsChip
             findChip
         }
     }
@@ -610,6 +940,60 @@ struct EepsiteBrowserView: View {
         .buttonStyle(.plain)
         .disabled(!enabled)
         .accessibilityLabel(title)
+    }
+
+    // MARK: Tabs
+
+    /// The chip beside the address bar that opens the sheet listing every page
+    /// this browser has open, with how many there are.
+    private var tabsChip: some View {
+        let count = model.tabs.count
+        return Button {
+            addressFocused = false
+            model.openTabs()
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "square.on.square")
+                    .font(.caption2.weight(.bold))
+                Text("Tabs")
+                    .font(.caption.weight(.semibold))
+                if count > 0 {
+                    Text("\(count)")
+                        .font(.caption2.weight(.bold))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(accent.opacity(0.22), in: Capsule())
+                }
+            }
+            .foregroundStyle(accent)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(accent.opacity(0.16), in: Capsule())
+            .overlay(
+                Capsule()
+                    .strokeBorder(accent.opacity(0.30), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(tabsChipLabel(count))
+        .accessibilityHint("Lists every page this browser has open")
+    }
+
+    private func tabsChipLabel(_ count: Int) -> String {
+        switch count {
+        case 0: return "Tabs, no pages open"
+        case 1: return "Tabs, 1 page open"
+        default: return "Tabs, \(count) pages open"
+        }
+    }
+
+    /// The sheet's presentation, routed through the model so the header's Close
+    /// and the last page closing both dismiss it.
+    private var tabsPresented: Binding<Bool> {
+        Binding(get: { model.tabsVisible },
+                set: { shown in
+                    if !shown { model.closeTabs() }
+                })
     }
 
     // MARK: Find
@@ -739,16 +1123,82 @@ struct EepsiteBrowserView: View {
 
     // MARK: Reader text size
 
-    /// The row above the page: one control that cycles the reader's text size
-    /// and names the size in effect, so the page's type, line spacing and
-    /// block padding all step together — a live page and a kept copy alike —
-    /// and, at the other end, the page's share control.
+    /// The row above the page: the control that cycles the reader's text size
+    /// and names the size in effect, so the page's type, line spacing and block
+    /// padding all step together — a live page and a kept copy alike — the
+    /// contents control beside it, and, at the other end, the share control.
     private var readerBar: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 8) {
             readerSizeChip
+            contentsChip
             Spacer(minLength: 0)
             shareChip
         }
+    }
+
+    // MARK: Contents
+
+    /// The contents control above the page: it opens the sheet that lists the
+    /// page's headings and names the host it will outline. It stays disabled
+    /// while nothing is on screen and while the page has fewer than two
+    /// headings, since there is nothing to jump between.
+    private var contentsChip: some View {
+        let contents = model.contents
+        let host = model.contentsHost
+        let enabled = contents.isAvailable
+        return Button {
+            addressFocused = false
+            model.openContents()
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "list.number")
+                    .font(.caption.weight(.bold))
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Contents")
+                        .font(.caption.weight(.semibold))
+                    if let host {
+                        Text(host)
+                            .font(.system(size: 10, design: .monospaced))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .frame(maxWidth: 108, alignment: .leading)
+                    }
+                }
+            }
+            .foregroundStyle(enabled ? accent : Color.secondary)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background((enabled ? accent.opacity(0.16) : Color.white.opacity(0.05)),
+                        in: Capsule())
+            .overlay(
+                Capsule()
+                    .strokeBorder(enabled ? accent.opacity(0.30) : Color.white.opacity(0.08),
+                                  lineWidth: 1)
+            )
+            .opacity(enabled ? 1 : 0.45)
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .accessibilityLabel(contentsLabel(contents: contents, host: host, enabled: enabled))
+        .accessibilityHint("Lists the page's headings and jumps to one")
+    }
+
+    /// The control's own name: the host it will outline and how many headings
+    /// the sheet will list, or what is missing while it is disabled.
+    private func contentsLabel(contents: I2PEepsiteContents,
+                               host: String?,
+                               enabled: Bool) -> String {
+        guard enabled, let host else { return "Contents, no headings to jump to" }
+        return "Contents, \(contents.countText.lowercased()) on \(host)"
+    }
+
+    /// The sheet's presentation, routed through the model so a new load closes
+    /// it along with the page it was outlining.
+    private var contentsPresented: Binding<Bool> {
+        Binding(get: { model.contentsVisible },
+                set: { shown in
+                    if !shown { model.closeContents() }
+                })
     }
 
     // MARK: Share
@@ -984,7 +1434,7 @@ struct EepsiteBrowserView: View {
 
     private var offlineSummary: String {
         let count = offlinePages.copies.count
-        guard count > 0 else { return "Pages kept from your saved hosts" }
+        guard count > 0 else { return "Keep any page for offline reading" }
         let size = I2PKeptPage.sizeText(offlinePages.libraryBytes)
         return count == 1 ? "1 page kept · \(size)" : "\(count) pages kept · \(size)"
     }
@@ -998,6 +1448,9 @@ struct EepsiteBrowserView: View {
     private var loadContent: some View {
         switch model.phase {
         case .idle:
+            if lastReadPage.shouldOffer, let page = lastReadPage.page {
+                continueReadingCard(page)
+            }
             emptyStateCard
         case .loading:
             loadingCard
@@ -1263,6 +1716,8 @@ struct EepsiteBrowserView: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            keepOfflineButton
+                .padding(.top, 6)
         }
         .padding(.horizontal, readerText.size.blockPadding)
         .padding(.top, 16)
@@ -1274,6 +1729,34 @@ struct EepsiteBrowserView: View {
         let size = byteText(kept.byteCount)
         let elapsed = String(format: "%.1fs", kept.elapsed)
         return "\(leases) · \(kept.route) · \(size) · \(elapsed)"
+    }
+
+    private var keepOfflineButton: some View {
+        let isKept = model.isCurrentPageKeptOffline
+        return Button {
+            model.keepCurrentPageOffline()
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: isKept ? "arrow.clockwise" : "tray.and.arrow.down")
+                    .font(.caption2.weight(.bold))
+                Text(isKept ? "Kept · update" : "Keep offline")
+                    .font(.caption.weight(.semibold))
+            }
+            .foregroundStyle(model.canKeepCurrentPageOffline ? accent : Color.secondary)
+            .padding(.horizontal, 11)
+            .padding(.vertical, 6)
+            .background((model.canKeepCurrentPageOffline ? accent.opacity(0.14) : Color.white.opacity(0.05)),
+                        in: Capsule())
+            .overlay(
+                Capsule()
+                    .strokeBorder(model.canKeepCurrentPageOffline ? accent.opacity(0.28) : Color.white.opacity(0.08),
+                                  lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(!model.canKeepCurrentPageOffline)
+        .accessibilityLabel(isKept ? "Kept offline. Update copy" : "Keep this page offline")
+        .accessibilityHint("Stores this reader page on this device for offline reading")
     }
 
     // MARK: Page
@@ -1326,6 +1809,8 @@ struct EepsiteBrowserView: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            keepOfflineButton
+                .padding(.top, 6)
         }
         .padding(.horizontal, readerText.size.blockPadding)
         .padding(.top, 16)
@@ -1425,6 +1910,87 @@ struct EepsiteBrowserView: View {
     }
 
     // MARK: Empty state & footnote
+
+    /// The one remembered address, offered only while the browser has no page
+    /// open. Reading the kept copy consults device storage only; the live button
+    /// is the sole action here that starts a fetch.
+    private func continueReadingCard(_ page: I2PLastReadPage) -> some View {
+        let kept = offlinePages.copy(for: page.address)
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                Image(systemName: "book.closed")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(accent)
+                    .frame(width: 30, height: 30)
+                    .background(accent.opacity(0.15), in: RoundedRectangle(cornerRadius: 9))
+                    .accessibilityHidden(true)
+                Text("Continue reading")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.primary)
+                Spacer(minLength: 4)
+                Button {
+                    lastReadPage.dismiss()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 30, height: 30)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Dismiss continue reading for \(page.address)")
+            }
+
+            Text(page.address)
+                .font(.system(.footnote, design: .monospaced).weight(.medium))
+                .foregroundStyle(.primary)
+                .lineLimit(2)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+            Text("Last read \(page.lastReadAt.formatted(date: .abbreviated, time: .shortened))")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 8) {
+                Button {
+                    addressFocused = false
+                    model.load(page.address)
+                } label: {
+                    Label("Load live", systemImage: "globe")
+                        .font(.caption.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                        .background(accent.opacity(0.17), in: RoundedRectangle(cornerRadius: 11))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(accent)
+                .accessibilityHint("Fetches this address now")
+
+                if let kept {
+                    Button {
+                        addressFocused = false
+                        model.readOffline(kept)
+                    } label: {
+                        Label("Read offline", systemImage: "tray.full")
+                            .font(.caption.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 11))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.primary)
+                    .accessibilityHint("Opens the kept copy without connecting to the network")
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .background(accent.opacity(0.09), in: RoundedRectangle(cornerRadius: 18))
+        .overlay(
+            RoundedRectangle(cornerRadius: 18)
+                .strokeBorder(accent.opacity(0.28), lineWidth: 1)
+        )
+    }
 
     private var emptyStateCard: some View {
         VStack(alignment: .leading, spacing: 12) {

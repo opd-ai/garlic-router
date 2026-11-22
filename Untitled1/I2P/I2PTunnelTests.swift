@@ -409,6 +409,10 @@ private static func rejectTest() async throws -> String {
         }) else {
             throw I2PTunnelTestFailure("a loopback build was not recorded as accepted with a latency")
         }
+        guard pool.lifetimeBuiltTunnels == history.filter(\.succeeded).count else {
+            throw I2PTunnelTestFailure(
+                "lifetime count is \(pool.lifetimeBuiltTunnels) for \(history.filter(\.succeeded).count) successful pool builds")
+        }
         guard pool.buildingCount(.outbound) == 0, pool.buildingCount(.inbound) == 0 else {
             throw I2PTunnelTestFailure("the pool still reports builds in flight after fillPools returned")
         }

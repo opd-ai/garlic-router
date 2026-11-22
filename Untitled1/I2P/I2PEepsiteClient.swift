@@ -200,6 +200,9 @@ struct I2PEepsitePage {
 
 /// A minimal HTTP/1.1 response read off the stream.
 struct I2PHTTPResponse {
+    static let maximumResponseBytes = 8 * 1024 * 1024
+    private static let maximumHeaderBytes = 64 * 1024
+
     let statusCode: Int
     let reason: String
     let headers: [String: String]
@@ -225,13 +228,21 @@ struct I2PHTTPResponse {
     /// True once the buffer holds everything the framing promises, so the
     /// read loop can stop before the peer closes the stream.
     static func isComplete(_ data: Data) -> Bool {
-        guard let terminator = headerTerminator(in: data) else { return false }
+        // Let the caller stop reading so `parse` can report a bounded, explicit
+        // error instead of buffering an untrusted response indefinitely.
+        guard data.count <= maximumResponseBytes else { return true }
+        guard let terminator = headerTerminator(in: data) else {
+            return data.count > maximumHeaderBytes
+        }
+        guard terminator.lowerBound <= maximumHeaderBytes else { return true }
         let headerText = String(decoding: data[..<terminator.lowerBound], as: UTF8.self).lowercased()
         let body = Data(data[terminator.upperBound...])
         if headerText.contains("transfer-encoding:") && headerText.contains("chunked") {
             return decodeChunked(body).complete
         }
-        if let length = contentLength(headerText) {
+        let framing = contentLength(headerText)
+        if framing.present {
+            guard let length = framing.length, length <= maximumResponseBytes else { return true }
             return body.count >= length
         }
         // No framing: the page ends when the peer closes (FIN). A complete
@@ -244,11 +255,20 @@ struct I2PHTTPResponse {
         func fail(_ message: String) -> I2PEepsiteFailure {
             I2PEepsiteFailure(stage: .response, message: message)
         }
+        guard data.count <= maximumResponseBytes else {
+            throw fail("The eepsite response exceeded the 8 MiB size limit.")
+        }
         guard let terminator = headerTerminator(in: data) else {
+            guard data.count <= maximumHeaderBytes else {
+                throw fail("The HTTP headers exceeded the 64 KiB size limit.")
+            }
             throw fail("The stream carried no complete HTTP header.")
         }
+        guard terminator.lowerBound <= maximumHeaderBytes else {
+            throw fail("The HTTP headers exceeded the 64 KiB size limit.")
+        }
         let headerText = String(decoding: data[..<terminator.lowerBound], as: UTF8.self)
-        let lines = headerText.split(whereSeparator: { $0 == "\r" || $0 == "\n" })
+        let lines = headerText.components(separatedBy: .newlines).filter { !$0.isEmpty }
         guard let statusLine = lines.first else {
             throw fail("The stream carried an empty HTTP header.")
         }
@@ -264,11 +284,19 @@ struct I2PHTTPResponse {
             let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
             headers[key] = value
         }
+        let framing = contentLength(headerText)
+        if framing.present, framing.length == nil {
+            throw fail("The eepsite sent an invalid or conflicting Content-Length header.")
+        }
+        if let length = framing.length, length > maximumResponseBytes {
+            throw fail("The eepsite declared a response larger than the 8 MiB size limit.")
+        }
+
         let rawBody = Data(data[terminator.upperBound...])
         let body: Data
         if headers["transfer-encoding"]?.lowercased().contains("chunked") == true {
             body = decodeChunked(rawBody).data
-        } else if let lengthText = headers["content-length"], let length = Int(lengthText) {
+        } else if let length = framing.length {
             body = rawBody.count > length ? Data(rawBody.prefix(length)) : rawBody
         } else {
             body = rawBody
@@ -284,14 +312,21 @@ struct I2PHTTPResponse {
         return data.range(of: Data([0x0A, 0x0A]))
     }
 
-    private static func contentLength(_ headerText: String) -> Int? {
-        for line in headerText.split(whereSeparator: { $0 == "\r" || $0 == "\n" }) {
-            guard line.lowercased().hasPrefix("content-length:") else { continue }
-            let value = line.split(separator: ":", maxSplits: 1).last?
-                .trimmingCharacters(in: .whitespaces)
-            if let value, let length = Int(value) { return length }
+    private static func contentLength(_ headerText: String) -> (present: Bool, length: Int?) {
+        var declaredLength: Int?
+        var present = false
+        for line in headerText.components(separatedBy: .newlines).filter { !$0.isEmpty } {
+            guard let colon = line.firstIndex(of: ":"),
+                  line[..<colon].trimmingCharacters(in: .whitespaces).lowercased() == "content-length" else {
+                continue
+            }
+            present = true
+            let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+            guard let length = Int(value), length >= 0 else { return (true, nil) }
+            if let declaredLength, declaredLength != length { return (true, nil) }
+            declaredLength = length
         }
-        return nil
+        return (present, declaredLength)
     }
 
     private static func decodeChunked(_ body: Data) -> (data: Data, complete: Bool) {
@@ -323,9 +358,68 @@ struct I2PHTTPResponse {
     }
 }
 
+// MARK: - HTTP response self-tests
+
+enum I2PHTTPResponseSelfTest {
+    static func runAll() -> [I2PSelfTestResult] {
+        var results: [I2PSelfTestResult] = []
+        func check(_ name: String, _ body: () -> String?) {
+            if let detail = body() {
+                results.append(I2PSelfTestResult(name: name, passed: true, detail: detail))
+            } else {
+                results.append(I2PSelfTestResult(
+                    name: name, passed: false,
+                    detail: "HTTP response framing did not match the expected bounded behavior"))
+            }
+        }
+        func rejects(_ data: Data) -> Bool {
+            do {
+                _ = try I2PHTTPResponse.parse(data)
+                return false
+            } catch let error as I2PEepsiteFailure {
+                return error.stage == .response
+            } catch {
+                return false
+            }
+        }
+
+        check("eepsite HTTP response: invalid and negative Content-Length rejected") {
+            let negative = Data("HTTP/1.1 200 OK\r\nContent-Length: -1\r\n\r\nx".utf8)
+            let malformed = Data("HTTP/1.1 200 OK\r\nContent-Length: nope\r\n\r\nx".utf8)
+            let conflicting = Data("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nxy".utf8)
+            guard I2PHTTPResponse.isComplete(negative), rejects(negative),
+                  rejects(malformed), rejects(conflicting) else { return nil }
+            return "negative, malformed and conflicting lengths fail as response errors without slicing or trapping"
+        }
+
+        check("eepsite HTTP response: oversized headers and bodies are bounded") {
+            let header = Data("HTTP/1.1 200 OK\r\nX-Large: ".utf8)
+                + Data(repeating: 0x61, count: 65 * 1024)
+            let body = Data(repeating: 0x61, count: I2PHTTPResponse.maximumResponseBytes + 1)
+            let oversizedLength = Data("HTTP/1.1 200 OK\r\nContent-Length: \(I2PHTTPResponse.maximumResponseBytes + 1)\r\n\r\n".utf8)
+            guard I2PHTTPResponse.isComplete(header), rejects(header),
+                  I2PHTTPResponse.isComplete(body), rejects(body),
+                  I2PHTTPResponse.isComplete(oversizedLength), rejects(oversizedLength) else { return nil }
+            return "header bytes and complete response bytes stay under explicit limits; oversized declarations stop reads early"
+        }
+
+        check("eepsite HTTP response: valid and partial Content-Length framing") {
+            let complete = Data("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabcignored".utf8)
+            let partial = Data("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nab".utf8)
+            guard I2PHTTPResponse.isComplete(complete),
+                  (try? I2PHTTPResponse.parse(complete).body) == Data("abc".utf8),
+                  !I2PHTTPResponse.isComplete(partial),
+                  (try? I2PHTTPResponse.parse(partial).body) == Data("ab".utf8) else { return nil }
+            return "valid declared bodies still trim extra bytes and preserve partial-response rendering"
+        }
+
+        return results
+    }
+}
+
 // MARK: - Resolved site
 
-/// A destination resolved to the leases a garlic stream can be delivered to.
+/// A destination resolved to the leases a garlic stream can route to.
 struct I2PEepsiteSite {
     let destination: I2PDestination
     let leases: [I2PLease]
@@ -597,9 +691,14 @@ private final class I2PEepsiteExchange {
 
     func append(_ chunk: Data) {
         lock.lock()
+        defer { lock.unlock() }
+        guard failure == nil else { return }
+        guard chunk.count <= I2PHTTPResponse.maximumResponseBytes - data.count else {
+            failure = "The eepsite response exceeded the 8 MiB size limit."
+            return
+        }
         data.append(chunk)
         lastActivity = Date()
-        lock.unlock()
     }
 
     func markFinished() {
@@ -889,10 +988,10 @@ final class I2PEepsiteClientSession {
         while Date() < deadline {
             if Task.isCancelled { throw CancellationError() }
             let state = exchange.snapshot()
-            if state.finished { break }
             if let failure = state.failure {
                 throw I2PEepsiteFailure(stage: .response, message: failure)
             }
+            if state.finished { break }
             if I2PHTTPResponse.isComplete(state.data) { break }
             if Date() > lease.expiration,
                Date().timeIntervalSince(state.lastActivity) > Self.leaseStallWindow {
@@ -903,6 +1002,9 @@ final class I2PEepsiteClientSession {
         }
 
         let state = exchange.snapshot()
+        if let failure = state.failure {
+            throw I2PEepsiteFailure(stage: .response, message: failure)
+        }
         let leaseExpiredMidFetch = Date() > lease.expiration
         if state.data.isEmpty {
             if leaseStalled || leaseExpiredMidFetch {

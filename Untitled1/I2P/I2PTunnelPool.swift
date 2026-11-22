@@ -65,6 +65,10 @@ final class I2PTunnelPool {
     /// Build outcomes kept for the tunnel health screen, oldest first.
     private var buildRecords: [I2PTunnelBuildRecord] = []
     private var nextBuildRecordID: UInt64 = 1
+    /// Tunnels this pool has built as their creator since the router started:
+    /// a lifetime counter the totals card reads, so it does not decay with the
+    /// health screen's rolling one-hour window.
+    private var lifetimeBuiltCount = 0
     /// Builds in flight per direction, so the pools can say "1 building".
     private var buildingCounts: [I2PTunnel.Direction: Int] = [:]
 
@@ -133,6 +137,14 @@ final class I2PTunnelPool {
     var outboundCount: Int { activeCount(.outbound) }
     var inboundCount: Int { activeCount(.inbound) }
 
+    /// Tunnels built successfully as their creator since the router started.
+    /// Cumulative and memory only, unlike `buildHistory`'s rolling window.
+    var lifetimeBuiltTunnels: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return lifetimeBuiltCount
+    }
+
     /// Mean build latency across live tunnels (latency monitoring).
     var averageBuildLatency: TimeInterval? {
         let latencies = (outboundTunnels + inboundTunnels).compactMap(\.buildLatency)
@@ -140,13 +152,16 @@ final class I2PTunnelPool {
         return latencies.reduce(0, +) / Double(latencies.count)
     }
 
-    /// Registers a tunnel (used by the builder and by tests).
+    /// Registers a successfully built tunnel, whether the pool's fill loop or
+    /// another router workflow drove the builder. Counting at this ownership
+    /// boundary keeps the run total correct for every caller of `adopt`.
     func adopt(_ tunnel: I2PTunnel) {
         lock.lock()
         switch tunnel.direction {
         case .outbound: outbound.append(tunnel)
         case .inbound: inbound.append(tunnel)
         }
+        lifetimeBuiltCount += 1
         lock.unlock()
     }
 

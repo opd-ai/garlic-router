@@ -10,9 +10,11 @@
 //
 //  Every suite the app runs now lives under I2P/ — including the eepsite
 //  browser's navigation and share suites — so this harness covers all of them
-//  and needs no stand-ins.
+//  and needs no stand-ins. Any failed check also makes the process exit nonzero,
+//  so a shell or CI job cannot mistake printed failures for a successful run.
 //
 
+import Darwin
 import Foundation
 
 var results: [I2PSelfTestResult] = []
@@ -29,6 +31,9 @@ if CommandLine.arguments.contains("--all") {
 }
 if CommandLine.arguments.contains("--netdb") {
     results += await I2PNetDBSelfTest.runAll()
+}
+if CommandLine.arguments.contains("--netdb-entries") {
+    results += I2PNetDBEntriesSelfTest.runAll()
 }
 if CommandLine.arguments.contains("--ntcp2") {
     results += await I2PNTCP2SelfTest.runAll()
@@ -69,3 +74,6 @@ for result in results {
 
 let failures = results.filter { !$0.passed }.count
 print("\n\(results.count - failures) passed, \(failures) failed")
+if failures > 0 {
+    exit(EXIT_FAILURE)
+}

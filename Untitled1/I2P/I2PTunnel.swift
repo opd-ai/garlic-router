@@ -271,6 +271,10 @@ final class I2PTunnelParticipant {
 
     private var pendingBuilds: [PendingBuild] = []
     private var hopStates: [UInt32: I2PTunnelHopState] = [:]
+    /// Tunnels carried as a hop for another participant since the router
+    /// started: a lifetime counter for the totals card, kept beside the live
+    /// hop states rather than derived from them, since they expire.
+    private var lifetimeCarriedTunnelCount = 0
     /// Reply consumers registered by originators (builders) on this router.
     private var replyConsumers: [(I2PTunnelBuildReply) -> Void] = []
 
@@ -337,6 +341,7 @@ final class I2PTunnelParticipant {
         )
         lock.lock()
         hopStates[record.receiveTunnelID] = state
+        lifetimeCarriedTunnelCount += 1
         if !isMessagePathEnd {
             pendingBuilds.append(PendingBuild(
                 source: source,
@@ -436,6 +441,15 @@ final class I2PTunnelParticipant {
         lock.lock()
         defer { lock.unlock() }
         return hopStates.count
+    }
+
+    /// Tunnels accepted and carried as a hop since the router started: the
+    /// cumulative reading the dashboard's totals card shows beside the live
+    /// hop-state count, which falls as tunnels expire.
+    var lifetimeCarriedTunnels: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return lifetimeCarriedTunnelCount
     }
 
     func pruneHopStates(now: Date = Date()) -> Int {

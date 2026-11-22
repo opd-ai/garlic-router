@@ -11,6 +11,7 @@ struct OfflineLibraryView: View {
     @ObservedObject private var store: I2POfflinePageStore
     @ObservedObject private var savedHosts: I2PSavedHostsStore
     @Environment(\.dismiss) private var dismiss
+    @State private var searchText = ""
 
     /// Reads a kept copy in the browser behind this screen.
     private let onOpen: (I2PKeptPage) -> Void
@@ -41,7 +42,7 @@ struct OfflineLibraryView: View {
     // MARK: - Header
 
     private var caption: some View {
-        Text("Pages kept from your saved hosts' last good fetch — readable even when the router can't reach them.")
+        Text("Pages you keep from the reader, alongside saved hosts' last good fetches — readable even when the router can't reach them.")
             .font(.footnote)
             .foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
@@ -92,21 +93,56 @@ struct OfflineLibraryView: View {
 
     private var copyList: some View {
         let copies = store.library
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let results = I2POfflineLibrarySearch.results(in: copies, query: query)
         return List {
-            if copies.isEmpty {
-                emptyState
+            searchField
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
+                .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
+
+            if !query.isEmpty {
+                searchCount(results.count, query: query)
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+                    .listRowInsets(EdgeInsets(top: 2, leading: 16, bottom: 6, trailing: 16))
+            }
+
+            if query.isEmpty {
+                if copies.isEmpty {
+                    emptyState
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
+                        .listRowInsets(EdgeInsets(top: 2, leading: 16, bottom: 6, trailing: 16))
+                } else {
+                    ForEach(copies, id: \.host) { kept in
+                        row(kept)
+                            .listRowBackground(Color.clear)
+                            .listRowSeparator(.hidden)
+                            .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 0))
+                            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                Button(role: .destructive) {
+                                    store.remove(kept.host)
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
+                            }
+                    }
+                }
+            } else if results.isEmpty {
+                noSearchResults(query)
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
                     .listRowInsets(EdgeInsets(top: 2, leading: 16, bottom: 6, trailing: 16))
             } else {
-                ForEach(copies, id: \.host) { kept in
-                    row(kept)
+                ForEach(results, id: \.page.host) { result in
+                    row(result.page, searchResult: result, query: query)
                         .listRowBackground(Color.clear)
                         .listRowSeparator(.hidden)
                         .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 0))
                         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                             Button(role: .destructive) {
-                                store.remove(kept.host)
+                                store.remove(result.page.host)
                             } label: {
                                 Label("Delete", systemImage: "trash")
                             }
@@ -121,10 +157,68 @@ struct OfflineLibraryView: View {
         }
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
+        .scrollDismissesKeyboard(.interactively)
         .animation(.easeInOut(duration: 0.2), value: store.copies)
+        .animation(.easeInOut(duration: 0.2), value: searchText)
     }
 
-    private func row(_ kept: I2PKeptPage) -> some View {
+    private var searchField: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "magnifyingglass")
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            TextField("Search inside kept pages", text: $searchText)
+                .font(.subheadline)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .accessibilityHint("Searches text in offline copies only. Nothing is fetched.")
+            if !searchText.isEmpty {
+                Button {
+                    searchText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear search")
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 11)
+        .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 13))
+    }
+
+    private func searchCount(_ count: Int, query: String) -> some View {
+        Text("\(count) \(count == 1 ? "page holds" : "pages hold") \"\(query)\"")
+            .font(.footnote.weight(.medium))
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityAddTraits(.isHeader)
+    }
+
+    private func noSearchResults(_ query: String) -> some View {
+        VStack(spacing: 10) {
+            Image(systemName: "text.magnifyingglass")
+                .font(.system(size: 38, weight: .light))
+                .foregroundStyle(.tertiary)
+                .accessibilityHidden(true)
+            Text("No matching pages")
+                .font(.headline.weight(.semibold))
+            Text("Nothing matched \"\(query)\" in your kept pages.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(18)
+        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 18))
+    }
+
+    private func row(_ kept: I2PKeptPage,
+                     searchResult: I2POfflineLibrarySearchResult? = nil,
+                     query: String = "") -> some View {
         Button {
             open(kept)
         } label: {
@@ -150,6 +244,16 @@ struct OfflineLibraryView: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.tail)
+                    if let searchResult {
+                        Text(matchedBlocksText(searchResult.matchingBlockCount))
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(accent)
+                        Text(highlightedSnippet(searchResult.snippet, query: query))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
                 }
                 Image(systemName: "chevron.right")
                     .font(.caption2.weight(.semibold))
@@ -164,7 +268,38 @@ struct OfflineLibraryView: View {
         }
         .buttonStyle(.plain)
         .padding(.trailing, 16)
-        .accessibilityLabel("\(kept.host), \(kept.address), \(kept.keptText()), \(metaLine(kept))")
+        .accessibilityLabel(accessibilityLabel(for: kept, searchResult: searchResult))
+    }
+
+    private func matchedBlocksText(_ count: Int) -> String {
+        count == 1 ? "1 block matched" : "\(count) blocks matched"
+    }
+
+    private func highlightedSnippet(_ snippet: String, query: String) -> AttributedString {
+        var text = AttributedString(snippet)
+        guard !query.isEmpty else { return text }
+        var searchStart = snippet.startIndex
+        while searchStart < snippet.endIndex,
+              let match = snippet.range(of: query,
+                                        options: [.caseInsensitive],
+                                        range: searchStart..<snippet.endIndex) {
+            guard let lower = AttributedString.Index(match.lowerBound, within: text),
+                  let upper = AttributedString.Index(match.upperBound, within: text) else { break }
+            text[lower..<upper].foregroundColor = accent
+            text[lower..<upper].font = .system(.caption, design: .default, weight: .bold)
+            guard match.upperBound > searchStart else { break }
+            searchStart = match.upperBound
+        }
+        return text
+    }
+
+    private func accessibilityLabel(for kept: I2PKeptPage,
+                                    searchResult: I2POfflineLibrarySearchResult?) -> String {
+        var label = "\(kept.host), \(kept.address), \(kept.keptText()), \(metaLine(kept))"
+        if let searchResult {
+            label += ", \(matchedBlocksText(searchResult.matchingBlockCount)), \(searchResult.snippet)"
+        }
+        return label
     }
 
     private func iconTile(_ kept: I2PKeptPage) -> some View {
@@ -176,8 +311,8 @@ struct OfflineLibraryView: View {
             .accessibilityHidden(true)
     }
 
-    /// The bookmark's kind for the copy's host: a b33 address or a .i2p name.
-    /// Every copy belongs to a saved host, so the bookmark is normally there.
+    /// The saved host's kind when it is bookmarked, or a kind inferred from the
+    /// host suffix for an explicitly kept page.
     private func hostKind(_ kept: I2PKeptPage) -> I2PSavedHostKind {
         if let entry = savedHosts.entries.first(where: { $0.host == kept.host }) {
             return entry.kind
@@ -222,7 +357,7 @@ struct OfflineLibraryView: View {
                 .accessibilityHidden(true)
             Text("No kept pages yet")
                 .font(.headline.weight(.semibold))
-            Text("We keep the last good fetch of every saved host so you can read it when the router can't reach it. Save a host in the browser, open it once, and it shows up here.")
+            Text("Use Keep offline in any page's header to save it here. Saved hosts also keep their last good fetch automatically.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -234,7 +369,7 @@ struct OfflineLibraryView: View {
     }
 
     private var footnote: some View {
-        Text("Copies stay on this device. Deleting one, or clearing the library, leaves the bookmarks alone.")
+        Text("Copies stay on this device. Deleting one, or clearing the library, leaves saved-host bookmarks alone.")
             .font(.caption2)
             .foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)

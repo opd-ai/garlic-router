@@ -199,12 +199,9 @@ struct CoreAuditView: View {
             }
 
             if let readinessLastInterruptedPhase {
-                // The crash report is the authoritative interruption record:
-                // its "active probe" line names what the process actually
-                // trapped on, while the UserDefaults checkpoint can be stale
-                // (an older build's phase-only write, or writes lost on an
-                // ephemeral test device). When the crash is at least as fresh
-                // as the checkpoint, it leads the banner.
+                // The signal marker and timestamped audit checkpoint are
+                // correlated at launch. The signal-safe report deliberately
+                // does not attempt to collect a backtrace.
                 let checkpoint = I2PReadinessAudit.interruptedCheckpoint
                 let crash = I2PCrashReporter.lastCrashContext()
                 let crashLeads: Bool = {
@@ -212,7 +209,7 @@ struct CoreAuditView: View {
                     return checkpoint?.savedAt.map({ crash.date >= $0 }) ?? true
                 }()
                 if crashLeads, let crash, let probe = crash.activeProbe {
-                    Text("The process crashed during: \(probe). The checkpoint banner below may be stale — judge by the signal report.")
+                    Text("The process crashed during: \(probe). The signal record matches the saved probe checkpoint; see the device crash report for the full backtrace.")
                         .font(.caption2.weight(.medium))
                         .foregroundStyle(.orange)
                         .textSelection(.enabled)
@@ -225,9 +222,8 @@ struct CoreAuditView: View {
                         .font(.caption2)
                         .foregroundStyle(.orange)
                         .textSelection(.enabled)
-                    // If the process actually crashed mid-audit, the fatal-signal
-                    // handler persisted the exact faulting context — show its
-                    // header (signal + top stack frames) right under the banner.
+                    // Show the signal-safe marker and explain where the full
+                    // symbolicated stack can be found.
                     Text(I2PCrashReporter.diagnosticHead(maxFrames: 4))
                         .font(.system(.caption2, design: .monospaced))
                         .foregroundStyle(.orange)
@@ -508,7 +504,7 @@ struct CoreAuditView: View {
     /// regardless of which audit crashed — the readiness card's banner is
     /// gated on the readiness checkpoint, which is empty after a passing
     /// readiness audit, so a stability-audit crash would otherwise be
-    /// invisible in the UI even though the signal handler captured it.
+    /// invisible even though the signal marker is available.
     private func refreshCapturedCrash() {
         guard capturedCrash == nil,
               let context = I2PCrashReporter.lastCrashContext() else { return }
@@ -803,8 +799,8 @@ final class BackgroundTaskLease: @unchecked Sendable {
     }
 }
 
-/// One captured crash: when the process died, which audit probe was running
-/// (from the signal handler's report), and the report's header for display.
+/// One captured crash: when the process died, the matching audit checkpoint,
+/// and the safe diagnostic summary shown in the app.
 struct CapturedCrash {
     let capturedAt: Date
     let probe: String?

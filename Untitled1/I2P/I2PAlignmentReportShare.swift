@@ -30,24 +30,37 @@ enum I2PAlignmentReportShare {
     static let appName = "garlic-router"
 
     /// The share payload for the current report state.
+    ///
+    /// `rows` is what the screen is showing: when the report is filtered, the
+    /// export carries only those rows (and only their failing tests), so a
+    /// shared report never claims more than the reader sees.
     static func payload(results: [I2PCrossValidationResult],
                         lastRunAt: Date?,
+                        rows: [I2PSpecRow] = I2PSpecTruthTable.rows,
                         generatedAt: Date = Date(),
                         appVersion: String = I2PAlignmentReportShare.currentVersion()) -> I2PAlignmentReportSharePayload {
         I2PAlignmentReportSharePayload(
             subject: "\(appName) alignment report",
             text: text(results: results,
                        lastRunAt: lastRunAt,
+                       rows: rows,
                        generatedAt: generatedAt,
                        appVersion: appVersion))
+    }
+
+    /// The app's marketing version alone ('1.0'), as the bundle carries it.
+    /// The JSON export's file name uses this rather than `currentVersion`,
+    /// which adds the build number for the exported report's provenance line.
+    static func marketingVersion(from bundle: Bundle = .main) -> String {
+        let short = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        return (short ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// The app's marketing version and build number, as the bundle carries
     /// them, so an exported report says which build produced it.
     static func currentVersion(from bundle: Bundle = .main) -> String {
-        let short = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
         let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String
-        let version = (short ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let version = marketingVersion(from: bundle)
         let buildNumber = (build ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if !version.isEmpty && !buildNumber.isEmpty {
             return "\(version) (build \(buildNumber))"
@@ -63,6 +76,7 @@ enum I2PAlignmentReportShare {
     /// time, every truth-table row, then the failing tests.
     static func text(results: [I2PCrossValidationResult],
                      lastRunAt: Date?,
+                     rows: [I2PSpecRow] = I2PSpecTruthTable.rows,
                      generatedAt: Date = Date(),
                      appVersion: String = I2PAlignmentReportShare.currentVersion()) -> String {
         let coverage = I2PSpecTruthTable.coverage
@@ -97,12 +111,16 @@ enum I2PAlignmentReportShare {
         lines.append("")
 
         lines.append("Truth table — one line per requirement row")
-        for row in I2PSpecTruthTable.rows {
+        if rows.count != I2PSpecTruthTable.rows.count {
+            lines.append("  Showing \(rows.count) of \(I2PSpecTruthTable.rows.count) rows (filtered on screen).")
+        }
+        for row in rows {
             lines.append(rowLine(row, results: results))
         }
         lines.append("")
 
-        let failures = results.filter { !$0.passed }
+        let shownRowIDs = Set(rows.map(\.id))
+        let failures = results.filter { !$0.passed && shownRowIDs.contains($0.rowID) }
         if failures.isEmpty {
             lines.append(results.isEmpty
                          ? "Failing tests: the suite has not been run."

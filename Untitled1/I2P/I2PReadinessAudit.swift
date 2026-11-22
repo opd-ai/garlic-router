@@ -57,8 +57,8 @@ enum I2PReadinessAudit {
     static func runAll(
         onProgress: (String, I2PSelfTestResult?) async -> Void = { _, _ in }
     ) async -> [I2PSelfTestResult] {
-        // Checkpointing (per-probe, timestamped, plus the crash reporter's
-        // active-probe name) happens inside I2PProductionAudit.runAll itself.
+        // Per-probe timestamped checkpointing happens inside the shared audit
+        // engine; launch diagnostics associate it with a signal marker safely.
         let productionResults = await I2PProductionAudit.runAll { phase, result in
             await onProgress(phase, result)
         }

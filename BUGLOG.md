@@ -1965,25 +1965,58 @@ nothing.
 
 ## BUG-061 — Rare load-case stall in full-suite runs (open)
 
-- Component: `I2PSAMConformanceTest.loadTest` and whatever else in the process
-  competes with it.
-- Symptom: after BUG-059 and BUG-060, `SAM load: 3 concurrent streams` still
-  stalls about once in 25 full `--all` runs — a 20 s `readBytes` timeout on one
-  stream while the other two pass. The same case is 40/40 clean when run alone
-  (`SAM_ONLY=LOAD`), and 25 consecutive full runs in one batch were clean.
+- Component: `I2PSAMConformanceTest.loadTest` and possible cross-suite
+  interference.
+- Symptom: after BUG-059 and BUG-060, `SAM load: 3 concurrent streams` was
+  observed stalling about once in 25 full `--all` runs — a 20 s `readBytes`
+  timeout on one stream while the other two pass. The case passed 40/40 alone
+  (`SAM_ONLY=LOAD`) and had also passed an earlier batch of 25 full runs.
 - What is ruled out: session readiness (BUG-059), concurrent chunk sends
-  (BUG-060), lease resolution/publication waits, and the chunker/assembler
-  arithmetic. The failure's bridge log shows the sessions created and the other
-  pairs established, so it is a data-plane stall on one stream, not a setup
-  failure.
-- Not yet known: which frame is missing. The load case has `SAM_TRACE=1`
-  tracing ("pair N established", "stream N probe R ok", "bulk …"), but the one
-  failing run captured so far kept only the beginning of the bridge log.
-- Next step: run the full suite with `SAM_TRACE=1` in a loop and, on failure,
-  take the last "stream N probe R ok" index per stream — that names the first
-  missing frame. In parallel, check whether the global
-  `I2PRouterAppContext.shared` that several earlier suites construct (netdb,
-  transports, tunnel pool) leaves background work that competes with the load
-  phase, and give the self-test runner a teardown hook for it if so.
-- Status: **open** (rare; every deterministic suite passes, and the two causes
-  found so far are fixed).
+  (BUG-060), lease resolution/publication waits, and chunker/assembler
+  arithmetic. The failure's bridge log showed the sessions created and the
+  other pairs established, so it was a data-plane stall on one stream, not a
+  setup failure.
+- Investigation: the existing `SAM_TRACE=1` markers identify the last completed
+  probe per stream. The offline `I2PSelfTest.runAll()` path does not call the
+  production live-wiring path that accesses `I2PRouterAppContext.shared`, so a
+  shared app-context teardown hook is not justified by the standalone harness.
+- Latest verification: 130 consecutive traced full `--all` runs completed with
+  **269 passed, 0 failed** each; no load timeout or other failure reproduced.
+  No root cause for the earlier rare report is confirmed, so this remains open
+  rather than being marked fixed on stress-test results alone.
+- Next step: if the stall recurs, retain that run's `.probe-build/sam-trace-N.log`
+  and use the last `stream N probe R ok` marker per stream to identify the first
+  missing exchange; then inspect the corresponding garlic/tunnel path.
+- Status: **open** (not reproduced in the latest stress run; earlier ordered
+  chunk sends and other confirmed causes are fixed).
+
+
+
+## BUG-062 — HTTP response framing ignored CRLF headers and trusted hostile lengths
+
+- Component: `I2PEepsiteClient.swift` (`I2PHTTPResponse`, `I2PEepsiteExchange`).
+- Symptom: the header parser split a `String` on `"\r"` and `"\n"` as individual `Character`s. Swift treats CRLF as one grapheme, so the status line and headers stayed joined; `Content-Length` was not recognized. A negative length could reach `Data.prefix(-1)` and trap, declared lengths were ignored, and response bytes accumulated without a cap.
+- Fix: split headers with Foundation's newline character set; reject malformed, negative, conflicting and over-limit `Content-Length` values; cap headers at 64 KiB and the complete response at 8 MiB. The stream exchange stops accepting bytes beyond the cap and reports an inline response-stage error instead of continuing to allocate.
+- Regression tests: `I2PHTTPResponseSelfTest` covers hostile lengths, header/body limits, normal framing and partial responses; it is included in the app's self-test runner.
+- Verification: focused HTTP response suite **3/3 passed**; simulator app build and `build-for-testing` succeeded. The first full offline run reported 267 passed and 2 failed in router-status and peer-nickname suites, fixed in BUG-063 and BUG-064. The latest full offline run passed **269/269**. Simulator-hosted XCTest execution was blocked because CoreSimulator returned `Operation not permitted`.
+- Status: fixed.
+
+
+
+## BUG-063 — Lifetime tunnel totals missed separately built tunnels
+
+- Component: `I2PTunnelPool.adopt` and the router dashboard's lifetime totals.
+- Symptom: the lifetime built-tunnel count increased only in the pool's fill-loop completion path. Workflows that built a tunnel through `I2PTunnelBuilder` and then adopted it directly (including the live verification path) left the dashboard total too low.
+- Fix: count a tunnel when the pool adopts it, the shared ownership boundary for both workflows, and remove the fill-loop's separate increment so ordinary pool builds count once.
+- Regression tests: the pool lifecycle compares the lifetime total with successful build history; the router-status snapshot test builds and adopts a tunnel directly and checks the reported total.
+- Verification: latest full offline self-test run **269/269 passed**; simulator app build and `build-for-testing` succeeded.
+- Status: fixed.
+
+## BUG-064 — Peer nickname self-test ordered labels with inconsistent timestamps
+
+- Component: `I2PPeerNicknamesSelfTest` fixture.
+- Symptom: the test inserted a replacement label with a fixed 2023 timestamp after creating earlier labels with the current time, then expected the older timestamp to sort first. The assertion failed despite the store correctly sorting by `updatedAt`.
+- Fix: use deterministic, increasing timestamps for the test's initial label, second label and replacement; production persistence and sort behavior are unchanged.
+- Regression tests: the nickname persistence suite now passes and is included in the unit-test adapter.
+- Verification: latest full offline self-test run **269/269 passed**; simulator app build and `build-for-testing` succeeded.
+- Status: fixed.

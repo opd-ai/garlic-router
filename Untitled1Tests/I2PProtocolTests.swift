@@ -6,6 +6,8 @@
 //  file is only the adapter.
 //
 
+import Darwin
+import Foundation
 import Testing
 @testable import Untitled1
 
@@ -38,9 +40,32 @@ struct I2PProtocolTests {
         results += I2PIRCHistorySelfTest.runAll()
         results += I2PIRCSnoozeSelfTest.runAll()
         results += I2PSavedHostsSelfTest.runAll()
+        results += I2PEepsiteContentsSelfTest.runAll()
         results += I2PRouterPlainStatusSelfTest.runAll()
         results += I2PLiveInteropSelfTest.runAll()
+        results += I2PIRCServerBookSelfTest.runAll()
+        results += I2PPeerNicknamesSelfTest.runAll()
         let failed = results.filter { !$0.passed }
+        #expect(failed.isEmpty,
+                "failing checks: \(failed.map { "\($0.name) — \($0.detail)" })")
+    }
+
+    @Test func netDBEntryBrowserProjectionPasses() {
+        let failed = I2PNetDBEntriesSelfTest.runAll().filter { !$0.passed }
+        #expect(failed.isEmpty,
+                "failing checks: \(failed.map { "\($0.name) — \($0.detail)" })")
+    }
+
+    /// Tunnel-pool and router-status loopback suites cover the totals shown on
+    /// the dashboard as well as the live snapshot stream.
+    @Test func tunnelPoolSuitePasses() async {
+        let failed = await I2PTunnelSelfTest.runAll().filter { !$0.passed }
+        #expect(failed.isEmpty,
+                "failing checks: \(failed.map { "\($0.name) — \($0.detail)" })")
+    }
+
+    @Test func routerStatusSuitePasses() async {
+        let failed = await I2PRouterStatusSelfTest.runAll().filter { !$0.passed }
         #expect(failed.isEmpty,
                 "failing checks: \(failed.map { "\($0.name) — \($0.detail)" })")
     }
@@ -59,5 +84,25 @@ struct I2PProtocolTests {
             }
             #expect(row.testIDs.contains(testID), "\(rowID) does not list \(testID)")
         }
+    }
+
+    @Test func crashSignalRecordAndReportAreBoundedAndHonest() {
+        let signal = Int32(SIGABRT)
+        let validMarker = Data([UInt8(truncatingIfNeeded: signal)])
+        #expect(I2PCrashReporter.signalNumber(from: validMarker) == signal)
+        #expect(I2PCrashReporter.signalNumber(from: Data()) == nil)
+        #expect(I2PCrashReporter.signalNumber(from: Data([validMarker[0], 0])) == nil)
+        #expect(I2PCrashReporter.signalNumber(from: Data([0])) == nil)
+
+        let capturedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let report = I2PCrashReporter.formatSignalReport(
+            signalNumber: signal,
+            capturedAt: capturedAt,
+            activeProbe: "NTCP2 handshake"
+        )
+        #expect(report.contains("Signal \(signal) at 2023-11-14 22:13:20 +0000"))
+        #expect(report.contains("active probe: NTCP2 handshake"))
+        #expect(report.contains("Backtrace unavailable in the signal-safe report"))
+        #expect(!report.contains("thread: main"))
     }
 }

@@ -150,7 +150,10 @@ private final class SAMTestRig {
                 return hopNodeList.first { $0.routerHash == hash }?.router
             }
         )
-        let serverInstance = I2PSAMServer(core: core, port: 0, poolConfig: poolConfig)
+        let keyStore = I2PSAMKeyStore(
+            service: "\(Bundle.main.bundleIdentifier ?? "ai.opd.garlicrouter").sam-test.\(UUID().uuidString)")
+        let serverInstance = I2PSAMServer(core: core, port: 0, poolConfig: poolConfig,
+                                          keyStore: keyStore)
 
         self.buildHub = buildHub
         self.deliveryHub = deliveryHub
@@ -453,6 +456,7 @@ enum I2PSAMConformanceTest {
         await run("SAM STREAM CONNECT/ACCEPT end-to-end through tunnels", streamE2ETest)
         await run("SAM DATAGRAM SEND fragmentation + reassembly", datagramTest)
         await run("SAM RAW anonymous datagram delivery", rawTest)
+        await run("SAM persistent key store migrates legacy files into Keychain", keyStoreTest)
         await run("SAM session persistence (save/restore private keys)", persistenceTest)
         await run("SAM load: 3 concurrent streams · latency + throughput", loadTest)
         await run("SAM session parameters (SIGNATURE_TYPE / ENCRYPTION_TYPE)", parametersTest)
@@ -953,13 +957,53 @@ enum I2PSAMConformanceTest {
         return "RAW datagram delivered anonymously without a return destination"
     }
 
+    /// Legacy key files migrate only after a successful Keychain write, and
+    /// normal saves never leave private destination material on disk.
+    private static func keyStoreTest() async throws -> String {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sam-key-store-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let nickname = "legacy-\(UUID().uuidString)"
+        let service = "\(Bundle.main.bundleIdentifier ?? "ai.opd.garlicrouter").sam-test.\(UUID().uuidString)"
+        let store = I2PSAMKeyStore(directory: directory, service: service)
+        let legacyFile = directory.appendingPathComponent(
+            I2PCrypto.sha256(Data(nickname.utf8)).hex + ".key")
+        let legacyKey = I2PCrypto.randomBytes(64)
+        try Data(legacyKey.base64EncodedString().utf8).write(to: legacyFile)
+        defer {
+            try? store.remove(nickname: nickname)
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let migrated = try store.load(nickname: nickname)
+        guard migrated == legacyKey,
+              !FileManager.default.fileExists(atPath: legacyFile.path) else {
+            throw I2PSAMError.invalidCommand("legacy_key_migration_failed")
+        }
+
+        let replacement = I2PCrypto.randomBytes(64)
+        try store.save(nickname: nickname, privateKey: replacement)
+        guard try store.load(nickname: nickname) == replacement,
+              (try FileManager.default.contentsOfDirectory(atPath: directory.path)).isEmpty else {
+            throw I2PSAMError.invalidCommand("keychain_key_persistence_failed")
+        }
+        try store.remove(nickname: nickname)
+        guard try store.load(nickname: nickname) == nil else {
+            throw I2PSAMError.invalidCommand("keychain_key_removal_failed")
+        }
+        return "legacy key migrated and removed; new key persisted in Keychain without a plaintext file"
+    }
+
     /// Session persistence: PERSISTENT=true saves the destination's private
-    /// keys under the nickname; a later session with the same nickname
-    /// restores the same destination. Plain TRANSIENT stays fresh.
+    /// key in the Keychain; a later session with the same nickname restores the
+    /// same destination. Plain TRANSIENT stays fresh.
     private static func persistenceTest() async throws -> String {
         let rig = try SAMTestRig(label: "persist")
         rig.start()
-        defer { rig.stop() }
+        defer {
+            rig.stop()
+            try? rig.server.keyStore.remove(nickname: "p1")
+        }
         guard let port = await waitForPort(rig) else { throw I2PSAMError.timeout }
 
         let first = SAMTestClient()

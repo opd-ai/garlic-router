@@ -7,6 +7,7 @@
 
 import Foundation
 import CryptoKit
+import Security
 
 // MARK: - Destination keys
 
@@ -761,41 +762,112 @@ struct I2PSAMSessionDetail {
 // MARK: - Session key persistence
 
 /// Optional session persistence (PERSISTENT=true): destination private keys
-/// are saved under the session nickname so a re-created session restores the
-/// same destination across bridge restarts.
+/// are stored in the device-only Keychain under a hash of the session nickname.
+/// Legacy plaintext files are migrated on first access and removed only after
+/// the Keychain write succeeds.
 final class I2PSAMKeyStore {
     private let directory: URL
+    private let service: String
     private let lock = NSLock()
 
-    init(directory: URL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
-        .first!.appendingPathComponent("i2p-sam-keys", isDirectory: true)) {
-        self.directory = directory
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    init(directory: URL? = nil, service: String? = nil) {
+        let supportDirectory = FileManager.default.urls(for: .applicationSupportDirectory,
+                                                       in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        self.directory = directory ?? supportDirectory.appendingPathComponent("i2p-sam-keys",
+                                                                               isDirectory: true)
+        self.service = service ?? "\(Bundle.main.bundleIdentifier ?? "ai.opd.garlicrouter").sam-keys"
     }
 
-    /// Filenames are keyed on the nickname's SHA-256 so any nickname string
-    /// maps to exactly one file.
-    private func file(for nickname: String) -> URL {
-        directory.appendingPathComponent(I2PCrypto.sha256(Data(nickname.utf8)).hex + ".key")
+    /// The account is a one-way hash so user-provided nicknames are not stored
+    /// in the Keychain metadata.
+    private func account(for nickname: String) -> String {
+        I2PCrypto.sha256(Data(nickname.utf8)).hex
     }
 
-    func load(nickname: String) -> Data? {
+    private func query(for nickname: String) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account(for: nickname)
+        ]
+    }
+
+    private func legacyFile(for nickname: String) -> URL {
+        directory.appendingPathComponent(account(for: nickname) + ".key")
+    }
+
+    func load(nickname: String) throws -> Data? {
         lock.lock(); defer { lock.unlock() }
-        guard let raw = try? Data(contentsOf: file(for: nickname)),
-              let decoded = I2PSAMEncoding.normalizedBase64(String(decoding: raw, as: UTF8.self)) else {
-            return nil
+
+        var lookup = query(for: nickname)
+        lookup[kSecReturnData as String] = true
+        lookup[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: AnyObject?
+        let status = SecItemCopyMatching(lookup as CFDictionary, &result)
+        if status == errSecSuccess {
+            guard let data = result as? Data, data.count == 64 else {
+                throw I2PSAMError.invalidCommand("persistent_key_store_invalid_data")
+            }
+            return data
         }
+        guard status == errSecItemNotFound else {
+            throw I2PSAMError.invalidCommand("persistent_key_store_unavailable")
+        }
+
+        let legacyURL = legacyFile(for: nickname)
+        guard FileManager.default.fileExists(atPath: legacyURL.path) else { return nil }
+        let raw = try Data(contentsOf: legacyURL)
+        guard let decoded = I2PSAMEncoding.normalizedBase64(String(decoding: raw, as: UTF8.self)),
+              decoded.count == 64 else {
+            throw I2PSAMError.invalidCommand("persistent_key_store_invalid_data")
+        }
+        try saveInKeychain(nickname: nickname, privateKey: decoded)
+        try FileManager.default.removeItem(at: legacyURL)
         return decoded
     }
 
-    func save(nickname: String, privateKey: Data) {
+    func save(nickname: String, privateKey: Data) throws {
         lock.lock(); defer { lock.unlock() }
-        try? privateKey.base64EncodedString().write(to: file(for: nickname),
-                                                    atomically: true, encoding: .utf8)
+        try saveInKeychain(nickname: nickname, privateKey: privateKey)
     }
 
-    func remove(nickname: String) {
+    private func saveInKeychain(nickname: String, privateKey: Data) throws {
+        guard privateKey.count == 64 else {
+            throw I2PSAMError.invalidCommand("persistent_key_store_invalid_data")
+        }
+        let key = query(for: nickname)
+        let attributes: [String: Any] = [
+            kSecValueData as String: privateKey,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        ]
+        let updateStatus = SecItemUpdate(key as CFDictionary, attributes as CFDictionary)
+        if updateStatus == errSecSuccess { return }
+        guard updateStatus == errSecItemNotFound else {
+            throw I2PSAMError.invalidCommand("persistent_key_store_unavailable")
+        }
+
+        var addQuery = key
+        addQuery[kSecValueData as String] = privateKey
+        addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+        if addStatus == errSecSuccess { return }
+        if addStatus == errSecDuplicateItem,
+           SecItemUpdate(key as CFDictionary, attributes as CFDictionary) == errSecSuccess {
+            return
+        }
+        throw I2PSAMError.invalidCommand("persistent_key_store_unavailable")
+    }
+
+    func remove(nickname: String) throws {
         lock.lock(); defer { lock.unlock() }
-        try? FileManager.default.removeItem(at: file(for: nickname))
+        let status = SecItemDelete(query(for: nickname) as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw I2PSAMError.invalidCommand("persistent_key_store_unavailable")
+        }
+        let legacyURL = legacyFile(for: nickname)
+        if FileManager.default.fileExists(atPath: legacyURL.path) {
+            try FileManager.default.removeItem(at: legacyURL)
+        }
     }
 }

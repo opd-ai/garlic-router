@@ -37,11 +37,8 @@ enum I2PSpecConformanceAudit {
         ]
         var results: [I2PSelfTestResult] = []
         for (name, probe) in probes {
-            // Register the active probe with the shared checkpoint engine and
-            // the fatal-signal handler BEFORE it runs: a mid-probe trap then
-            // names this probe in its own persisted crash report instead of
-            // landing as "outside a named probe".
-            I2PProductionAudit.setActiveProbe(name)
+            // Persist the probe before running it so launch-time diagnostics
+            // can associate a fresh checkpoint with a fatal-signal marker.
             I2PProductionAudit.writeCheckpoint(name)
             await onProgress?(name, nil)
             do {
@@ -57,7 +54,6 @@ enum I2PSpecConformanceAudit {
         }
         // The run completed (probe errors folded into failed results) — retire
         // the checkpoint so no stale banner survives the session.
-        I2PProductionAudit.setActiveProbe(nil)
         I2PProductionAudit.writeCheckpoint(nil)
         let passing = results.filter(\.passed).count
         let verdict = I2PSelfTestResult(

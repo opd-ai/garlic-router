@@ -22,6 +22,14 @@ struct RouterDashboardView: View {
     /// single-consumer sequence, so it is attached once and never cancelled
     /// (a pushed detail screen does not stop the dashboard's readings).
     @State private var streamTask: Task<Void, Never>?
+    /// The sheet showing the RouterInfo this router publishes to the floodfills.
+    @State private var showsPublishedRouterInfo = false
+    /// The sheet browsing every entry the netdb cache holds.
+    @State private var showsNetDBEntries = false
+    /// The order the session list is drawn in. Seeded from the run's store so
+    /// the choice survives leaving and re-entering the tab, and written back on
+    /// every change so it lasts for the life of the app run.
+    @State private var sessionSort: I2PSessionSortOrder = I2PSessionSortStore.shared.current
 
     private let accent = Color(red: 0.47, green: 0.44, blue: 0.97)
     private let background = Color(red: 0.055, green: 0.06, blue: 0.09)
@@ -36,12 +44,15 @@ struct RouterDashboardView: View {
                         statusCard(snapshot)
                         eepsiteBrowserCard
                         participationCard
+                        publishedRouterInfoCard
                         statGrid(snapshot)
+                        networkDatabaseCard(snapshot)
                         liveInteropCard(snapshot)
                         b33HostsCard
                         peersCard(snapshot)
                         tunnelsCard(snapshot)
                         throughputCard(snapshot)
+                        lifetimeCard(snapshot)
                         footerText(snapshot)
                     } else if isStarting {
                         startingCard
@@ -50,6 +61,8 @@ struct RouterDashboardView: View {
                         stoppedCard
                         eepsiteBrowserCard
                         participationCard
+                        publishedRouterInfoCard
+                        networkDatabaseCard(nil)
                         b33HostsCard
                     }
                 }
@@ -61,6 +74,12 @@ struct RouterDashboardView: View {
             .navigationTitle("Router")
             .navigationBarTitleDisplayMode(.large)
             .onAppear(perform: attachIfRunning)
+            .sheet(isPresented: $showsPublishedRouterInfo) {
+                PublishedRouterInfoView()
+            }
+            .sheet(isPresented: $showsNetDBEntries) {
+                NetDBEntriesView()
+            }
         }
         .preferredColorScheme(.dark)
     }
@@ -302,6 +321,56 @@ struct RouterDashboardView: View {
         .accessibilityLabel("\(title): \(value), \(caption)")
     }
 
+    // MARK: - Network database
+
+    /// The netdb cache browser: every RouterInfo and LeaseSet this router
+    /// holds, by hash. The card names how many there are and how many of them
+    /// are floodfills, or — while the router is off — what the screen shows.
+    private func networkDatabaseCard(_ snapshot: I2PRouterStatusSnapshot?) -> some View {
+        Button {
+            showsNetDBEntries = true
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "cylinder.split.1x2")
+                    .font(.subheadline)
+                    .foregroundStyle(accent)
+                    .frame(width: 22)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Network database")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                    Text("Cached RouterInfos and LeaseSets by hash")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                    Text(netDBLine(snapshot))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                }
+                Spacer(minLength: 6)
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(16)
+            .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 18))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Network database")
+        .accessibilityValue(netDBLine(snapshot))
+        .accessibilityHint("Opens every cached RouterInfo and LeaseSet")
+    }
+
+    private func netDBLine(_ snapshot: I2PRouterStatusSnapshot?) -> String {
+        guard let snapshot else { return "Browse the cached entries" }
+        let total = snapshot.routerInfoCount + snapshot.leaseSetCount
+        return "\(I2PRouterPlainStatus.count(total, "entry")) · \(I2PRouterPlainStatus.count(snapshot.floodfillCount, "floodfill"))"
+    }
+
     // MARK: - Live interoperability
 
     /// The transport card's way into the live probe: what the last run of
@@ -465,31 +534,137 @@ struct RouterDashboardView: View {
         .accessibilityHint("Opens the participation controls")
     }
 
+    // MARK: - Published RouterInfo
+
+    /// The RouterInfo this router advertises to the floodfills. The card names
+    /// the publication state; the sheet behind it shows the identity, the
+    /// published addresses, the capabilities and options, and whether the
+    /// stored signature verifies. Until the router has bootstrapped and
+    /// published, the card says so instead of implying an advertisement exists.
+    private var publishedRouterInfoCard: some View {
+        let publishedAt = I2PRouterAppContext.shared.lastRouterInfoPublishedAt
+        let isPublished = publishedAt != nil
+        return Button {
+            showsPublishedRouterInfo = true
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "person.text.rectangle")
+                    .font(.subheadline)
+                    .foregroundStyle(accent)
+                    .frame(width: 22)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Published RouterInfo")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                    Text("What this router advertises to the floodfills")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                    Text(I2PPublishedRouterInfoText.publishedStateLine(publishedAt))
+                        .font(.caption2)
+                        .foregroundStyle(isPublished ? accent : Color.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                }
+                Spacer(minLength: 6)
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(16)
+            .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 18))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Published RouterInfo")
+        .accessibilityValue(I2PPublishedRouterInfoText.publishedStateLine(publishedAt))
+        .accessibilityHint("Opens the RouterInfo this router publishes to the floodfills")
+    }
+
     // MARK: - Peers & sessions
 
     private func peersCard(_ snapshot: I2PRouterStatusSnapshot) -> some View {
-        card(title: "Peers & Sessions") {
-            if snapshot.peers.isEmpty {
+        let pins = I2PPeerPins.shared.pinnedIdentities()
+        // The user's own labels, keyed by identity: a labelled row reads by its
+        // name with the shortened hash one line below, an unlabelled one is
+        // exactly the row it always was.
+        let nicknames = I2PPeerNicknames.shared.labels()
+        let peers = I2PSessionSorter.sorted(snapshot.peers, by: sessionSort, pinned: pins)
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Text("Peers & Sessions")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
+                    .accessibilityAddTraits(.isHeader)
+                Spacer(minLength: 6)
+                sessionSortControl
+            }
+            Text(I2PPeerPinFormat.orderLine(sessionSort, pinnedCount: pins.count))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+            if peers.isEmpty {
                 Label("No peer connected yet. Peers appear here as soon as a session establishes — the router keeps trying while it runs.",
                       systemImage: "antenna.radiowaves.left.and.right")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
-                ForEach(snapshot.peers) { peer in
+                ForEach(peers) { peer in
                     NavigationLink {
                         PeerDetailView(summary: peer)
                     } label: {
-                        peerRow(peer)
+                        peerRow(peer,
+                                pinned: pins.contains(peer.id.lowercased()),
+                                nickname: nicknames[peer.id.lowercased()])
                     }
                     .buttonStyle(.plain)
                     .accessibilityHint("Opens this peer's details")
                 }
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 18))
     }
 
-    private func peerRow(_ peer: I2PPeerSummary) -> some View {
+    /// The session list's sort control: four orders, the one in effect marked
+    /// in the menu. Picking one applies it at once and keeps it for this run.
+    private var sessionSortControl: some View {
+        Menu {
+            ForEach(I2PSessionSortOrder.allCases) { order in
+                Button {
+                    sessionSort = order
+                    I2PSessionSortStore.shared.current = order
+                } label: {
+                    Label {
+                        Text(order.title)
+                    } icon: {
+                        Image(systemName: order == sessionSort ? "checkmark" : order.systemImage)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "arrow.up.arrow.down")
+                    .font(.caption2.weight(.semibold))
+                Text("Sort")
+                    .font(.caption2.weight(.medium))
+            }
+            .foregroundStyle(accent)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(accent.opacity(0.14), in: Capsule())
+        }
+        .accessibilityLabel("Sort sessions")
+        .accessibilityValue(sessionSort.title)
+        .accessibilityHint("Orders the session list by session start, bytes received, bytes sent or peer hash")
+    }
+
+    private func peerRow(_ peer: I2PPeerSummary, pinned: Bool, nickname: String?) -> some View {
         HStack(spacing: 10) {
             Text(peer.transport)
                 .font(.caption2.weight(.bold))
@@ -498,12 +673,40 @@ struct RouterDashboardView: View {
                 .padding(.vertical, 3)
                 .background(accent.opacity(0.14), in: RoundedRectangle(cornerRadius: 7))
             VStack(alignment: .leading, spacing: 2) {
-                Text(formatHash(peer.id))
-                    .font(.footnote.weight(.medium))
-                    .foregroundStyle(.primary)
-                Text("\(formatBytes(peer.bytesIn)) in · \(formatBytes(peer.bytesOut)) out")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 6) {
+                    Text(I2PPeerNicknameFormat.displayName(label: nickname, identityHex: peer.id))
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    if pinned {
+                        pinBadge
+                    }
+                }
+                HStack(spacing: 6) {
+                    // A labelled peer keeps its shortened hash on the line below
+                    // its name, so it is still identifiable at a glance.
+                    if let hashLine = I2PPeerNicknameFormat.hashLine(label: nickname,
+                                                                     identityHex: peer.id) {
+                        Text(hashLine)
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .layoutPriority(1)
+                            .accessibilityLabel("Identity \(hashLine)")
+                        Text("·")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                            .accessibilityHidden(true)
+                    }
+                    Text("\(formatBytes(peer.bytesIn)) in · \(formatBytes(peer.bytesOut)) out")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                    if let flag = peer.trafficFlag {
+                        trafficFlagBadge(flag)
+                    }
+                }
             }
             Spacer()
             VStack(alignment: .trailing, spacing: 2) {
@@ -530,6 +733,42 @@ struct RouterDashboardView: View {
         }
         .padding(.vertical, 2)
         .accessibilityElement(children: .combine)
+    }
+
+    /// The small pin a peer carries once it is pinned from its inspector: the
+    /// row is one of the rows held above the rest of the list, whatever order is
+    /// in effect.
+    private var pinBadge: some View {
+        HStack(spacing: 3) {
+            Image(systemName: I2PPeerPinFormat.badgeSystemImage)
+                .font(.system(size: 9, weight: .bold))
+                .accessibilityHidden(true)
+            Text(I2PPeerPinFormat.badgeTitle)
+                .font(.caption2.weight(.bold))
+        }
+        .foregroundStyle(accent)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(accent.opacity(0.16), in: RoundedRectangle(cornerRadius: 6))
+        .accessibilityLabel("Pinned peer")
+    }
+
+    /// A session that has gone quiet or started flooding, named on its row. The
+    /// badge is derived from the peer's traffic history on every snapshot, so it
+    /// keeps no state of its own and disappears when the traffic is normal again.
+    private func trafficFlagBadge(_ flag: I2PPeerTrafficFlag) -> some View {
+        HStack(spacing: 3) {
+            Image(systemName: I2PPeerTrafficFlagFormat.badgeSystemImage(flag))
+                .font(.system(size: 9, weight: .bold))
+                .accessibilityHidden(true)
+            Text(I2PPeerTrafficFlagFormat.badgeTitle(flag))
+                .font(.caption2.weight(.bold))
+        }
+        .foregroundStyle(warnOrange)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(warnOrange.opacity(0.16), in: RoundedRectangle(cornerRadius: 6))
+        .accessibilityLabel("\(I2PPeerTrafficFlagFormat.badgeTitle(flag)) peer")
     }
 
     private func formatBytes(_ bytes: Int) -> String {
@@ -677,6 +916,55 @@ struct RouterDashboardView: View {
             .frame(maxWidth: .infinity)
     }
 
+    // MARK: - Lifetime totals
+
+    /// What this run of the router has done since it started: cumulative
+    /// traffic, sessions, tunnels and I2NP messages, recomputed from the status
+    /// engine on every reading. Deliberately quiet — no sparkline, no axis and
+    /// no accent — so it stays a summary under the live cards instead of
+    /// competing with the transport and throughput readings above it.
+    private func lifetimeCard(_ snapshot: I2PRouterStatusSnapshot) -> some View {
+        let totals = snapshot.lifetime
+        return card(title: "Lifetime totals") {
+            LazyVGrid(columns: [GridItem(.flexible(), alignment: .leading),
+                                GridItem(.flexible(), alignment: .leading)],
+                      spacing: 12) {
+                ForEach(totals.figures) { figure in
+                    lifetimeFigure(figure)
+                }
+            }
+            Text(I2PRouterLifetimeTotals.caption)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Lifetime totals")
+        .accessibilityValue(totals.accessibilitySummary)
+        .accessibilityAddTraits(.updatesFrequently)
+    }
+
+    private func lifetimeFigure(_ figure: I2PRouterLifetimeTotals.Figure) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(figure.title)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+            Text(figure.value)
+                .font(.system(.subheadline, design: .monospaced).weight(.medium))
+                .foregroundStyle(.primary.opacity(0.88))
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+            Text(figure.caption)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
     // MARK: - Shared card style
 
     private func card(title: String, @ViewBuilder content: () -> some View) -> some View {
@@ -696,8 +984,7 @@ struct RouterDashboardView: View {
     // MARK: - Formatting
 
     private func formatHash(_ hex: String) -> String {
-        guard hex.count > 20 else { return hex }
-        return "\(hex.prefix(10))…\(hex.suffix(10))"
+        I2PPeerNicknameFormat.shortHash(hex)
     }
 
     private func countdownText(_ seconds: TimeInterval) -> String {

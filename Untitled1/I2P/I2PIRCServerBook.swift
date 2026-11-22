@@ -2,12 +2,13 @@
 //  I2PIRCServerBook.swift
 //  The IRC servers the user keeps: a display name, the I2P address, the port,
 //  the nick to register with, the channels to join on connect and an optional
-//  server password. Persisted across launches in user defaults, like the
-//  browser's saved hosts.
+//  server password. Server details live in user defaults; passwords live in the
+//  device-only Keychain.
 //
 
 import Foundation
 import Combine
+import Security
 
 // MARK: - Entry
 
@@ -79,6 +80,85 @@ struct I2PIRCServerEntry: Codable, Identifiable, Equatable {
         guard port > 0 else { return "Pick a port between 1 and 65535." }
         return nil
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, host, port, nick, password, channels
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        name = try values.decode(String.self, forKey: .name)
+        host = try values.decode(String.self, forKey: .host)
+        port = try values.decode(UInt16.self, forKey: .port)
+        nick = try values.decode(String.self, forKey: .nick)
+        password = try values.decodeIfPresent(String.self, forKey: .password) ?? ""
+        channels = try values.decode([String].self, forKey: .channels)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(id, forKey: .id)
+        try values.encode(name, forKey: .name)
+        try values.encode(host, forKey: .host)
+        try values.encode(port, forKey: .port)
+        try values.encode(nick, forKey: .nick)
+        try values.encode(channels, forKey: .channels)
+        // Passwords are intentionally excluded; I2PIRCServerBook stores them in Keychain.
+    }
+}
+
+protocol I2PIRCServerPasswordStore {
+    func password(account: String) -> String?
+    func setPassword(_ password: String, account: String) -> Bool
+    func deletePassword(account: String) -> Bool
+}
+
+final class I2PIRCServerPasswordKeychain: I2PIRCServerPasswordStore {
+    static let shared = I2PIRCServerPasswordKeychain()
+    private let service = "i2p.irc.server-password"
+
+    func password(account: String) -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var result: AnyObject?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    func setPassword(_ password: String, account: String) -> Bool {
+        let attributes: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        guard let data = password.data(using: .utf8) else { return false }
+        let update: [String: Any] = [kSecValueData as String: data]
+        let status = SecItemUpdate(attributes as CFDictionary, update as CFDictionary)
+        if status == errSecSuccess { return true }
+        guard status == errSecItemNotFound else { return false }
+
+        var query = attributes
+        query[kSecValueData as String] = data
+        query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        return SecItemAdd(query as CFDictionary, nil) == errSecSuccess
+    }
+
+    func deletePassword(account: String) -> Bool {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        let status = SecItemDelete(query as CFDictionary)
+        return status == errSecSuccess || status == errSecItemNotFound
+    }
 }
 
 // MARK: - Server book
@@ -89,20 +169,30 @@ final class I2PIRCServerBook: ObservableObject {
     static let defaultsKey = "i2p.irc.servers"
 
     @Published private(set) var entries: [I2PIRCServerEntry] = []
+    @Published private(set) var didDiscardLegacyPasswords = false
 
     private let defaults: UserDefaults
     private let storageKey: String
+    private let passwordStore: I2PIRCServerPasswordStore
 
     init(defaults: UserDefaults = .standard,
-         storageKey: String = I2PIRCServerBook.defaultsKey) {
+         storageKey: String = I2PIRCServerBook.defaultsKey,
+         passwordStore: I2PIRCServerPasswordStore = I2PIRCServerPasswordKeychain.shared) {
         self.defaults = defaults
         self.storageKey = storageKey
-        self.entries = Self.load(defaults: defaults, key: storageKey)
+        self.passwordStore = passwordStore
+        let loaded = Self.load(defaults: defaults, key: storageKey, passwordStore: passwordStore)
+        self.entries = loaded.entries
+        self.didDiscardLegacyPasswords = loaded.discardedLegacyPasswords
     }
 
     func entry(_ id: UUID?) -> I2PIRCServerEntry? {
         guard let id else { return nil }
         return entries.first { $0.id == id }
+    }
+
+    func dismissPasswordMigrationWarning() {
+        didDiscardLegacyPasswords = false
     }
 
     func contains(host: String, nick: String) -> Bool {
@@ -123,6 +213,14 @@ final class I2PIRCServerBook: ObservableObject {
         cleaned.host = entry.host.trimmingCharacters(in: .whitespacesAndNewlines)
         cleaned.nick = entry.nick.trimmingCharacters(in: .whitespacesAndNewlines)
         cleaned.channels = Self.channels(from: entry.channels.joined(separator: ","))
+        let account = cleaned.id.uuidString
+        if cleaned.password.isEmpty {
+            if entries.contains(where: { $0.id == cleaned.id }) {
+                guard passwordStore.deletePassword(account: account) else { return false }
+            }
+        } else {
+            guard passwordStore.setPassword(cleaned.password, account: account) else { return false }
+        }
         if let index = entries.firstIndex(where: { $0.id == cleaned.id }) {
             entries[index] = cleaned
         } else {
@@ -132,11 +230,13 @@ final class I2PIRCServerBook: ObservableObject {
         return true
     }
 
-    func remove(_ id: UUID) {
-        let before = entries.count
+    @discardableResult
+    func remove(_ id: UUID) -> Bool {
+        guard entries.contains(where: { $0.id == id }),
+              passwordStore.deletePassword(account: id.uuidString) else { return false }
         entries.removeAll { $0.id == id }
-        guard entries.count != before else { return }
         persist()
+        return true
     }
 
     // MARK: Channel list
@@ -166,16 +266,44 @@ final class I2PIRCServerBook: ObservableObject {
     // MARK: Persistence
 
     private func persist() {
-        guard let data = try? JSONEncoder().encode(entries) else { return }
-        defaults.set(data, forKey: storageKey)
+        Self.persist(entries, defaults: defaults, key: storageKey)
     }
 
-    private static func load(defaults: UserDefaults, key: String) -> [I2PIRCServerEntry] {
+    private static func persist(_ entries: [I2PIRCServerEntry], defaults: UserDefaults, key: String) {
+        guard let data = try? JSONEncoder().encode(entries) else { return }
+        defaults.set(data, forKey: key)
+    }
+
+    private static func load(defaults: UserDefaults,
+                             key: String,
+                             passwordStore: I2PIRCServerPasswordStore) -> (entries: [I2PIRCServerEntry], discardedLegacyPasswords: Bool) {
         guard let data = defaults.data(forKey: key),
-              let decoded = try? JSONDecoder().decode([I2PIRCServerEntry].self, from: data) else {
-            return []
+              var decoded = try? JSONDecoder().decode([I2PIRCServerEntry].self, from: data) else {
+            return ([], false)
         }
-        return decoded
+        var migratedLegacyPasswords = false
+        var discardedLegacyPasswords = false
+        for index in decoded.indices {
+            let account = decoded[index].id.uuidString
+            let legacyPassword = decoded[index].password
+            if legacyPassword.isEmpty {
+                decoded[index].password = passwordStore.password(account: account) ?? ""
+            } else {
+                let stored = passwordStore.setPassword(legacyPassword, account: account)
+                decoded[index].password = stored
+                    ? legacyPassword
+                    : (passwordStore.password(account: account) ?? "")
+                migratedLegacyPasswords = true
+                if !stored { discardedLegacyPasswords = true }
+            }
+        }
+        // Always scrub legacy values from defaults, even when Keychain is
+        // unavailable. In that case the credential is discarded rather than
+        // retained as plaintext; the next save can store a new value securely.
+        if migratedLegacyPasswords {
+            persist(decoded, defaults: defaults, key: key)
+        }
+        return (decoded, discardedLegacyPasswords)
     }
 }
 
@@ -197,21 +325,29 @@ enum I2PIRCServerBookSelfTest {
             let suite = "i2p.irc.serverBook.selfTest"
             let defaults = UserDefaults(suiteName: suite) ?? .standard
             defaults.removePersistentDomain(forName: suite)
-            let store = I2PIRCServerBook(defaults: defaults, storageKey: "servers")
+            let passwordStore = I2PIRCServerBookMemoryPasswordStore()
+            let store = I2PIRCServerBook(defaults: defaults,
+                                         storageKey: "servers",
+                                         passwordStore: passwordStore)
 
             let valid = I2PIRCServerEntry(name: "  Postman  ",
                                           host: " irc.postman.i2p ",
                                           port: 6667,
                                           nick: " tester ",
+                                          password: "test-only-password",
                                           channels: ["#i2p"])
             guard store.save(valid) else { throw I2PWireError.invalidFormat }
             guard let saved = store.entries.first,
                   saved.name == "Postman",
                   saved.host == "irc.postman.i2p",
                   saved.nick == "tester",
+                   saved.password == "test-only-password",
                   saved.displayName == "Postman",
                   saved.address == "irc.postman.i2p",
-                  store.entries.count == 1 else {
+                  store.entries.count == 1,
+                   passwordStore.password(account: valid.id.uuidString) == "test-only-password",
+                   let persisted = defaults.data(forKey: "servers"),
+                   String(data: persisted, encoding: .utf8)?.contains("test-only-password") == false else {
                 throw I2PWireError.invalidFormat
             }
             // A custom port is part of the address line.
@@ -240,17 +376,87 @@ enum I2PIRCServerBookSelfTest {
                 throw I2PWireError.invalidFormat
             }
             // The list survives a relaunch, and removal sticks.
-            let reopened = I2PIRCServerBook(defaults: defaults, storageKey: "servers")
+            let reopened = I2PIRCServerBook(defaults: defaults,
+                                           storageKey: "servers",
+                                           passwordStore: passwordStore)
             guard reopened.entries.count == 2,
-                  reopened.entry(custom.id)?.name == "Renamed" else {
+                  reopened.entry(custom.id)?.name == "Renamed",
+                   reopened.entry(valid.id)?.password == "test-only-password" else {
                 throw I2PWireError.invalidFormat
             }
             reopened.remove(custom.id)
-            guard I2PIRCServerBook(defaults: defaults, storageKey: "servers").entries.count == 1 else {
+            guard I2PIRCServerBook(defaults: defaults,
+                                  storageKey: "servers",
+                                  passwordStore: passwordStore).entries.count == 1 else {
                 throw I2PWireError.invalidFormat
             }
             defaults.removePersistentDomain(forName: suite)
             return "trimmed entry saved and persisted; an edit replaces in place; clear-net host, bad nick and port 0 refused"
+        }
+
+        run("irc · legacy server passwords migrate out of user defaults") {
+            let suite = "i2p.irc.serverBook.migration.\(UUID().uuidString)"
+            guard let defaults = UserDefaults(suiteName: suite) else {
+                throw I2PWireError.invalidFormat
+            }
+            defer { defaults.removePersistentDomain(forName: suite) }
+
+            let id = UUID()
+            let secret = "legacy-test-password"
+            let legacy: [[String: Any]] = [[
+                "id": id.uuidString,
+                "name": "Legacy",
+                "host": "irc.legacy.i2p",
+                "port": 6667,
+                "nick": "tester",
+                "password": secret,
+                "channels": ["#i2p"]
+            ]]
+            defaults.set(try JSONSerialization.data(withJSONObject: legacy), forKey: "servers")
+            let passwordStore = I2PIRCServerBookMemoryPasswordStore()
+            let migrated = I2PIRCServerBook(defaults: defaults,
+                                             storageKey: "servers",
+                                             passwordStore: passwordStore)
+            guard migrated.entry(id)?.password == secret,
+                  passwordStore.password(account: id.uuidString) == secret,
+                  let scrubbed = defaults.data(forKey: "servers"),
+                  let scrubbedText = String(data: scrubbed, encoding: .utf8),
+                  !scrubbedText.contains(secret),
+                  !scrubbedText.contains("\"password\"") else {
+                throw I2PWireError.invalidFormat
+            }
+            let reopened = I2PIRCServerBook(defaults: defaults,
+                                             storageKey: "servers",
+                                             passwordStore: passwordStore)
+            guard reopened.entry(id)?.password == secret,
+                  reopened.remove(id),
+                  passwordStore.password(account: id.uuidString) == nil else {
+                throw I2PWireError.invalidFormat
+            }
+
+            let blockedSuite = "i2p.irc.serverBook.blocked.\(UUID().uuidString)"
+            guard let blockedDefaults = UserDefaults(suiteName: blockedSuite) else {
+                throw I2PWireError.invalidFormat
+            }
+            defer { blockedDefaults.removePersistentDomain(forName: blockedSuite) }
+            blockedDefaults.set(try JSONSerialization.data(withJSONObject: legacy), forKey: "servers")
+            let blockedStore = I2PIRCServerBookMemoryPasswordStore(acceptsWrites: false)
+            let blocked = I2PIRCServerBook(defaults: blockedDefaults,
+                                            storageKey: "servers",
+                                            passwordStore: blockedStore)
+            guard blocked.entry(id)?.password.isEmpty == true,
+                  blocked.didDiscardLegacyPasswords,
+                  let scrubbedAfterFailure = blockedDefaults.data(forKey: "servers"),
+                  String(data: scrubbedAfterFailure, encoding: .utf8)?.contains(secret) == false,
+                  blocked.save(I2PIRCServerEntry(host: "irc.new.i2p",
+                                                 nick: "tester",
+                                                 password: "blocked-write")) == false,
+                  blocked.entries.count == 1 else {
+                throw I2PWireError.invalidFormat
+            }
+            blocked.dismissPasswordMigrationWarning()
+            guard !blocked.didDiscardLegacyPasswords else { throw I2PWireError.invalidFormat }
+            return "legacy password moved to Keychain, omitted from defaults, restored after reopen and removed with its server; failed migration scrubs plaintext, warns the user and failed writes are refused"
         }
 
         run("irc · channel list parsing normalizes names") {
@@ -265,6 +471,30 @@ enum I2PIRCServerBookSelfTest {
         }
 
         return results
+    }
+}
+
+private final class I2PIRCServerBookMemoryPasswordStore: I2PIRCServerPasswordStore {
+    private var values: [String: String] = [:]
+    private let acceptsWrites: Bool
+
+    init(acceptsWrites: Bool = true) {
+        self.acceptsWrites = acceptsWrites
+    }
+
+    func password(account: String) -> String? {
+        values[account]
+    }
+
+    func setPassword(_ password: String, account: String) -> Bool {
+        guard acceptsWrites else { return false }
+        values[account] = password
+        return true
+    }
+
+    func deletePassword(account: String) -> Bool {
+        values.removeValue(forKey: account)
+        return true
     }
 }
 

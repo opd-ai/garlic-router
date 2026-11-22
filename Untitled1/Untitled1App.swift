@@ -7,9 +7,8 @@ import SwiftUI
 @main
 struct Untitled1App: App {
     init() {
-        // Install fatal-signal handlers before any audit or transport work so
-        // a crash anywhere — including mid-audit — persists its backtrace for
-        // the next launch's crash-diagnostics surface.
+        // Install signal-safe fatal-signal handlers before audit or transport
+        // work so a minimal marker is available to next-launch diagnostics.
         I2PCrashReporter.install()
     }
 

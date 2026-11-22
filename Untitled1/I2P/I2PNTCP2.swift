@@ -662,6 +662,13 @@ final class NTCP2Transport {
     /// advertise an address is what a NAT or firewall looks like from here —
     /// and a count above zero with no builds is a real selection finding.
     private var acceptedInboundConnections = 0
+    /// Lifetime totals for the dashboard's totals card: the bytes carried by
+    /// sessions that have already closed, banked when the session ends so the
+    /// cumulative figures never fall when a peer hangs up. Live sessions add
+    /// their own running counters on top.
+    private var closedSessionBytesIn = 0
+    private var closedSessionBytesOut = 0
+    private var establishedSessionTotal = 0
 
     /// TCP connections the listener has accepted since launch.
     var inboundConnectionCount: Int {
@@ -812,6 +819,28 @@ final class NTCP2Transport {
         return sessions.count
     }
 
+    /// Cumulative session totals since this transport started: every closed
+    /// session's bytes banked at close plus the live sessions' running
+    /// counters, and how many sessions reached the established state. Memory
+    /// only — the dashboard's totals card reads them and nothing persists.
+    ///
+    /// The session counters are read directly under this transport's lock
+    /// (rather than hopping onto a session's own queue) for the reason
+    /// `sessionSummaries` does: a session's queue calls back into this
+    /// transport on establish and close, so waiting on it while holding this
+    /// lock would invert the two.
+    func lifetimeTotals() -> (bytesIn: Int, bytesOut: Int, sessions: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        var bytesIn = closedSessionBytesIn
+        var bytesOut = closedSessionBytesOut
+        for session in sessions {
+            bytesIn += session.bytesIn
+            bytesOut += session.bytesOut
+        }
+        return (bytesIn, bytesOut, establishedSessionTotal)
+    }
+
     /// Per-peer session readings for the peer inspector (established sessions only,
     /// deduplicated by router hash).
     func sessionSummaries() -> [(hash: Data, establishedAt: Date, bytesIn: Int, bytesOut: Int)] {
@@ -897,11 +926,12 @@ final class NTCP2Transport {
 
 extension NTCP2Transport: NTCP2SessionDelegate {
     func session(_ session: NTCP2Session, didEstablishWith remoteRouterHash: Data?, remoteRouterInfo: I2PRouterInfo?) {
-        if let hash = remoteRouterHash {
-            lock.lock()
-            sessionsByHash[hash] = session
-            lock.unlock()
-        }
+        lock.lock()
+        // One established session per session object (a session notifies
+        // once), which is exactly what the totals card's sessions figure counts.
+        establishedSessionTotal += 1
+        if let hash = remoteRouterHash { sessionsByHash[hash] = session }
+        lock.unlock()
         delegate?.transport(self, sessionEstablished: session)
     }
 
@@ -911,6 +941,11 @@ extension NTCP2Transport: NTCP2SessionDelegate {
 
     func session(_ session: NTCP2Session, didClose error: Error?) {
         lock.lock()
+        // Bank the finished session's bytes before it leaves the list, so the
+        // cumulative totals cover every session this transport has carried,
+        // not only the ones still live.
+        closedSessionBytesIn += session.bytesIn
+        closedSessionBytesOut += session.bytesOut
         let label = session.remoteRouterHash.map { String($0.hex.prefix(12)) } ?? "unknown"
         recentCloseReasons.append("\(label): \(session.closeReason ?? "closed")")
         if recentCloseReasons.count > 10 {

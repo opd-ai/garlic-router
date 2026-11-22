@@ -94,7 +94,9 @@ struct I2PKeptBlock: Codable, Equatable {
 // MARK: - Kept page
 
 /// One kept page: the host it belongs to, the address that was fetched, the
-/// reader blocks it rendered and when it was kept.
+/// reader blocks it rendered and when it was kept. `isBookmarkCopy` identifies
+/// copies kept automatically for saved hosts; explicitly kept pages are not
+/// removed when a bookmark changes.
 struct I2PKeptPage: Codable, Equatable {
     /// Blocks kept per copy: beyond this a page is no longer a reading copy and
     /// the stored copy stays bounded.
@@ -116,12 +118,18 @@ struct I2PKeptPage: Codable, Equatable {
     /// When this copy was kept.
     let keptAt: Date
     let blocks: [I2PKeptBlock]
+    /// Nil is treated as true for copies persisted before this distinction was
+    /// introduced, preserving the saved-host pruning behavior of those copies.
+    let isBookmarkCopy: Bool?
+
+    var followsBookmark: Bool { isBookmarkCopy ?? true }
 
     init(page: I2PEepsitePage,
          host: String,
          address: String,
          keptAt: Date,
-         blockLimit: Int = I2PKeptPage.blockLimit) {
+         blockLimit: Int = I2PKeptPage.blockLimit,
+         isBookmarkCopy: Bool = true) {
         self.host = host
         self.address = address.isEmpty ? page.address : address
         self.title = page.title
@@ -133,6 +141,26 @@ struct I2PKeptPage: Codable, Equatable {
         self.elapsed = page.elapsed
         self.keptAt = keptAt
         self.blocks = page.blocks.prefix(max(0, blockLimit)).map { I2PKeptBlock(block: $0) }
+        self.isBookmarkCopy = isBookmarkCopy
+    }
+
+    init(copy: I2PKeptPage,
+         host: String,
+         address: String,
+         keptAt: Date,
+         isBookmarkCopy: Bool = false) {
+        self.host = host
+        self.address = address
+        self.title = copy.title
+        self.statusCode = copy.statusCode
+        self.contentType = copy.contentType
+        self.byteCount = copy.byteCount
+        self.route = copy.route
+        self.leaseCount = copy.leaseCount
+        self.elapsed = copy.elapsed
+        self.keptAt = keptAt
+        self.blocks = Array(copy.blocks.prefix(Self.blockLimit))
+        self.isBookmarkCopy = isBookmarkCopy
     }
 
     /// The blocks back in the reader's terms, ready to be rendered.
@@ -173,14 +201,64 @@ struct I2PKeptPage: Codable, Equatable {
     }
 }
 
+/// One offline-library search hit, with its matching block count and a short
+/// excerpt centred on the first match in reading order.
+struct I2POfflineLibrarySearchResult {
+    let page: I2PKeptPage
+    let matchingBlockCount: Int
+    let snippet: String
+}
+
+enum I2POfflineLibrarySearch {
+    /// Searches only the text already stored in each copy's reader blocks.
+    /// Results retain the library's existing order.
+    static func results(in pages: [I2PKeptPage], query: String) -> [I2POfflineLibrarySearchResult] {
+        let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return [] }
+
+        return pages.compactMap { page in
+            let matches = page.blocks.compactMap { block -> (text: String, range: Range<String.Index>)? in
+                let text = block.plainText.replacingOccurrences(of: "\\s+",
+                                                                 with: " ",
+                                                                 options: .regularExpression)
+                guard let range = text.range(of: query, options: [.caseInsensitive]) else { return nil }
+                return (text, range)
+            }
+            guard let first = matches.first else { return nil }
+            return I2POfflineLibrarySearchResult(page: page,
+                                                 matchingBlockCount: matches.count,
+                                                 snippet: excerpt(first.text, matching: first.range))
+        }
+    }
+
+    private static func excerpt(_ text: String, matching range: Range<String.Index>) -> String {
+        let matchStart = text.distance(from: text.startIndex, to: range.lowerBound)
+        let matchLength = text.distance(from: range.lowerBound, to: range.upperBound)
+        let windowLength = max(120, matchLength)
+        let contextLength = windowLength - matchLength
+        var windowStart = max(0, matchStart - contextLength / 2)
+        var windowEnd = min(text.count, windowStart + windowLength)
+        if windowEnd == text.count {
+            windowStart = max(0, windowEnd - windowLength)
+        }
+        windowEnd = min(text.count, windowStart + windowLength)
+
+        let start = text.index(text.startIndex, offsetBy: windowStart)
+        let end = text.index(text.startIndex, offsetBy: windowEnd)
+        let prefix = windowStart > 0 ? "…" : ""
+        let suffix = windowEnd < text.count ? "…" : ""
+        return prefix + String(text[start..<end]) + suffix
+    }
+}
+
 // MARK: - Offline store
 
-/// The kept pages, one per saved host.
+/// The kept pages, one per canonical I2P host.
 ///
-/// A copy is only ever kept for a bookmarked host: an unbookmarked page is
-/// never stored, and a bookmark that goes away takes its copy with it. Every
-/// successful fetch of a saved host replaces that host's copy, so the store
-/// always holds the last page that worked — never a growing archive.
+/// Successful fetches of saved hosts are kept automatically and are pruned if
+/// their bookmark is removed. Any valid I2P page can also be explicitly kept;
+/// that copy lives independently of the bookmark. Every keep replaces the
+/// host's previous copy rather than building an archive.
 ///
 /// Every mutation is driven from the main thread (SwiftUI actions and the
 /// browser's `MainActor.run` completions), so the published state stays
@@ -214,25 +292,60 @@ final class I2POfflinePageStore: ObservableObject {
 
     // MARK: Keeping and reading
 
-    /// Keeps one fetched page as its host's copy. Returns false when the address
-    /// is not an eepsite host or the host is not saved — an unbookmarked page is
-    /// never kept, however well it loaded.
+    /// Keeps a successful fetch automatically only when its host is bookmarked.
+    /// The browser uses this for its existing last-good-fetch behavior.
     @discardableResult
     func keep(_ page: I2PEepsitePage,
               address: String,
               at date: Date = Date()) -> Bool {
-        guard let host = I2PSavedHostsStore.host(in: address)?.host else { return false }
-        guard savedHosts.contains(host) else { return false }
-        copies[host] = I2PKeptPage(page: page, host: host, address: address, keptAt: date)
+        guard let host = I2PSavedHostsStore.host(in: address)?.host,
+              savedHosts.contains(host) else { return false }
+        copies[host] = I2PKeptPage(page: page,
+                                   host: host,
+                                   address: address,
+                                   keptAt: date,
+                                   isBookmarkCopy: true)
         persist()
         return true
     }
 
-    /// The copy kept for the host an address points at, or nil when the host is
-    /// not saved or has never loaded successfully.
+    /// Explicitly keeps any valid I2P page, whether or not it is a saved host.
+    /// A host already in the library is replaced in place.
+    @discardableResult
+    func keepAny(_ page: I2PEepsitePage,
+                 address: String,
+                 at date: Date = Date()) -> Bool {
+        guard let host = I2PSavedHostsStore.host(in: address)?.host else { return false }
+        copies[host] = I2PKeptPage(page: page,
+                                   host: host,
+                                   address: address,
+                                   keptAt: date,
+                                   isBookmarkCopy: false)
+        persist()
+        return true
+    }
+
+    /// Refreshes a copy already being read, preserving its reader data and fetch
+    /// details while updating the address and keep time.
+    @discardableResult
+    func keepAny(_ copy: I2PKeptPage,
+                 address: String? = nil,
+                 at date: Date = Date()) -> Bool {
+        let keptAddress = address ?? copy.address
+        guard let host = I2PSavedHostsStore.host(in: keptAddress)?.host else { return false }
+        copies[host] = I2PKeptPage(copy: copy,
+                                   host: host,
+                                   address: keptAddress,
+                                   keptAt: date,
+                                   isBookmarkCopy: false)
+        persist()
+        return true
+    }
+
+    /// The copy kept for the host an address points at, whether or not that host
+    /// is also bookmarked.
     func copy(for address: String) -> I2PKeptPage? {
         guard let host = I2PSavedHostsStore.host(in: address)?.host else { return nil }
-        guard savedHosts.contains(host) else { return nil }
         return copies[host]
     }
 
@@ -274,9 +387,13 @@ final class I2POfflinePageStore: ObservableObject {
 
     // MARK: Pruning
 
-    /// Drops the copies whose host is no longer a bookmark, and nothing else.
+    /// Drops only the automatically-kept copies whose bookmark went away.
+    /// Explicitly kept pages remain in the offline library independently.
     private func dropCopies(keeping hosts: Set<String>) {
-        let stale = copies.keys.filter { !hosts.contains($0) }
+        let stale = copies.keys.filter { host in
+            guard let copy = copies[host] else { return false }
+            return copy.followsBookmark && !hosts.contains(host)
+        }
         guard !stale.isEmpty else { return }
         for host in stale {
             copies[host] = nil
@@ -701,6 +818,105 @@ enum I2POfflinePagesSelfTest {
                 throw I2PWireError.invalidFormat
             }
             return "sizes read 84 KB / 1.0 MB / 512 B; a row's keep badge is the copy's own keep time with a lower-case opening"
+        }
+
+        run("offline pages · any I2P page can be kept, updated and deleted without changing bookmarks") {
+            let (savedDefaults, savedKey) = makeDefaults("any-saved")
+            let (pageDefaults, pageKey) = makeDefaults("any-pages")
+            defer {
+                savedDefaults.removePersistentDomain(forName: suiteName("any-saved"))
+                pageDefaults.removePersistentDomain(forName: suiteName("any-pages"))
+            }
+            let saved = I2PSavedHostsStore(defaults: savedDefaults, storageKey: savedKey)
+            let store = I2POfflinePageStore(savedHosts: saved,
+                                            defaults: pageDefaults,
+                                            storageKey: pageKey)
+            let base = Date(timeIntervalSince1970: 1_700_000_000)
+            let live = makePage(address: "reader.i2p",
+                                blocks: [block(.title, "Reader"), block(.paragraph, "Offline text")])
+
+            // An explicitly kept page does not need a bookmark and appears in
+            // the same library with the address, time, byte size and block count.
+            guard store.keepAny(live, address: "https://reader.i2p/guide", at: base),
+                  let first = store.copy(for: "reader.i2p"),
+                  first.address == "https://reader.i2p/guide",
+                  first.keptAt == base,
+                  first.byteCount == live.byteCount,
+                  first.blocks.count == 2,
+                  first.blocks[1].plainText == "Offline text",
+                  store.library.map(\.host) == ["reader.i2p"] else {
+                throw I2PWireError.invalidFormat
+            }
+
+            // Updating a page already read from a copy refreshes its address and
+            // time but still leaves exactly one copy for that host.
+            let later = base.addingTimeInterval(600)
+            guard store.keepAny(first, address: "reader.i2p/updated", at: later),
+                  store.copies.count == 1,
+                  store.copy(for: "reader.i2p")?.address == "reader.i2p/updated",
+                  store.copy(for: "reader.i2p")?.keptAt == later,
+                  store.copy(for: "reader.i2p")?.blocks == first.blocks else {
+                throw I2PWireError.invalidFormat
+            }
+
+            // Deleting an explicitly-kept copy never deletes its saved-host
+            // bookmark. Explicit copies also survive bookmark removal.
+            guard saved.save("reader.i2p", at: base) else { throw I2PWireError.invalidFormat }
+            store.remove("reader.i2p")
+            guard saved.contains("reader.i2p"), store.copy(for: "reader.i2p") == nil,
+                  store.keepAny(live, address: "reader.i2p/guide", at: later) else {
+                throw I2PWireError.invalidFormat
+            }
+            saved.remove("reader.i2p")
+            guard !saved.contains("reader.i2p"), store.copy(for: "reader.i2p") != nil else {
+                throw I2PWireError.invalidFormat
+            }
+
+            // Automatic saved-host copies keep their previous bookmark-bound
+            // cleanup behavior, and explicit pages persist independently.
+            guard saved.save("automatic.i2p", at: base),
+                  store.keep(makePage(address: "automatic.i2p", blocks: [block(.paragraph, "Auto")]),
+                             address: "automatic.i2p", at: base) else {
+                throw I2PWireError.invalidFormat
+            }
+            saved.remove("automatic.i2p")
+            let reopened = I2POfflinePageStore(savedHosts: saved,
+                                               defaults: pageDefaults,
+                                               storageKey: pageKey)
+            guard reopened.library.map(\.host) == ["reader.i2p"],
+                  reopened.copy(for: "reader.i2p")?.blocks.map(\.plainText) == ["Reader", "Offline text"] else {
+                throw I2PWireError.invalidFormat
+            }
+            return "an unbookmarked page is persisted in the library; refreshing a copy updates its address and time in place; deleting a copy leaves its bookmark alone; explicitly kept pages survive bookmark removal while automatic saved-host copies still prune"
+        }
+
+        run("offline pages · library search reads kept blocks and highlights a useful snippet") {
+            let base = Date(timeIntervalSince1970: 1_700_000_000)
+            let pages = [
+                I2PKeptPage(page: makePage(address: "newest.i2p", blocks: [
+                    block(.paragraph, "Floodfill routers\nshare a database."),
+                    block(.code, "A floodfill peer answers queries.")
+                ]), host: "newest.i2p", address: "newest.i2p/wiki", keptAt: base),
+                I2PKeptPage(page: makePage(address: "floodfill.i2p", blocks: [
+                    block(.paragraph, "No matching words in this page.")
+                ]), host: "floodfill.i2p", address: "floodfill.i2p", keptAt: base),
+                I2PKeptPage(page: makePage(address: "older.i2p", blocks: [
+                    block(.paragraph, "A FLOODFILL map.")
+                ]), host: "older.i2p", address: "older.i2p", keptAt: base.addingTimeInterval(-60))
+            ]
+
+            let matches = I2POfflineLibrarySearch.results(in: pages, query: "  floodfill  ")
+            guard matches.map({ $0.page.host }) == ["newest.i2p", "older.i2p"],
+                  matches[0].matchingBlockCount == 2,
+                  matches[1].matchingBlockCount == 1,
+                  matches[0].snippet.contains("Floodfill"),
+                  !matches[0].snippet.contains("\n"),
+                  matches[1].snippet.contains("FLOODFILL"),
+                  I2POfflineLibrarySearch.results(in: pages, query: "missing").isEmpty,
+                  I2POfflineLibrarySearch.results(in: pages, query: "   ").isEmpty else {
+                throw I2PWireError.invalidFormat
+            }
+            return "case-insensitive search matched only reader-block text, counted matching blocks, kept library order, normalized the snippet to one line, and returned no results for a miss or blank query"
         }
 
         return results
