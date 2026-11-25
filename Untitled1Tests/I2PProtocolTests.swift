@@ -87,6 +87,28 @@ struct I2PProtocolTests {
         }
     }
 
+    /// The suites the off-device harness runs through its subsystem selectors.
+    /// Until this case existed they were reachable only from a macOS `swiftc`
+    /// build, so a regression in the NetDB, the NTCP2 or SSU2 transports, the
+    /// transport wiring, the I2NP layer, garlic, b33 blinding or the SAM
+    /// server merged without failing CI.
+    @Test func protocolAndTransportSuitesPass() async {
+        var results: [I2PSelfTestResult] = []
+        results += await I2PNetDBSelfTest.runAll()
+        results += await I2PNTCP2SelfTest.runAll()
+        results += await I2PSSU2SelfTest.runAll()
+        results += await I2PRouterTransportWiringSelfTest.runAll()
+        results += await I2NPSelfTest.runAll()
+        results += await I2PGarlicSelfTest.runAll()
+        results += await I2PB33BlindingSelfTest.runAll()
+        results += I2PSpecComplianceSelfTest.runAll()
+        results += await I2PSAMConformanceTest.runAll()
+
+        let failed = results.filter { !$0.passed }
+        #expect(failed.isEmpty,
+                "failing checks: \(failed.map { "\($0.name) — \($0.detail)" })")
+    }
+
     @Test func crashSignalRecordAndReportAreBoundedAndHonest() {
         let signal = Int32(SIGABRT)
         let validMarker = Data([UInt8(truncatingIfNeeded: signal)])

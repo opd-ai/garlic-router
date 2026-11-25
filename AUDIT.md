@@ -80,8 +80,8 @@ Every candidate lead was checked against the current implementation. **23 surviv
 
 ### AUD-01 — CI does not run the project's main protocol suites
 
-- **Category:** build & CI coverage · **Priority:** High · **Confidence:** VERIFIED · **Status:** open
-- **Description.** `xcodebuild test` is the only gate CI runs, and the unit-test adapter it executes calls `I2PSelfTest.runCoreTests()` rather than the composed `runAll()`. Large parts of the protocol surface — including the SAM conformance suite, the NTCP2 suite, the SSU2 suite and the transport wiring suite — therefore never run in CI, while the README and `INTEROP_REPORT.md` present the standalone harness as the project's evidence base.
+- **Category:** build & CI coverage · **Priority:** High · **Confidence:** VERIFIED · **Status:** fixed (§9.2)
+- **Description.** `xcodebuild test` was the only gate CI ran, and the unit-test adapter it executes called `I2PSelfTest.runCoreTests()` rather than the composed `runAll()`. Large parts of the protocol surface — including the SAM conformance suite, the NTCP2 suite, the SSU2 suite and the transport wiring suite — therefore never ran in CI, while the README and `INTEROP_REPORT.md` present the standalone harness as the project's evidence base. Large parts of the protocol surface — including the SAM conformance suite, the NTCP2 suite, the SSU2 suite and the transport wiring suite — therefore never run in CI, while the README and `INTEROP_REPORT.md` present the standalone harness as the project's evidence base.
 - **Evidence.**
   - `Untitled1Tests/I2PProtocolTests.swift:26` — `I2PSelfTest.runCoreTests()`; the adapter's other cases cover cross-validation, thirteen client-logic suites, `I2PNetDBEntriesSelfTest`, `I2PTunnelSelfTest`, `I2PRouterStatusSelfTest`.
   - `Untitled1/I2P/I2PSelfTest.swift:85-226` — `runAll()` composes ~55 suites including `I2PNetDBSelfTest` (:96), `I2PNTCP2SelfTest` (:100), `I2PSSU2SelfTest`, `I2PRouterTransportWiringSelfTest`, `I2NPSelfTest` (:102 is tunnel; I2NP follows), `I2PGarlicSelfTest`, `I2PB33BlindingSelfTest`, `I2PSAMConformanceTest` (:222).
@@ -526,3 +526,24 @@ NetDiag exit=0   SelfTestProbe exit=0 WireProbe exit=0
 ```
 
 Eleven of eleven. Before the change, five of them failed with the `@main` error and two of those five had a second, independent defect behind it.
+
+### 9.2 — AUD-01: CI now runs the protocol suites, both ways
+
+**Change.**
+- `.github/workflows/ci.yml` gains a second job, *Protocol suites (off-device harness)*: it compiles the repository's own `swiftc` harness and runs every suite it contains (`--all`). The job fails unless the harness finishes **and** the only failures are the two checks that need the app bundle's Keychain (`SAM persistent key store migrates legacy files into Keychain`, `SAM session persistence (save/restore private keys)`), which the `Build and test` job runs for real in the simulator. An unfinished run fails the job even when it prints no failures, so a crash cannot pass as green.
+- `Untitled1Tests/I2PProtocolTests.swift` gains `protocolAndTransportSuitesPass`, which runs the suites that were reachable only from the harness: NetDB, NTCP2, SSU2, the transport wiring, I2NP, garlic, b33 blinding, spec compliance and the SAM conformance suite.
+
+**Verification.**
+- Both test targets compile with the new case: `xcodebuild build-for-testing …` → exit 0.
+- The workflow's gate was replayed against a real harness run:
+
+  ```
+  $ ./.probe-build/selftestprobe --all   → 277 passed, 2 failed
+  FAIL  SAM persistent key store migrates legacy files into Keychain
+  FAIL  SAM session persistence (save/restore private keys)
+  gate: PASS          # both failures are the allow-listed, bundle-only ones
+  ```
+
+- The workflow file parses as YAML: `jobs: build-and-test, protocol-suites` (9 and 5 steps).
+
+**Not verified here.** The XCTest cases have not been *executed* — the build Mac has no simulator runtime. Whether the SAM conformance suite and the UDP loopback suites behave identically inside a simulator process is exactly what the first real CI run will answer (AUD-02).

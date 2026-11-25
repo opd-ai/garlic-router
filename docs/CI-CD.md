@@ -7,7 +7,13 @@ Two GitHub Actions workflows live in `.github/workflows/`:
   Simulator and runs the `Untitled1Tests` (unit) and `Untitled1UITests` (UI)
   targets. Any build or test failure fails the run. It uses **no** signing
   material, so it passes on forks and on pull requests where none of the secrets
-  below exist.
+  below exist. A second job in the same workflow, *Protocol suites (off-device
+  harness)*, compiles the repository's own `swiftc` harness and runs every suite
+  it contains, which is where the evidence in `INTEROP_REPORT.md` comes from.
+  Two of those checks (`SAM persistent key store migrates legacy files into
+  Keychain` and `SAM session persistence (save/restore private keys)`) need the
+  app bundle's Keychain, cannot pass in a bare macOS binary, and are named as the
+  only allowed failures there — they run for real in the `Build and test` job.
 - **`cd-testflight.yml`** — on a `v*` tag push, or manually from the Actions tab.
   Imports a distribution certificate and provisioning profile into a throwaway
   keychain, archives with manual signing, exports a signed IPA and uploads it to
