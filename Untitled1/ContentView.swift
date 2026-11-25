@@ -813,6 +813,8 @@ struct CapturedCrash {
 /// "More" list that buries whole screens; the product roadmap moved behind the
 /// Alignment tab's toolbar, where it stays one tap away.
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
+
     /// Set the first time the first-run screen is dismissed, whichever way it
     /// is left, so a returning user never meets it again.
     @AppStorage("i2p.firstRun.completed") private var firstRunCompleted = false
@@ -859,6 +861,16 @@ struct ContentView: View {
         }
         .tint(accent)
         .preferredColorScheme(.dark)
+        .onChange(of: scenePhase, initial: true) { _, phase in
+            switch phase {
+            case .background:
+                I2PRouterHealthHistory.shared.markAppSuspended()
+            case .active:
+                I2PRouterHealthHistory.shared.resumeSampling()
+            default:
+                break
+            }
+        }
         .task {
             if !firstRunCompleted { showingFirstRun = true }
         }

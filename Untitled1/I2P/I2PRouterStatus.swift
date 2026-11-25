@@ -510,6 +510,7 @@ final class I2PRouterStatusEngine {
             while !Task.isCancelled {
                 guard let self else { break }
                 let snapshot = await self.snapshot()
+                I2PRouterHealthHistory.shared.record(snapshot: snapshot)
                 self.continuation?.yield(snapshot)
                 try? await Task.sleep(for: .seconds(interval))
             }

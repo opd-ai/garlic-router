@@ -19,9 +19,7 @@ concurrency:
 env:
   PROJECT: Untitled1.xcodeproj
   SCHEME: Untitled1
-  # Pinned toolchain. Override with a repository variable named XCODE_VERSION
-  # if the runner image carries a different Xcode (see docs/CI-CD.md).
-  XCODE_VERSION: ${{ vars.XCODE_VERSION || '27.1' }}
+  XCODE_VERSION: '27.1'
 
 jobs:
   build-and-test:
@@ -49,6 +47,7 @@ jobs:
           path: |
             ~/Library/Caches/org.swift.swiftpm
             ~/Library/Developer/Xcode/DerivedData/**/SourcePackages
+            ${{ runner.temp }}/DerivedData/SourcePackages
           key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
           restore-keys: |
             ${{ runner.os }}-spm-
@@ -56,7 +55,10 @@ jobs:
       - name: Resolve package dependencies
         run: |
           set -euo pipefail
-          xcodebuild -resolvePackageDependencies -project "$PROJECT" -scheme "$SCHEME"
+          xcodebuild -resolvePackageDependencies \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData"
 
       - name: Select an available iOS simulator
         run: |

@@ -112,6 +112,8 @@ enum I2PSelfTest {
         results.append(contentsOf: I2PSavedHostsSelfTest.runAll())
         progress?("router status (plain)")
         results.append(contentsOf: I2PRouterPlainStatusSelfTest.runAll())
+        progress?("router health history")
+        results.append(contentsOf: I2PRouterHealthHistorySelfTest.runAll())
         progress?("router lifetime totals")
         results.append(contentsOf: I2PRouterLifetimeTotalsSelfTest.runAll())
         progress?("live interop")

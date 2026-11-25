@@ -114,6 +114,12 @@ protocol I2PIRCServerPasswordStore {
     func deletePassword(account: String) -> Bool
 }
 
+enum I2PIRCServerPasswordChange {
+    case keep
+    case replace(String)
+    case remove
+}
+
 final class I2PIRCServerPasswordKeychain: I2PIRCServerPasswordStore {
     static let shared = I2PIRCServerPasswordKeychain()
     private let service = "i2p.irc.server-password"
@@ -203,6 +209,20 @@ final class I2PIRCServerBook: ObservableObject {
         }
     }
 
+    /// Saved servers matching a query across their name, address, nick and
+    /// channels. Filtering retains the book's current ordering.
+    func filtered(_ query: String) -> [I2PIRCServerEntry] {
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !needle.isEmpty else { return entries }
+        return entries.filter { entry in
+            entry.displayName.lowercased().contains(needle)
+                || entry.host.lowercased().contains(needle)
+                || entry.address.lowercased().contains(needle)
+                || entry.nick.lowercased().contains(needle)
+                || entry.channels.contains { $0.lowercased().contains(needle) }
+        }
+    }
+
     /// Adds a server, or replaces the entry with the same id. A server that
     /// cannot pass validation is refused and false is returned.
     @discardableResult
@@ -228,6 +248,42 @@ final class I2PIRCServerBook: ObservableObject {
         }
         persist()
         return true
+    }
+
+    /// Updates a saved server without treating an empty password field as a
+    /// request to delete its credential. The Keychain is touched only when the
+    /// caller explicitly chooses replacement or removal.
+    @discardableResult
+    func update(_ entry: I2PIRCServerEntry,
+                passwordChange: I2PIRCServerPasswordChange = .keep) -> Bool {
+        guard entry.validationProblem == nil,
+              let index = entries.firstIndex(where: { $0.id == entry.id }) else { return false }
+
+        var cleaned = entry
+        cleaned.name = entry.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        cleaned.host = entry.host.trimmingCharacters(in: .whitespacesAndNewlines)
+        cleaned.nick = entry.nick.trimmingCharacters(in: .whitespacesAndNewlines)
+        cleaned.channels = Self.channels(from: entry.channels.joined(separator: ","))
+
+        switch passwordChange {
+        case .keep:
+            cleaned.password = entries[index].password
+        case .replace(let password):
+            guard !password.isEmpty,
+                  passwordStore.setPassword(password, account: entry.id.uuidString) else { return false }
+            cleaned.password = password
+        case .remove:
+            guard passwordStore.deletePassword(account: entry.id.uuidString) else { return false }
+            cleaned.password = ""
+        }
+
+        entries[index] = cleaned
+        persist()
+        return true
+    }
+
+    func hasPassword(for id: UUID) -> Bool {
+        entries.first(where: { $0.id == id })?.password.isEmpty == false
     }
 
     @discardableResult
@@ -369,7 +425,37 @@ enum I2PIRCServerBookSelfTest {
                     throw I2PWireError.invalidFormat
                 }
             }
-            // Saving the same id edits in place; the list keeps its order.
+            // Editing metadata keeps the existing Keychain password and does
+            // not issue any credential-store writes or deletes.
+            let initialWrites = passwordStore.setCount
+            let initialDeletes = passwordStore.deleteCount
+            let originalOrder = store.entries.map(\.id)
+            var edited = valid
+            edited.name = "Renamed"
+            edited.host = "irc.renamed.i2p"
+            edited.port = 6697
+            edited.nick = "newnick"
+            edited.channels = ["#help"]
+            guard store.update(edited),
+                  store.entries.map(\.id) == originalOrder,
+                  store.entry(valid.id)?.name == "Renamed",
+                  store.entry(valid.id)?.password == "test-only-password",
+                  passwordStore.setCount == initialWrites,
+                  passwordStore.deleteCount == initialDeletes else {
+                throw I2PWireError.invalidFormat
+            }
+            guard store.update(edited, passwordChange: .replace("replacement-password")),
+                  passwordStore.password(account: valid.id.uuidString) == "replacement-password",
+                  store.entry(valid.id)?.password == "replacement-password" else {
+                throw I2PWireError.invalidFormat
+            }
+            guard store.update(edited, passwordChange: .remove),
+                  passwordStore.password(account: valid.id.uuidString) == nil,
+                  store.entry(valid.id)?.password.isEmpty == true else {
+                throw I2PWireError.invalidFormat
+            }
+
+            // Saving the same id still replaces in place; the list keeps its order.
             custom.name = "Renamed"
             guard store.save(custom), store.entries.count == 2,
                   store.entry(custom.id)?.name == "Renamed" else {
@@ -381,7 +467,7 @@ enum I2PIRCServerBookSelfTest {
                                            passwordStore: passwordStore)
             guard reopened.entries.count == 2,
                   reopened.entry(custom.id)?.name == "Renamed",
-                   reopened.entry(valid.id)?.password == "test-only-password" else {
+                  reopened.entry(valid.id)?.password.isEmpty == true else {
                 throw I2PWireError.invalidFormat
             }
             reopened.remove(custom.id)
@@ -392,6 +478,38 @@ enum I2PIRCServerBookSelfTest {
             }
             defaults.removePersistentDomain(forName: suite)
             return "trimmed entry saved and persisted; an edit replaces in place; clear-net host, bad nick and port 0 refused"
+        }
+
+        run("irc · saved server search matches each field case-insensitively in order") {
+            let suite = "i2p.irc.serverBook.search.\(UUID().uuidString)"
+            guard let defaults = UserDefaults(suiteName: suite) else {
+                throw I2PWireError.invalidFormat
+            }
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let store = I2PIRCServerBook(defaults: defaults,
+                                         storageKey: "servers",
+                                         passwordStore: I2PIRCServerBookMemoryPasswordStore())
+            let quiet = I2PIRCServerEntry(name: "Quiet Net",
+                                          host: "irc.quiet.i2p",
+                                          nick: "Squirrel",
+                                          channels: ["#HelpDesk"])
+            let cedar = I2PIRCServerEntry(name: "Cedar",
+                                          host: "irc.cedar.i2p",
+                                          port: 6697,
+                                          nick: "Owl",
+                                          channels: ["#Garden"])
+            guard store.save(quiet), store.save(cedar),
+                  store.filtered("QUIET").map(\.id) == [quiet.id],
+                  store.filtered("CEDAR.I2P:6697").map(\.id) == [cedar.id],
+                  store.filtered("sQuIrReL").map(\.id) == [quiet.id],
+                  store.filtered("helpdesk").map(\.id) == [quiet.id],
+                  store.filtered("IRC.").map(\.id) == store.entries.map(\.id),
+                  store.filtered("") == store.entries,
+                  store.filtered("   ") == store.entries,
+                  store.filtered("no such server").isEmpty else {
+                throw I2PWireError.invalidFormat
+            }
+            return "name, address, nick and channel matches are case-insensitive; ordering is retained and empty queries restore every entry"
         }
 
         run("irc · legacy server passwords migrate out of user defaults") {
@@ -477,6 +595,8 @@ enum I2PIRCServerBookSelfTest {
 private final class I2PIRCServerBookMemoryPasswordStore: I2PIRCServerPasswordStore {
     private var values: [String: String] = [:]
     private let acceptsWrites: Bool
+    private(set) var setCount = 0
+    private(set) var deleteCount = 0
 
     init(acceptsWrites: Bool = true) {
         self.acceptsWrites = acceptsWrites
@@ -488,11 +608,13 @@ private final class I2PIRCServerBookMemoryPasswordStore: I2PIRCServerPasswordSto
 
     func setPassword(_ password: String, account: String) -> Bool {
         guard acceptsWrites else { return false }
+        setCount += 1
         values[account] = password
         return true
     }
 
     func deletePassword(account: String) -> Bool {
+        deleteCount += 1
         values.removeValue(forKey: account)
         return true
     }

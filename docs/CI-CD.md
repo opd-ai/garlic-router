@@ -51,11 +51,11 @@ naming the one that is absent.
 ## Repository variables
 
 Set under **Settings → Secrets and variables → Actions → Variables** (visible,
-non-secret). Both are optional.
+non-secret). `APP_BUNDLE_ID` is optional; the Xcode version is pinned in both
+workflow files and changes only with a reviewed commit.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `XCODE_VERSION` | `27.1` | The Xcode version both workflows select on the runner (e.g. `27.1`, `26.2`). Set this to a version present on the runner image if the default is not. Check with `ls /Applications \| grep Xcode` on a failed run's log, or the runner image README. |
 | `APP_BUNDLE_ID` | `ai.opd.garlicrouter` | The app's bundle identifier. Used as the `provisioningProfiles` key in `ExportOptions.plist` and passed to the archive as `PRODUCT_BUNDLE_IDENTIFIER`, so the profile and the binary agree. Must match the App ID the provisioning profile was created for. |
 
 ## Manual setup that cannot be automated here
@@ -99,9 +99,11 @@ non-secret). Both are optional.
   `$(PRODUCT_BUNDLE_IDENTIFIER)`), so a tag `v1.2.3` produces marketing version
   `1.2.3` and the build number is the workflow run number (or the manual
   dispatch input).
-- Cached paths: `~/Library/Caches/org.swift.swiftpm` and the DerivedData
-   `SourcePackages` directory, keyed on `Package.resolved`. The project currently
-   has no Swift package dependencies, so the cache is a no-op until one is added.
+- Cached paths: `~/Library/Caches/org.swift.swiftpm`, Xcode's default DerivedData
+  `SourcePackages` directory, and the CI job's `$RUNNER_TEMP/DerivedData/SourcePackages`,
+  keyed on `Package.resolved`. Dependency resolution and builds share that explicit
+  DerivedData path. The project currently has no Swift package dependencies, so the
+  cache is a no-op until one is added.
 - `Untitled1/ENCRYPTED_KEYS.plist` is an empty template in this checkout. Do not
   put credentials in it or commit populated copies. The current API-key importer
   derives its AES-GCM key from the public bundle identifier, so that ciphertext

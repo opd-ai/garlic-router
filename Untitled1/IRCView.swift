@@ -1690,8 +1690,31 @@ struct IRCServersView: View {
 
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var history = I2PIRCHistoryStore.shared
-    @State private var showForm = false
+    @State private var formMode: FormMode?
+    @State private var searchText = ""
     @State private var showDeleteStorageError = false
+
+    private enum FormMode: Identifiable {
+        case add
+        case edit(I2PIRCServerEntry)
+
+        var id: String {
+            switch self {
+            case .add: return "add-server"
+            case .edit(let entry): return "edit-\(entry.id.uuidString)"
+            }
+        }
+
+        var entry: I2PIRCServerEntry? {
+            if case .edit(let entry) = self { return entry }
+            return nil
+        }
+
+        var isEditing: Bool {
+            if case .edit = self { return true }
+            return false
+        }
+    }
 
     private let accent = Color(red: 0.47, green: 0.44, blue: 0.97)
     private let background = Color(red: 0.055, green: 0.06, blue: 0.09)
@@ -1713,16 +1736,17 @@ struct IRCServersView: View {
             }
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
-                    showForm = true
+                    formMode = .add
                 } label: {
                     Image(systemName: "plus")
                 }
                 .accessibilityLabel("Add a server")
             }
         }
-        .sheet(isPresented: $showForm) {
+        .sheet(item: $formMode) { mode in
             NavigationStack {
-                IRCServerFormView(book: book) { entry in
+                IRCServerFormView(book: book, editingEntry: mode.entry) { entry in
+                    guard !mode.isEditing else { return }
                     onConnect(entry)
                     dismiss()
                 }
@@ -1745,42 +1769,62 @@ struct IRCServersView: View {
                         .listRowSeparator(.hidden)
                 }
             }
-            ForEach(book.entries) { entry in
-                Button {
-                    onConnect(entry)
-                    dismiss()
-                } label: {
-                    HStack(spacing: 12) {
-                        Image(systemName: "server.rack")
-                            .font(.system(size: 15, weight: .medium))
+            searchField
+
+            if filteredEntries.isEmpty {
+                noSearchResults
+            }
+            ForEach(filteredEntries) { entry in
+                HStack(spacing: 8) {
+                    Button {
+                        onConnect(entry)
+                        dismiss()
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "server.rack")
+                                .font(.system(size: 15, weight: .medium))
+                                .foregroundStyle(accent)
+                                .frame(width: 38, height: 38)
+                                .background(accent.opacity(0.14), in: RoundedRectangle(cornerRadius: 10))
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(entry.displayName)
+                                    .font(.subheadline.weight(.medium))
+                                    .foregroundStyle(.primary)
+                                    .lineLimit(1)
+                                Text("\(entry.address) · \(entry.nick)")
+                                    .font(.system(.caption2, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                if !entry.channels.isEmpty {
+                                    Text(entry.channels.joined(separator: ", "))
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                        .lineLimit(1)
+                                }
+                            }
+                            Spacer(minLength: 4)
+                            Image(systemName: "chevron.right")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.tertiary)
+                        }
+                        .contentShape(Rectangle())
+                        .padding(.vertical, 4)
+                    }
+                    .buttonStyle(.plain)
+                    Button {
+                        formMode = .edit(entry)
+                    } label: {
+                        Image(systemName: "pencil")
+                            .font(.system(size: 14, weight: .semibold))
                             .foregroundStyle(accent)
                             .frame(width: 38, height: 38)
-                            .background(accent.opacity(0.14), in: RoundedRectangle(cornerRadius: 10))
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(entry.displayName)
-                                .font(.subheadline.weight(.medium))
-                                .foregroundStyle(.primary)
-                                .lineLimit(1)
-                            Text("\(entry.address) · \(entry.nick)")
-                                .font(.system(.caption2, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                            if !entry.channels.isEmpty {
-                                Text(entry.channels.joined(separator: ", "))
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
-                                    .lineLimit(1)
-                            }
-                        }
-                        Spacer(minLength: 4)
-                        Image(systemName: "chevron.right")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.tertiary)
+                            .background(accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 11))
                     }
-                    .padding(.vertical, 4)
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Edit \(entry.displayName)")
+                    .accessibilityHint("Edit this saved server without connecting")
                 }
-                .buttonStyle(.plain)
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
                 .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
@@ -1809,6 +1853,62 @@ struct IRCServersView: View {
         .scrollContentBackground(.hidden)
     }
 
+    private var filteredEntries: [I2PIRCServerEntry] {
+        book.filtered(searchText)
+    }
+
+    private var searchField: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+            TextField("Search name, address, nick or channel", text: $searchText)
+                .font(.subheadline)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .accessibilityLabel("Search saved IRC servers")
+            if !searchText.isEmpty {
+                Button {
+                    searchText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear search")
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 12))
+        .listRowBackground(Color.clear)
+        .listRowSeparator(.hidden)
+        .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+    }
+
+    private var noSearchResults: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .font(.title2)
+                .foregroundStyle(.secondary)
+            Text("No servers found")
+                .font(.subheadline.weight(.semibold))
+            Text("No saved servers match “\(searchText.trimmingCharacters(in: .whitespacesAndNewlines))”.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Button("Clear search") {
+                searchText = ""
+            }
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(accent)
+            .padding(.top, 2)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 28)
+        .listRowBackground(Color.clear)
+        .listRowSeparator(.hidden)
+    }
+
     private var emptyState: some View {
         VStack(alignment: .leading, spacing: 12) {
             if book.didDiscardLegacyPasswords {
@@ -1822,7 +1922,7 @@ struct IRCServersView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Button {
-                showForm = true
+                formMode = .add
             } label: {
                 Label("Add a server", systemImage: "plus.circle")
                     .font(.footnote.weight(.semibold))
@@ -1859,22 +1959,40 @@ struct IRCServersView: View {
 
 struct IRCServerFormView: View {
     @ObservedObject var book: I2PIRCServerBook
+    let editingEntry: I2PIRCServerEntry?
     let onSaved: (I2PIRCServerEntry) -> Void
 
     @Environment(\.dismiss) private var dismiss
-    @State private var name = ""
-    @State private var host = ""
-    @State private var portText = String(I2PIRCServerEntry.defaultPort)
-    @State private var nick = ""
+    @State private var serverID: UUID
+    @State private var name: String
+    @State private var host: String
+    @State private var portText: String
+    @State private var nick: String
     @State private var password = ""
-    @State private var channelsText = "#i2p"
+    @State private var passwordRemovalRequested = false
+    @State private var channelsText: String
     @State private var saveError: String?
 
     private let accent = Color(red: 0.47, green: 0.44, blue: 0.97)
     private let background = Color(red: 0.055, green: 0.06, blue: 0.09)
 
+    init(book: I2PIRCServerBook,
+         editingEntry: I2PIRCServerEntry? = nil,
+         onSaved: @escaping (I2PIRCServerEntry) -> Void) {
+        self.book = book
+        self.editingEntry = editingEntry
+        self.onSaved = onSaved
+        _serverID = State(initialValue: editingEntry?.id ?? UUID())
+        _name = State(initialValue: editingEntry?.name ?? "")
+        _host = State(initialValue: editingEntry?.host ?? "")
+        _portText = State(initialValue: String(editingEntry?.port ?? I2PIRCServerEntry.defaultPort))
+        _nick = State(initialValue: editingEntry?.nick ?? "")
+        _channelsText = State(initialValue: I2PIRCServerBook.channelListText(editingEntry?.channels ?? ["#i2p"]))
+    }
+
     private var draft: I2PIRCServerEntry {
-        I2PIRCServerEntry(name: name,
+        I2PIRCServerEntry(id: serverID,
+                          name: name,
                           host: host,
                           port: UInt16(portText) ?? 0,
                           nick: nick,
@@ -1885,6 +2003,12 @@ struct IRCServerFormView: View {
     private var problem: String? {
         guard !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         return draft.validationProblem
+    }
+
+    private var passwordChange: I2PIRCServerPasswordChange {
+        if passwordRemovalRequested { return .remove }
+        if !password.isEmpty { return .replace(password) }
+        return .keep
     }
 
     var body: some View {
@@ -1911,7 +2035,7 @@ struct IRCServerFormView: View {
                 Button {
                     save()
                 } label: {
-                    Text("Save server")
+                    Text(editingEntry == nil ? "Save server" : "Save changes")
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(draft.validationProblem == nil ? Color.white : Color.white.opacity(0.45))
                         .frame(maxWidth: .infinity)
@@ -1931,7 +2055,7 @@ struct IRCServerFormView: View {
             .padding(16)
         }
         .background(background.ignoresSafeArea())
-        .navigationTitle("Add a server")
+        .navigationTitle(editingEntry == nil ? "Add a server" : "Edit server")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
@@ -1963,24 +2087,59 @@ struct IRCServerFormView: View {
     }
 
     private var passwordField: some View {
-        VStack(alignment: .leading, spacing: 5) {
+        VStack(alignment: .leading, spacing: 7) {
             Text("Server password")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
                 .textCase(.uppercase)
-            SecureField("Optional — sent as PASS before the nick", text: $password)
+            if let editingEntry {
+                Text(passwordRemovalRequested
+                     ? "The saved password will be removed when you save."
+                     : book.hasPassword(for: editingEntry.id)
+                        ? "A password is stored. Leave this blank to keep it."
+                        : "No password is stored.")
+                    .font(.caption2)
+                    .foregroundStyle(passwordRemovalRequested ? Color.orange : Color.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if book.hasPassword(for: editingEntry.id) {
+                    Button {
+                        passwordRemovalRequested.toggle()
+                        if passwordRemovalRequested { password = "" }
+                    } label: {
+                        Label(passwordRemovalRequested ? "Keep saved password" : "Remove saved password",
+                              systemImage: passwordRemovalRequested ? "arrow.uturn.backward" : "trash")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(passwordRemovalRequested ? accent : Color.orange)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            SecureField(editingEntry == nil
+                        ? "Optional — sent as PASS before the nick"
+                        : "New password — leave blank to keep current",
+                        text: $password)
                 .font(.callout)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled(true)
+                .disabled(passwordRemovalRequested)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 12)
                 .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 14))
+                .onChange(of: password) { _, newValue in
+                    if !newValue.isEmpty { passwordRemovalRequested = false }
+                }
         }
     }
 
     private func save() {
         let entry = draft
-        guard book.save(entry) else {
+        let saved: Bool
+        if editingEntry == nil {
+            saved = book.save(entry)
+        } else {
+            saved = book.update(entry, passwordChange: passwordChange)
+        }
+        guard saved else {
             saveError = "Could not securely save this server. Make sure Keychain is available, then try again."
             return
         }

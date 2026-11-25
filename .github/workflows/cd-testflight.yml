@@ -27,7 +27,7 @@ concurrency:
 env:
   PROJECT: Untitled1.xcodeproj
   SCHEME: Untitled1
-  XCODE_VERSION: ${{ vars.XCODE_VERSION || '27.1' }}
+  XCODE_VERSION: '27.1'
   APP_BUNDLE_ID: ${{ vars.APP_BUNDLE_ID || 'ai.opd.garlicrouter' }}
   KEYCHAIN_NAME: app-signing.keychain-db
   PROFILE_INSTALL_NAME: ci-app.mobileprovision

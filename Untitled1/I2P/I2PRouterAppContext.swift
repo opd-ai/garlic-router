@@ -467,6 +467,7 @@ final class I2PRouterAppContext {
         ntcp2.shutdown()
         ssu2.shutdown()
         tunnelPool.stop()
+        engine.stop()
         samServer.stop()
     }
 

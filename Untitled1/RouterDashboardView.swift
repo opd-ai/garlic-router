@@ -51,6 +51,7 @@ struct RouterDashboardView: View {
                         b33HostsCard
                         peersCard(snapshot)
                         tunnelsCard(snapshot)
+                        routerHealthCard
                         throughputCard(snapshot)
                         lifetimeCard(snapshot)
                         footerText(snapshot)
@@ -64,6 +65,7 @@ struct RouterDashboardView: View {
                         publishedRouterInfoCard
                         networkDatabaseCard(nil)
                         b33HostsCard
+                        routerHealthCard
                     }
                 }
                 .padding(.horizontal, 16)
@@ -776,6 +778,40 @@ struct RouterDashboardView: View {
         if value >= 1_048_576 { return String(format: "%.1f MB", value / 1_048_576) }
         if value >= 1024 { return String(format: "%.1f KB", value / 1024) }
         return "\(bytes) B"
+    }
+
+    // MARK: - Router health
+
+    private var routerHealthCard: some View {
+        NavigationLink {
+            RouterHealthView()
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "waveform.path.ecg")
+                    .font(.subheadline)
+                    .foregroundStyle(accent)
+                    .frame(width: 22)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Router health")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                    Text("Local uptime, availability, peer and tunnel trends")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                }
+                Spacer(minLength: 6)
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(16)
+            .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 18))
+        }
+        .buttonStyle(.plain)
+        .accessibilityHint("Opens local router health history")
     }
 
     // MARK: - Tunnels

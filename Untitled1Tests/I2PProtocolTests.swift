@@ -42,6 +42,7 @@ struct I2PProtocolTests {
         results += I2PSavedHostsSelfTest.runAll()
         results += I2PEepsiteContentsSelfTest.runAll()
         results += I2PRouterPlainStatusSelfTest.runAll()
+        results += I2PRouterHealthHistorySelfTest.runAll()
         results += I2PLiveInteropSelfTest.runAll()
         results += I2PIRCServerBookSelfTest.runAll()
         results += I2PPeerNicknamesSelfTest.runAll()

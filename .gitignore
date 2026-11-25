@@ -40,6 +40,10 @@ Pods/
 *.provisionprofile
 *.p8
 AuthKey_*.p8
+*.key
+*.pem
+*.p7b
+*.p7c
 private_keys/
 *.keystore
 *.jks
