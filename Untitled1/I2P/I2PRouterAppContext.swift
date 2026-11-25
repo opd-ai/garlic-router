@@ -818,11 +818,12 @@ final class I2PRouterAppContext {
             scheduleSSU2Fallback(routerInfo: info)
             return true
         }
-        // No NTCP2 address works at all: dial the peer over SSU2 instead.
+        // No NTCP2 address works at all: dial the peer over SSU2 instead. The
+        // attempt is watched exactly like an NTCP2 one, so a peer that never
+        // answers over UDP is held back instead of being redialled every tick.
         if let endpoint = SSU2PeerEndpoint.preferred(from: info.addresses) {
-            try? ssu2.connect(host: endpoint.host, port: endpoint.port,
-                              remoteStaticKey: endpoint.staticKey,
-                              remoteIntroKey: endpoint.introKey)
+            guard startSSU2Dial(info, endpoint: endpoint) else { return false }
+            watchSSU2Handshake(peer: info.identity.hash)
             return true
         }
         return false
@@ -891,9 +892,7 @@ final class I2PRouterAppContext {
         guard !I2PPeerBlocklist.shared.isBlocked(hash) else { return false }
         if ssu2.hasSession(forRouterHash: hash) { return true }
         guard let endpoint = SSU2PeerEndpoint.preferred(from: routerInfo.addresses) else { return false }
-        try? ssu2.connect(host: endpoint.host, port: endpoint.port,
-                          remoteStaticKey: endpoint.staticKey,
-                          remoteIntroKey: endpoint.introKey)
+        guard startSSU2Dial(routerInfo, endpoint: endpoint) else { return false }
         let deadline = Date().addingTimeInterval(timeout)
         while !ssu2.hasSession(forRouterHash: hash), Date() < deadline {
             try? await Task.sleep(for: .milliseconds(150))
@@ -901,8 +900,52 @@ final class I2PRouterAppContext {
         let established = ssu2.hasSession(forRouterHash: hash)
         // A successful SSU2 handshake resets the peer's retry schedule exactly as
         // a TCP one does: the peer is not failing, it just answers over UDP.
-        if established { handshakeBackoff.recordSuccess(hash) }
+        if established {
+            handshakeBackoff.recordSuccess(hash)
+        } else {
+            // A window that closes without a session is the same ending the NTCP2
+            // path records, so an SSU2-only peer lands on the same retry ladder
+            // instead of being redialled on every maintenance tick.
+            handshakeBackoff.recordFailure(hash, reason: .handshakeTimeout)
+        }
         return established
+    }
+
+    /// Starts one SSU2 dial. A throw means the session could not be built at all
+    /// (key or socket setup), which is recorded against the peer rather than
+    /// discarded, so the next attempt is scheduled instead of immediate.
+    @discardableResult
+    private func startSSU2Dial(_ routerInfo: I2PRouterInfo, endpoint: SSU2PeerEndpoint) -> Bool {
+        do {
+            try ssu2.connect(host: endpoint.host, port: endpoint.port,
+                             remoteStaticKey: endpoint.staticKey,
+                             remoteIntroKey: endpoint.introKey)
+            return true
+        } catch {
+            handshakeBackoff.recordFailure(routerInfo.identity.hash, reason: .udpConnectFailed)
+            return false
+        }
+    }
+
+    /// Watches an SSU2 dial the way `watchHandshake` watches an NTCP2 one: the
+    /// window either produces an established session or records the timeout
+    /// against the peer's profile. Nothing is closed here; the transport owns its
+    /// own timers.
+    private func watchSSU2Handshake(peer hash: Data) {
+        let backoff = handshakeBackoff
+        let ssu2 = self.ssu2
+        Task {
+            let deadline = Date().addingTimeInterval(Self.handshakeWatchWindow)
+            while Date() < deadline {
+                if ssu2.hasSession(forRouterHash: hash) { break }
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+            if ssu2.hasSession(forRouterHash: hash) {
+                backoff.recordSuccess(hash)
+            } else {
+                backoff.recordFailure(hash, reason: .handshakeTimeout)
+            }
+        }
     }
 
     /// Sends one I2NP envelope down the running router's delivery path, which

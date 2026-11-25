@@ -174,7 +174,7 @@ Every candidate lead was checked against the current implementation. **23 surviv
 
 ### AUD-10 — SSU2 dial failures are discarded and never enter the handshake backoff
 
-- **Category:** protocol / interoperability (reliability) · **Priority:** Medium · **Confidence:** VERIFIED (warning + source) · **Status:** open
+- **Category:** protocol / interoperability (reliability) · **Priority:** Medium · **Confidence:** VERIFIED (warning + source) · **Status:** fixed (§9.3)
 - **Description.** The NTCP2 dial path records each attempt's ending against the peer's profile (`watchHandshake`), which is what schedules the 1/2/5/15/30-minute retry ladder. The SSU2 dial path calls `try? ssu2.connect(...)` and ignores the result; a peer reachable only over UDP therefore never gets a failure recorded and is never backed off.
 - **Evidence.** `Untitled1/I2P/I2PRouterAppContext.swift:823-825` and `:894-896` (both `try? ssu2.connect(...)`, result discarded); the compiler flags both: *"warning: result of 'try?' is unused [#NoUsage]"* at 823 and 894. Contrast `:808-819`, where the NTCP2 session is passed to `watchHandshake(of:peer:)` at `:841-866`.
 - **Validation performed.** Observed the two warnings in the `build-for-testing` log, then read the surrounding code and `I2PPeerHandshakeBackoff.swift` to confirm the asymmetry.
@@ -547,3 +547,16 @@ Eleven of eleven. Before the change, five of them failed with the `@main` error 
 - The workflow file parses as YAML: `jobs: build-and-test, protocol-suites` (9 and 5 steps).
 
 **Not verified here.** The XCTest cases have not been *executed* — the build Mac has no simulator runtime. Whether the SAM conformance suite and the UDP loopback suites behave identically inside a simulator process is exactly what the first real CI run will answer (AUD-02).
+
+### 9.3 — AUD-10: SSU2 dial failures are recorded and backed off
+
+**Change.**
+- `I2PPeerHandshakeFailureReason` gains `udpConnectFailed` ("UDP session could not be opened"), because a synchronous SSU2 setup failure is not a TCP timeout and the peer inspector should not say it was.
+- `I2PRouterAppContext` no longer discards the result of `ssu2.connect`. A new `startSSU2Dial` records `udpConnectFailed` when the session cannot be built; `dialSSU2` records `handshakeTimeout` when its window closes without an established session; and a new `watchSSU2Handshake` gives the fire-and-forget path (a peer with no NTCP2 address) the same treatment the NTCP2 path already had. Both paths feed the existing 1/2/5/15/30-minute ladder, so an SSU2-only peer stops being redialled on every maintenance tick.
+
+**Verification.**
+- Harness compiles and the full suite runs: `278 passed, 2 failed` (the two unchanged bundle-only Keychain checks), up one check because of the new case.
+- New case `Handshake backoff · a UDP dial failure lands on the same ladder as a TCP one` passes: two UDP failures produce a 1-minute then a 2-minute next attempt, the reading carries the new reason, and its label reads "UDP session could not be opened".
+- The app builds for the simulator (`xcode_build`, Debug) with the changed router context.
+
+**Not verified here.** No SSU2 peer was dialled, so the recording runs in the failure direction only — the success path (`.recordSuccess` on an established session) was already covered by the wiring suite.

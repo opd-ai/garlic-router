@@ -26,6 +26,9 @@ enum I2PPeerHandshakeFailureReason: String, Equatable {
     case peerClosedAfterSessionRequest
     case connectTimeout
     case handshakeTimeout
+    /// An SSU2 dial could not be started at all over UDP: the session could not
+    /// be built or its handshake never ran.
+    case udpConnectFailed
 
     /// The words the peer inspector shows beside the last failure.
     var label: String {
@@ -33,6 +36,7 @@ enum I2PPeerHandshakeFailureReason: String, Equatable {
         case .peerClosedAfterSessionRequest: return "Peer closed after SessionRequest"
         case .connectTimeout: return "TCP connect timed out"
         case .handshakeTimeout: return "Handshake window expired"
+        case .udpConnectFailed: return "UDP session could not be opened"
         }
     }
 
@@ -311,6 +315,23 @@ enum I2PPeerHandshakeBackoffSelfTest {
                 }
             }
             return "6 failures → 1m, 2m, 5m, 15m, 30m, 30m"
+        }
+
+        run("Handshake backoff · a UDP dial failure lands on the same ladder as a TCP one") {
+            let store = I2PPeerHandshakeBackoff()
+            let hash = I2PCrypto.randomBytes(32)
+            let start = Date(timeIntervalSince1970: 1_700_000_000)
+            let first = store.recordFailure(hash, reason: .udpConnectFailed, now: start)
+            let second = store.recordFailure(hash, reason: .udpConnectFailed,
+                                             now: start.addingTimeInterval(60))
+            guard first.nextAttemptAt?.timeIntervalSince(start) == 60,
+                  second.nextAttemptAt?.timeIntervalSince(start) == 180,
+                  store.reading(hash)?.reason == .udpConnectFailed,
+                  I2PPeerHandshakeFailureReason.udpConnectFailed.label
+                    == "UDP session could not be opened" else {
+                throw I2PWireError.invalidFormat
+            }
+            return "two UDP failures → 1m then 2m; the inspector reads the UDP wording"
         }
 
         run("Handshake backoff · a peer inside its window is held back, then due") {
