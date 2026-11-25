@@ -241,18 +241,18 @@ Every candidate lead was checked against the current implementation. **23 surviv
 
 ### AUD-17 — Five developer probes cannot compile as written
 
-- **Category:** dead / orphan code · **Priority:** Low · **Confidence:** VERIFIED · **Status:** open
-- **Description.** `DbProbe`, `KeyProbe`, `Msg1Probe`, `NetDBProbe` and `WireProbe` each declare `@main` inside a file named `main.swift`, which the Swift compiler rejects. They are diagnostic harnesses left over from earlier debugging passes.
-- **Evidence.** `DbProbe/main.swift:19`, `KeyProbe/main.swift:8`, `Msg1Probe/main.swift:7`, `NetDBProbe/main.swift:6`, `WireProbe/main.swift:8`. Compiler experiment run in this audit:
+- **Category:** dead / orphan code · **Priority:** Low · **Confidence:** VERIFIED · **Status:** fixed (§9.1)
+- **Description.** `DbProbe`, `KeyProbe`, `Msg1Probe`, `NetDBProbe` and `WireProbe` each declared `@main` inside a file named `main.swift`, which the Swift compiler rejects. They are diagnostic harnesses left over from earlier debugging passes.
+- **Evidence.** At the time of the audit: `DbProbe/main.swift:19`, `KeyProbe/main.swift:8`, `Msg1Probe/main.swift:7`, `NetDBProbe/main.swift:6`, `WireProbe/main.swift:8`. Compiler experiment run in this audit:
   ```
   $ printf '@main\nstruct A { static func main() { print("hi") } }\n' > .probe-build/atmain/main.swift
   $ swiftc -o .probe-build/atmain/a .probe-build/atmain/main.swift
   main.swift:1:1: error: 'main' attribute cannot be used in a module that contains top-level code
   ```
   `DhtProbe`, `Diagnose`, `MainnetProbe`, `NetDiag` and `SelfTestProbe` use top-level code and are unaffected; `LiveProbe/run.swift` is legal because its file is not named `main.swift`.
-- **Validation performed.** Enumerated the entry-point style of all eleven harnesses and reproduced the compiler error.
+- **Validation performed.** Enumerated the entry-point style of all eleven harnesses, reproduced the compiler error, then recompiled every harness against the current I2P sources after the fix (§9.1).
 - **Impact.** No shipped effect. It is the residue of a harness-rot class the 2026-11-18 pass fixed for three other probes but not these five.
-- **Recommended next action.** Convert them to top-level code as the others were, or delete them (see AUD-18).
+- **Recommended next action.** Done — see §9.1. The two additional defects that only the recompile could reveal (a renamed symbol and an `Int8` literal) are recorded there.
 
 ### AUD-18 — Seven harnesses and one Python tool have no documented entry point
 
@@ -503,3 +503,26 @@ No application code, test, workflow, build setting or general-purpose document w
 - The repository's CI has never run, so no statement in this document about CI is evidence about a runner (AUD-02).
 - Every live-network statement is either quoted from the project's own recorded runs or marked UNVERIFIED; none was re-observed here.
 - The `README.md` copy found inside the built app bundle could not be traced to a build phase (§4, L-6).
+
+---
+
+## 9. Remediation log
+
+Fixes applied after the audit, newest last. Each entry names the finding it closes and the check that was actually run.
+
+### 9.1 — AUD-17: every developer harness compiles again
+
+**Change.** The five probes that declared `@main` inside `main.swift` were renamed so the attribute is legal, with no change to their bodies: `DbProbe/main.swift` → `DbProbe/DbProbe.swift`, and the same for `KeyProbe`, `Msg1Probe`, `NetDBProbe` and `WireProbe`. The rename alone would have left two probes broken, and only a real compile could say so:
+
+- `NetDBProbe` called `I2PNetDBTests.runAll()`; that type has not existed since the suite was renamed to `I2PNetDBSelfTest`. It was calling a symbol the compiler cannot resolve.
+- `WireProbe` printed `own.addresses.first?.cost ?? -1` into an `UInt8` field, so the `-1` default was an `Int8` overflow at compile time. It now formats the cost as a string with `-` when no address exists.
+
+**Verification.** Every harness in the repository was compiled against the current I2P sources on the build Mac:
+
+```
+DbProbe exit=0   DhtProbe exit=0      Diagnose exit=0     KeyProbe exit=0
+LiveProbe exit=0 MainnetProbe exit=0  Msg1Probe exit=0    NetDBProbe exit=0
+NetDiag exit=0   SelfTestProbe exit=0 WireProbe exit=0
+```
+
+Eleven of eleven. Before the change, five of them failed with the `@main` error and two of those five had a second, independent defect behind it.

@@ -14,7 +14,8 @@ struct WireProbe {
         let ntcp2 = context.mainnetNTCP2
         await context.ensureReachableAddress()
         let own = context.mainnetSignedRouterInfo
-        print("our RI cost=\(own.addresses.first?.cost ?? -1) options=\(own.addresses.first?.options ?? [:])")
+        let cost = own.addresses.first.map { String($0.cost) } ?? "-"
+        print("our RI cost=\(cost) options=\(own.addresses.first?.options ?? [:])")
         print("router info version=\(own.options)")
 
         var floodfills = 0

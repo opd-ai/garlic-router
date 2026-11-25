@@ -6,7 +6,7 @@ import Foundation
 @main
 struct NetDBProbe {
     static func main() async {
-        let results = await I2PNetDBTests.runAll()
+        let results = await I2PNetDBSelfTest.runAll()
         var passed = 0
         for result in results {
             print("[\(result.passed ? "PASS" : "FAIL")] \(result.name)")
