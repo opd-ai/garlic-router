@@ -442,7 +442,7 @@ enum I2PSpecTruthTable {
             wire: "Lookup: key (32) + from (32 or SH) + [replyToken (4) + reply gateway] + flags (1) + [excluded peers (1 count + hashes)]. SearchReply: from (32) + count (1) + candidate hashes + published timestamp (8).",
             encoding: "Flags: tunnel-vs-router reply addressing; excluded peers bound lookup scope.",
             crypto: "n/a",
-            edges: "Reply-token gating; iterative rounds use SearchReply candidates; excluded-peer lists bounded.",
+            edges: "Reply-token gating; iterative rounds use SearchReply candidates; excluded-peer lists bounded. Encrypted-reply requests (flags 0x02/0x10) are recorded on parse and refused by the netdb rather than answered in the wrong shape; this router never sends one — its own lookups ask in clear, which interoperates.",
             status: .pendingWireVerification,
             tests: ["T4-NP-DBLOOKUP-RT", "T4-NP-DBLOOKUP-EDGE"]),
         row("NP-TUNDATA", .i2np,

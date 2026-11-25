@@ -1359,6 +1359,21 @@ enum I2PCrossValidation {
             replyTunnels: [(gateway, 0x0000_0BEE)],
             replyToken: 0x1234_ABCD, replyTunnelId: 7, replyGateway: queryKey)
         let encoded = lookup.serialize()
+        // The outbound lookup never asks for an encrypted reply, so the flags byte
+        // (query key 32 + from hash 32 = byte 64) carries neither bit 0x02 nor
+        // 0x10. A request that arrives from a peer *is* recorded, and is not
+        // echoed back when the message is reserialized.
+        let flagsIndex = encoded.startIndex + 64
+        guard encoded.count > 64, encoded[flagsIndex] & 0x12 == 0 else {
+            throw I2PWireError.invalidFormat
+        }
+        var askingBytes = encoded
+        askingBytes[flagsIndex] |= 0x02
+        let asking = try I2PDatabaseLookup.parse(askingBytes)
+        guard asking.encryptedReplyRequested,
+              asking.serialize()[flagsIndex] & 0x12 == 0 else {
+            throw I2PWireError.invalidFormat
+        }
         let parsed = try I2PDatabaseLookup.parse(encoded)
         guard parsed.serialize() == encoded else { throw I2PWireError.invalidFormat }
         guard parsed.excludedPeers.count == 3, parsed.replyTunnels.count == 1,
@@ -1378,7 +1393,7 @@ enum I2PCrossValidation {
         guard try I2PDatabaseSearchReply.parse(replyBytes).serialize() == replyBytes else {
             throw I2PWireError.invalidFormat
         }
-        return "lookup (full + minimal) and search replies round trip byte-for-byte"
+        return "lookup (full + minimal) and search replies round trip byte-for-byte; outbound lookups never request an encrypted reply, an inbound request is recorded and not echoed"
     }
 
     private static func deliveryInstructionsRoundTrip() throws -> String {

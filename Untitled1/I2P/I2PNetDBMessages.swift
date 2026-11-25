@@ -132,14 +132,18 @@ struct I2PDatabaseLookup {
     let replyToken: UInt32
     let replyTunnelId: UInt32
     let replyGateway: Data
-    /// True when the requester asked for an encrypted reply (flags bits 1/4).
-    let encryptedReplyRequested: Bool
+    /// True when the *peer* asked for an encrypted reply (flags bits 1/4). This
+    /// router never asks for one: it looks up and is answered in clear, which
+    /// interoperates, and an inbound lookup that wants ECIES replies is refused
+    /// by the netdb rather than answered in the wrong shape. The flag is set only
+    /// by `parse`, never by `serialize`.
+    private(set) var encryptedReplyRequested: Bool
     let lookupType: I2PLookupKind
 
     init(queryKey: Data, fromHash: Data, excludedPeers: [Data] = [],
          replyTunnels: [(gateway: Data, tunnelId: UInt32)] = [],
          replyToken: UInt32 = 0, replyTunnelId: UInt32 = 0, replyGateway: Data = Data(),
-         encryptedReplyRequested: Bool = false, lookupType: I2PLookupKind = .any) {
+         lookupType: I2PLookupKind = .any) {
         precondition(queryKey.count == 32 && fromHash.count == 32)
         if replyToken > 0 {
             precondition(replyGateway.count == 32, "reply gateway must be a 32-byte hash")
@@ -151,7 +155,7 @@ struct I2PDatabaseLookup {
         self.replyToken = replyToken
         self.replyTunnelId = replyTunnelId
         self.replyGateway = replyGateway
-        self.encryptedReplyRequested = encryptedReplyRequested
+        self.encryptedReplyRequested = false
         self.lookupType = lookupType
     }
 
@@ -160,6 +164,8 @@ struct I2PDatabaseLookup {
         w.hash(queryKey)
         let tunnel = replyTunnels.first
         w.hash(tunnel?.gateway ?? fromHash)
+        // No encrypted-reply bits: this router asks in clear (see
+        // `encryptedReplyRequested`), so the flag can never claim otherwise.
         var flags: UInt8 = (lookupType.rawValue & 0x03) << 2
         if tunnel != nil { flags |= 0x01 }
         w.byte(flags)
@@ -192,15 +198,16 @@ struct I2PDatabaseLookup {
         let encrypted = flags & 0x12 != 0
         let tunnels: [(gateway: Data, tunnelId: UInt32)] = replyTunnelId != 0
             ? [(fromHash, replyTunnelId)] : []
-        return I2PDatabaseLookup(queryKey: queryKey,
-                                 fromHash: fromHash,
-                                 excludedPeers: excludedPeers,
-                                 replyTunnels: tunnels,
-                                 replyToken: 0,
-                                 replyTunnelId: replyTunnelId,
-                                 replyGateway: fromHash,
-                                 encryptedReplyRequested: encrypted,
-                                 lookupType: I2PLookupKind(rawValue: (flags >> 2) & 0x03) ?? .any)
+        var lookup = I2PDatabaseLookup(queryKey: queryKey,
+                                       fromHash: fromHash,
+                                       excludedPeers: excludedPeers,
+                                       replyTunnels: tunnels,
+                                       replyToken: 0,
+                                       replyTunnelId: replyTunnelId,
+                                       replyGateway: fromHash,
+                                       lookupType: I2PLookupKind(rawValue: (flags >> 2) & 0x03) ?? .any)
+        lookup.encryptedReplyRequested = encrypted
+        return lookup
     }
 }
 

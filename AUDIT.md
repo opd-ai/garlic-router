@@ -164,7 +164,7 @@ Every candidate lead was checked against the current implementation. **23 surviv
 
 ### AUD-09 — Encrypted DatabaseLookup replies are parsed but never requested
 
-- **Category:** protocol / interoperability · **Priority:** Medium · **Confidence:** VERIFIED · **Status:** open
+- **Category:** protocol / interoperability · **Priority:** Medium · **Confidence:** VERIFIED · **Status:** fixed (§9.4)
 - **Description.** `I2PDatabaseLookup` carries an `encryptedReplyRequested` flag, but `serialize()` never sets the corresponding flag bits, so no lookup this router sends ever asks for an ECIES-encrypted reply. The field is dead on the write path.
 - **Evidence.** `Untitled1/I2P/I2PNetDBMessages.swift:135-136` (field), `:142` (init parameter), `:154` (assignment), `:158-173` (`serialize()` sets only the delivery and lookup-kind bits — `flags |= 0x01`, `(lookupType.rawValue & 0x03) << 2`). The only consumer is `Untitled1/I2P/I2PNetDB.swift:462`, which uses it to *refuse to answer* an encrypted request. `INTEROP_REPORT.md:111-113` records it as "still a product decision".
 - **Validation performed.** Grepped every occurrence of the symbol across `Untitled1/` and read the serializer and parser in full.
@@ -560,3 +560,16 @@ Eleven of eleven. Before the change, five of them failed with the `@main` error 
 - The app builds for the simulator (`xcode_build`, Debug) with the changed router context.
 
 **Not verified here.** No SSU2 peer was dialled, so the recording runs in the failure direction only — the success path (`.recordSuccess` on an established session) was already covered by the wiring suite.
+
+### 9.4 — AUD-09: the encrypted-reply parameter can no longer lie
+
+**Decision.** Implement or remove? Encrypted DatabaseLookup replies need the reply key and tag on the wire *and* an ECIES decrypt path for the answer — a protocol feature, not a fix. The audit's own guidance was "either implement it, or remove the parameter and note the omission". The second was done, because the honest state of the code is that this router looks up in clear, which interoperates (`INTEROP_REPORT.md` §5.5 records it as a product decision).
+
+**Change.**
+- `I2PDatabaseLookup.encryptedReplyRequested` is now `private(set) var`, set by `parse` only. The initialiser no longer accepts it, so no outbound lookup can be built that claims to ask for an encrypted reply and then not send one.
+- `serialize()` carries a comment at the flags byte saying why the bits are absent.
+- The truth-table row `NP-DBLOOKUP` now states the rule in its edge cases: requests from peers are recorded and refused rather than answered in the wrong shape; our own lookups ask in clear.
+
+**Verification.**
+- `T4-NP-DBLOOKUP-RT` now asserts three things and passes: the serialized flags byte (offset 64) carries neither 0x02 nor 0x10; a lookup whose wire bytes do carry 0x02 parses with `encryptedReplyRequested == true`; and reserializing it does **not** echo the flag.
+- `--alignment` → 74 passed, 1 failed (the unchanged bundle-only SU3 case); `--all` → 278 passed, 2 failed (unchanged).
