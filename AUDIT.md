@@ -152,15 +152,15 @@ Every candidate lead was checked against the current implementation. **23 surviv
 - **Dependencies/blockers.** AUD-06 (SSU2) plus a reachable address.
 - **Recommended next action.** Same as AUD-06; do not treat the absence as a bug until a reachable path exists.
 
-### AUD-08 — I2NP messages are not fragmented across NTCP2 blocks, and the row still says "aligned"
+### AUD-08 — The truth table claimed a fragmentation gap that the specification forbids
 
-- **Category:** protocol / interoperability · **Priority:** Medium · **Confidence:** VERIFIED (source text) · **Status:** open
-- **Description.** The truth table records that I2NP messages larger than one NTCP2 block are not fragmented, and that all current live traffic happens to fit a single block. The same row's status is `aligned`, so the Alignment screen and its export present an unimplemented path as conformant.
-- **Evidence.** `Untitled1/I2P/I2PSpecTruthTable.swift:412` — *"messages larger than one NTCP2 block are not yet fragmented (all live-suite traffic fits a single block) — tracked as the remaining gap"*; the row `NP-HEADER` closes with `status: .aligned` on line 413. SSU2 does have both session-confirmed and I2NP fragmenters (`I2PSSU2.swift:596-700`); NTCP2 does not.
-- **Validation performed.** Read the row and searched the whole `I2P/` tree for fragmentation logic — the only fragmenters found are in `I2PSSU2.swift`.
-- **Impact.** Any larger message (a large LeaseSet2 bundle, a long garlic clove set, a big DatabaseStore) would be silently truncated or rejected by a peer once real traffic flows. The row's status would also mislead a reader of the exported compliance JSON.
-- **Dependencies/blockers.** None; this is self-contained work in the NTCP2 data-phase writer.
-- **Recommended next action.** Either implement NTCP2 block fragmentation and add a golden-vector test, or downgrade `NP-HEADER` to `pendingWireVerification` until it exists. Do not leave `aligned` on a row that documents its own gap.
+- **Category:** protocol / interoperability · **Priority:** Medium · **Confidence:** VERIFIED (source text) · **Status:** resolved as a documentation defect (§9.5)
+- **Description.** The `NP-HEADER` row recorded that I2NP messages larger than one NTCP2 block "are not yet fragmented … tracked as the remaining gap", while the same row's status was `aligned`. Checked against the specification, the premise was wrong: NTCP2 forbids fragmentation.
+- **Evidence.** `Untitled1/I2P/I2PSpecTruthTable.swift:412` (row `NP-HEADER`, before the fix) and `:413` (`status: .aligned`). Counter-evidence, NTCP2 spec §Data Phase → "I2NP Message": *"An single I2NP message with a modified header. **I2NP messages may not be fragmented across blocks or across ChaChaPoly frames.**"* and *"Maximum single block data size is 65516 bytes."* Fetched from `https://i2p.net/en/docs/specs/ntcp2/` on 2026-11-25 ("Updated: 2026-07, Accurate for: 0.9.70").
+- **Validation performed.** Read the row; searched the `I2P/` tree for fragmentation logic (the only fragmenters are in `I2PSSU2.swift`, where SSU2 does define them); then fetched the NTCP2 specification, which settles the question against the row's wording.
+- **Impact.** A reader of the Alignment screen and of the exported JSON was told a capability was missing that the protocol does not have, and the row contradicted itself. The code was not at fault: `I2PNTCP2.sendOnQueue` already refused oversize payloads.
+- **Dependencies/blockers.** None.
+- **Recommended next action.** Done — see §9.5.
 
 ### AUD-09 — Encrypted DatabaseLookup replies are parsed but never requested
 
@@ -573,3 +573,15 @@ Eleven of eleven. Before the change, five of them failed with the `@main` error 
 **Verification.**
 - `T4-NP-DBLOOKUP-RT` now asserts three things and passes: the serialized flags byte (offset 64) carries neither 0x02 nor 0x10; a lookup whose wire bytes do carry 0x02 parses with `encryptedReplyRequested == true`; and reserializing it does **not** echo the flag.
 - `--alignment` → 74 passed, 1 failed (the unchanged bundle-only SU3 case); `--all` → 278 passed, 2 failed (unchanged).
+
+### 9.5 — AUD-08: the "missing fragmentation" was a documentation defect
+
+**What the specification says.** NTCP2 §Data Phase, "I2NP Message": *"I2NP messages may not be fragmented across blocks or across ChaChaPoly frames"*, with a single block's data capped at 65516 bytes. Fragmenting would have been the divergence, not the fix.
+
+**Change.**
+- The `NP-HEADER` row's edge-case text now states the spec rule instead of claiming a gap, so the Alignment screen and its JSON export stop reporting a capability the protocol forbids.
+- `I2PNTCP2.sendOnQueue` tightened its guard from the *frame* maximum (65519) to the *block* maximum (65516) with the spec sentence quoted at the check, so the row's claim ("oversize payloads rejected") is exact. The oversize path still throws rather than truncating.
+
+**Verification.** Harness compiles; `--alignment` → 74 passed, 1 failed (the unchanged bundle-only SU3 case); `--all` → 278 passed, 2 failed (unchanged). No test sends a message between 65517 and 65519 bytes, so no expectation changed.
+
+**Note.** This finding is closed as *invalid premise*, not as *fixed code*: the code was already right and the document was wrong. That distinction matters for anyone reading the roadmap, which is why it stays in the record rather than disappearing.

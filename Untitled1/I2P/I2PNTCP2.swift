@@ -470,7 +470,12 @@ final class NTCP2Session: NSObject {
         } else {
             shortMessage = data
         }
-        guard shortMessage.count <= 65519 else {
+        // The NTCP2 spec (Data Phase, "I2NP Message") bounds a single block's
+        // data at 65516 bytes, and states that I2NP messages "may not be
+        // fragmented across blocks or across ChaChaPoly frames". An oversize
+        // message is therefore refused here rather than split, and the limit is
+        // the block's, not the frame's.
+        guard shortMessage.count <= 65516 else {
             throw NTCP2Error.notEstablished
         }
         bytesOut += shortMessage.count
