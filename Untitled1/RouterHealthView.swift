@@ -64,6 +64,9 @@ struct RouterHealthView: View {
                         trafficCard
                     }
                     interruptionCard
+                    if reading.hasDowntime {
+                        downtimeCard
+                    }
                 } else {
                     trendCard
                 }
@@ -563,6 +566,57 @@ struct RouterHealthView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(16)
         .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 18))
+    }
+
+    // MARK: - Downtime by cause
+
+    /// How the selected window's downtime splits by cause. Each cause totals the
+    /// time attributed to it after an overlap is counted once, so the rows add up
+    /// to no more than the window; a gap that is still open shows as
+    /// unmeasurable rather than as an outage that has already ended.
+    private var downtimeCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Downtime by cause")
+                .font(.headline)
+                .foregroundStyle(.primary)
+                .accessibilityAddTraits(.isHeader)
+
+            ForEach(reading.downtime) { entry in
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(downtimeColor(entry.cause))
+                        .frame(width: 7, height: 7)
+                        .accessibilityHidden(true)
+                    Text(entry.cause.title)
+                        .font(.footnote)
+                    Spacer(minLength: 8)
+                    Text(entry.count == 1 ? "1 gap" : "\(entry.count) gaps")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(entry.seconds.map(durationText) ?? "Measuring")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(entry.isMeasurable ? .primary : .secondary)
+                        .frame(minWidth: 52, alignment: .trailing)
+                }
+                .accessibilityElement(children: .combine)
+            }
+
+            Text("Overlapping gaps are counted once, from the most specific cause down.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 18))
+    }
+
+    private func downtimeColor(_ cause: I2PRouterHealthInterruption.Cause) -> Color {
+        switch cause {
+        case .routerStopped: return Color.red.opacity(0.85)
+        case .appSuspended: return warning
+        case .samplingPaused: return Color.gray
+        }
     }
 
     // MARK: - Formatting

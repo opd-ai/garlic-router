@@ -696,4 +696,19 @@ xcodebuild build-for-testing -project Untitled1.xcodeproj -scheme Untitled1 \
 **Still failing under `-swift-version 6` (enumerated, not yet changed).** The same declaration shape appears elsewhere; each is one of:
 - an `ObservableObject` singleton (`static let shared = …`), e.g. `I2PBrowserHistoryStore`, `I2PSavedHostsStore`, `I2PIRCKeywordBook`, `I2PIRCServerBook`, `I2POfflinePageStore`, `I2PB33HostBook`, `I2PLastReadPageStore`, `I2PIRCIgnoreBook`, `I2PIRCHistoryStore`, `I2PIRCSnoozeBook`, `I2PIRCServerPasswordKeychain`;
 - a non-`Sendable` class singleton, e.g. `I2PRouterAppContext`, `I2PTunnelPool`, `I2PEepsiteClient`.
-The fix for the first group is `@MainActor` isolation (their mutations are already documented as main-thread only); for the second, a lock-guarded store as above or an explicit `Sendable` conformance where the type really is immutable.
+
+**An approach tried and reverted.** Annotating the eleven `ObservableObject` stores `@MainActor` does **not** work, and the build says so: it broke 38 sites (`main actor-isolated initializer 'init(defaults:storageKey:credentialledHosts:lookup:)' cannot be called from outside of the actor`) and failed `xcodebuild`, because the engines, the self-tests and `I2POfflinePages`' default arguments construct and call these stores off the main actor. Those types are genuinely reachable from more than one isolation domain today, so "their mutations are main-thread only" is true of the views and false of the rest: the honest fix is the lock-guarded store shape used above (or moving the off-main callers onto the main actor first), one store at a time, each verified by a build. Recorded here so the next pass does not repeat it.
+
+
+### 9.16 — Roadmap: the router health screen breaks downtime down by cause
+
+**Change.** `I2PRouterHealthReading` gains a `downtime` breakdown and the health screen a "Downtime by cause" card:
+
+- `I2PRouterHealthDowntime` gives, per cause, the number of gaps and the seconds attributed to it, in one order: intentional clean stop, app suspension, unexplained sampling gap.
+- `downtime(interruptions:in:openSince:)` clips every gap to the selected window and attributes time to one cause only. Two gaps that overlap are counted once: the earlier-cited cause keeps the time and the later one gets only the remainder, which is what keeps the rows from summing past the window. Each piece is subtracted with an interval-splitting helper rather than by adjusting totals.
+- A gap that has not closed reports no duration. An open app suspension (suspended, not yet resumed) shows as "Measuring" instead of as an outage that has already ended, because the time so far is not the outage.
+- The card is shown only when the window holds downtime, so an empty window keeps its existing empty state and adds no card.
+
+**Verification.** Harness `--router-health` → **6 passed, 0 failed**, one more than before. The new case asserts a 0–300 s suspension and a 120–180 s clean stop inside it read as **240 s** and **60 s** (the 60 s overlap counted once), a separate 40 s sampling gap stays 40 s, an interruption wholly outside the window contributes nothing, and an open suspension has `seconds == nil`. `--all` → **280 passed, 2 failed** (the two unchanged bundle-only Keychain checks); `--alignment` → 74 passed, 1 failed (the unchanged bundle-only reseed-certificate case). The app builds.
+
+**Not verified.** The rendered card was not seen: no simulator runtime here, so the layout, the colours and the "Measuring" state are checked at source only. The new unit test in `I2PRouterHealthExportTests` style was not added for this case — the harness case covers the logic — and no XCTest was executed.

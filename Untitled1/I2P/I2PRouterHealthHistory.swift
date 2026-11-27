@@ -103,6 +103,20 @@ struct I2PRouterHealthChartPoint: Identifiable {
     var value: Double { sample.available ? 100 : 0 }
 }
 
+/// How much of the window each cause accounts for, after overlapping time is
+/// attributed once. A cause whose gap has not closed yet reports no duration:
+/// an unfinished gap has no measurable total, and reporting the time so far
+/// would read as a completed outage.
+struct I2PRouterHealthDowntime: Identifiable, Equatable {
+    let cause: I2PRouterHealthInterruption.Cause
+    let count: Int
+    /// Seconds attributed to this cause, or nil when a gap of it is still open.
+    let seconds: TimeInterval?
+
+    var id: String { cause.rawValue }
+    var isMeasurable: Bool { seconds != nil }
+}
+
 struct I2PRouterHealthReading {
     let samples: [I2PRouterHealthSample]
     let chartPoints: [I2PRouterHealthChartPoint]
@@ -112,8 +126,12 @@ struct I2PRouterHealthReading {
     let receivedBytes: Int
     let sentBytes: Int
     let lastInterruption: I2PRouterHealthInterruption?
+    /// The window's interruptions attributed to one cause each, in the order
+    /// the screen lists them. Empty when the window holds no interruption.
+    let downtime: [I2PRouterHealthDowntime]
 
     var hasSamples: Bool { !samples.isEmpty }
+    var hasDowntime: Bool { !downtime.isEmpty }
 }
 
 // MARK: - Local recorder
@@ -334,6 +352,7 @@ final class I2PRouterHealthHistory: @unchecked Sendable {
         let cutoff = now.addingTimeInterval(-window.duration)
         let selected = allSamples(at: now).filter { $0.sampledAt >= cutoff }
         let selectedEvents = allEvents(at: now).filter { $0.occurredAt >= cutoff }
+        let openSuspension = isSuspensionOpen(at: now)
         var segment = 0
         let points = selected.map { sample -> I2PRouterHealthChartPoint in
             if sample.interruptionBefore != nil { segment += 1 }
@@ -343,7 +362,10 @@ final class I2PRouterHealthHistory: @unchecked Sendable {
         guard let first = selected.first, let last = selected.last else {
             return I2PRouterHealthReading(samples: [], chartPoints: [], events: selectedEvents,
                                           uptimePercent: nil, onlineSeconds: 0,
-                                          receivedBytes: 0, sentBytes: 0, lastInterruption: nil)
+                                          receivedBytes: 0, sentBytes: 0, lastInterruption: nil,
+                                          downtime: downtime(interruptions: [],
+                                                             in: cutoff...now,
+                                                             openSince: openSuspension))
         }
 
         let windowStart = max(cutoff, first.sampledAt.addingTimeInterval(-first.availableSeconds))
@@ -365,8 +387,79 @@ final class I2PRouterHealthHistory: @unchecked Sendable {
             onlineSeconds: onlineSeconds,
             receivedBytes: selected.reduce(0) { $0 + $1.receivedBytes },
             sentBytes: selected.reduce(0) { $0 + $1.sentBytes },
-            lastInterruption: selected.compactMap(\.interruptionBefore).last
+            lastInterruption: selected.compactMap(\.interruptionBefore).last,
+            downtime: downtime(interruptions: selected.compactMap(\.interruptionBefore),
+                              in: cutoff...now,
+                              openSince: openSuspension)
         )
+    }
+
+    private func isSuspensionOpen(at now: Date) -> Date? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard isSuspended, resumedAt == nil else { return nil }
+        return suspensionStartedAt
+    }
+
+    /// Attributes each interruption to one cause, clipping to the window and
+    /// subtracting time already attributed, so the totals never double-count an
+    /// overlap. The order is the most specific cause first: an intentional
+    /// shutdown outranks an app suspension, which outranks a fallback sampling
+    /// gap. A cause whose gap is still open reports no duration.
+    func downtime(interruptions: [I2PRouterHealthInterruption],
+                  in range: ClosedRange<Date>,
+                  openSince: Date? = nil) -> [I2PRouterHealthDowntime] {
+        var claimed: [(start: Date, end: Date)] = []
+        var breakdown: [I2PRouterHealthDowntime] = []
+
+        for cause in [I2PRouterHealthInterruption.Cause.routerStopped, .appSuspended, .samplingPaused] {
+            var count = 0
+            var seconds: TimeInterval = 0
+
+            for interruption in interruptions where interruption.cause == cause {
+                let start = max(range.lowerBound, interruption.startedAt)
+                let end = min(range.upperBound, interruption.startedAt.addingTimeInterval(interruption.duration))
+                guard end > start else { continue }
+                count += 1
+                for slice in Self.unclaimed(from: start, to: end, claimed: claimed) {
+                    seconds += slice.end.timeIntervalSince(slice.start)
+                    claimed.append(slice)
+                }
+            }
+
+            var open = false
+            if cause == .appSuspended, let openSince, range.contains(openSince) {
+                count += 1
+                open = true
+            }
+
+            guard count > 0 else { continue }
+            breakdown.append(I2PRouterHealthDowntime(cause: cause,
+                                                    count: count,
+                                                    seconds: open ? nil : seconds))
+        }
+        return breakdown
+    }
+
+    /// The parts of [start, end] that no claimed interval already covers.
+    private static func unclaimed(from start: Date,
+                                  to end: Date,
+                                  claimed: [(start: Date, end: Date)]) -> [(start: Date, end: Date)] {
+        var pieces = [(start: start, end: end)]
+        for taken in claimed {
+            pieces = pieces.flatMap { piece -> [(start: Date, end: Date)] in
+                guard taken.start < piece.end, taken.end > piece.start else { return [piece] }
+                var result: [(start: Date, end: Date)] = []
+                if taken.start > piece.start {
+                    result.append((piece.start, taken.start))
+                }
+                if taken.end < piece.end {
+                    result.append((taken.end, piece.end))
+                }
+                return result
+            }
+        }
+        return pieces
     }
 
     private func allEvents(at now: Date) -> [I2PRouterHealthEvent] {
@@ -461,6 +554,44 @@ enum I2PRouterHealthHistorySelfTest {
                   reading.chartPoints.map({ $0.sample.readyTunnels }) == [1, 1, 2],
                   reading.chartPoints.map(\.segment) == [0, 0, 1] else { return nil }
             return "App suspended · peer and ready-tunnel samples retain values and restart as separate chart segments"
+        }
+
+        check("Router health: downtime is broken down by cause without double-counting an overlap") {
+            let start = Date(timeIntervalSince1970: 1_700_200_000)
+            let range = start...(start.addingTimeInterval(600))
+            // An app suspension 0–300 s and a clean shutdown 120–180 s inside it.
+            let suspended = I2PRouterHealthInterruption(startedAt: start, duration: 300,
+                                                       cause: .appSuspended)
+            let stopped = I2PRouterHealthInterruption(startedAt: start.addingTimeInterval(120),
+                                                     duration: 60, cause: .routerStopped)
+            let gap = I2PRouterHealthInterruption(startedAt: start.addingTimeInterval(400),
+                                                 duration: 40, cause: .samplingPaused)
+            let history = I2PRouterHealthHistory(defaults: UserDefaults(suiteName:
+                "i2p.health.downtime.\(UUID().uuidString)")!)
+            let breakdown = history.downtime(interruptions: [suspended, stopped, gap], in: range)
+            guard breakdown.map(\.cause) == [.routerStopped, .appSuspended, .samplingPaused],
+                  breakdown[0].seconds == 60, breakdown[0].count == 1,
+                  // 300 s of suspension minus the 60 s already attributed to
+                  // the router stop: the overlap is counted once.
+                  breakdown[1].seconds == 240, breakdown[1].count == 1,
+                  breakdown[2].seconds == 40, breakdown[2].count == 1,
+                  breakdown.allSatisfy(\.isMeasurable) else { return nil }
+
+            // An interruption outside the window contributes nothing.
+            let old = I2PRouterHealthInterruption(startedAt: start.addingTimeInterval(-500),
+                                                  duration: 120, cause: .samplingPaused)
+            guard history.downtime(interruptions: [old], in: range).isEmpty else { return nil }
+
+            // An open suspension has no measurable total yet.
+            let open = history.downtime(interruptions: [],
+                                        in: range,
+                                        openSince: start.addingTimeInterval(560))
+            guard open.count == 1,
+                  open[0].cause == .appSuspended,
+                  open[0].count == 1,
+                  open[0].seconds == nil,
+                  !open[0].isMeasurable else { return nil }
+            return "0–300 s suspension and 120–180 s stop read as 240 s and 60 s (overlap counted once), the 40 s gap stays separate, and an open suspension reads as unmeasurable"
         }
 
         check("Router health: explicit router lifecycle events distinguish clean shutdowns from suspension") {
