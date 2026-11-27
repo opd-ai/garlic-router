@@ -29,6 +29,9 @@ let progress: ((String) -> Void)? = CommandLine.arguments.contains("--progress")
 if CommandLine.arguments.contains("--all") {
     results += await I2PSelfTest.runAll(progress: progress)
 }
+if CommandLine.arguments.contains("--router-health") {
+    results += I2PRouterHealthHistorySelfTest.runAll()
+}
 if CommandLine.arguments.contains("--netdb") {
     results += await I2PNetDBSelfTest.runAll()
 }

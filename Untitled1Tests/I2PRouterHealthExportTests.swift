@@ -57,6 +57,61 @@ struct I2PRouterHealthExportTests {
                 == "garlic-router-router-health-2023-11-14.csv")
     }
 
+    @Test func routerLifecycleEventsMarkAnIntentionalShutdownGap() throws {
+        let suite = "i2p.health.lifecycle.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let history = I2PRouterHealthHistory(defaults: defaults)
+        let began = Date()
+        history.recordRouterStart(at: began)
+        history.recordRouterStart(at: began)
+        history.record(available: true, activePeers: 1, readyTunnels: 1,
+                       cumulativeReceivedBytes: 10, cumulativeSentBytes: 10, at: began)
+        history.record(available: true, activePeers: 1, readyTunnels: 1,
+                       cumulativeReceivedBytes: 20, cumulativeSentBytes: 20,
+                       at: began.addingTimeInterval(60))
+
+        let stopped = began.addingTimeInterval(70)
+        let restarted = began.addingTimeInterval(190)
+        history.recordRouterCleanStop(at: stopped)
+        history.recordRouterStart(at: restarted)
+        history.record(available: true, activePeers: 2, readyTunnels: 2,
+                       cumulativeReceivedBytes: 30, cumulativeSentBytes: 30,
+                       at: began.addingTimeInterval(200))
+
+        let reading = history.reading(window: .sixHours, at: began.addingTimeInterval(200))
+        #expect(reading.events.map(\.kind) == [.started, .cleanStop, .started])
+        #expect(reading.samples.last?.interruptionBefore?.cause == .routerStopped)
+        #expect(reading.samples.last?.interruptionBefore?.startedAt == stopped)
+        #expect(reading.samples.last?.interruptionBefore?.duration == 120)
+        #expect(reading.chartPoints.map(\.segment) == [0, 0, 1])
+
+        let restored = I2PRouterHealthHistory(defaults: defaults)
+            .reading(window: .sixHours, at: began.addingTimeInterval(200))
+        #expect(restored.events == reading.events)
+    }
+
+    @Test func appSuspensionRemainsSeparateFromCleanRouterShutdown() throws {
+        let suite = "i2p.health.suspension-events.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let history = I2PRouterHealthHistory(defaults: defaults)
+        let began = Date()
+        history.recordRouterStart(at: began)
+        history.record(available: true, activePeers: 1, readyTunnels: 1,
+                       cumulativeReceivedBytes: 10, cumulativeSentBytes: 10, at: began)
+        let suspended = began.addingTimeInterval(70)
+        let resumed = began.addingTimeInterval(250)
+        history.markAppSuspended(at: suspended)
+        history.resumeSampling(at: resumed)
+        history.record(available: true, activePeers: 1, readyTunnels: 1,
+                       cumulativeReceivedBytes: 10, cumulativeSentBytes: 10, at: resumed)
+
+        let reading = history.reading(window: .sixHours, at: resumed)
+        #expect(reading.lastInterruption?.cause == .appSuspended)
+        #expect(reading.events.map(\.kind) == [.started])
+    }
+
     private func sample(at date: Date,
                         available: Bool,
                         peers: Int,

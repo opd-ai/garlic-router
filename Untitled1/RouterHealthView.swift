@@ -57,10 +57,12 @@ struct RouterHealthView: View {
                 windowPicker
                 exportCard
 
-                if reading.hasSamples {
+                if reading.hasSamples || !reading.events.isEmpty {
                     availabilityCard
                     trendCard
-                    trafficCard
+                    if reading.hasSamples {
+                        trafficCard
+                    }
                     interruptionCard
                 } else {
                     trendCard
@@ -234,12 +236,29 @@ struct RouterHealthView: View {
 
                 ForEach(visibleInterruptions) { interruption in
                     RuleMark(x: .value("Interruption", interruption.midpoint))
-                        .foregroundStyle(warning.opacity(0.75))
+                        .foregroundStyle(interruption.cause == .routerStopped ? Color.red.opacity(0.85) : warning.opacity(0.75))
                         .lineStyle(interruptionLineStyle(for: interruption))
                         .annotation(position: .bottom, alignment: .center, spacing: 3) {
                             if window != .sevenDays {
                                 Text(interruption.cause.title)
                                     .font(.caption2.weight(.medium))
+                                    .foregroundStyle(.primary)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 3)
+                                    .background(.ultraThinMaterial, in: Capsule())
+                                    .fixedSize()
+                            }
+                        }
+                }
+
+                ForEach(visibleEvents) { event in
+                    RuleMark(x: .value("Router event", event.occurredAt))
+                        .foregroundStyle(event.kind == .started ? healthy : Color.red)
+                        .lineStyle(StrokeStyle(lineWidth: 2))
+                        .annotation(position: .top, alignment: .center, spacing: 3) {
+                            if window != .sevenDays {
+                                Text(event.kind.title)
+                                    .font(.caption2.weight(.semibold))
                                     .foregroundStyle(.primary)
                                     .padding(.horizontal, 6)
                                     .padding(.vertical, 3)
@@ -283,10 +302,11 @@ struct RouterHealthView: View {
             .frame(height: 205)
             .accessibilityLabel(availabilityAccessibilityLabel)
 
-            if window == .sevenDays, !visibleInterruptions.isEmpty {
-                Text("Dashed: app suspended · dotted: sampling gap")
+            if !visibleInterruptions.isEmpty || !visibleEvents.isEmpty {
+                Text("Green: start · red: clean stop · dashed: app suspended · dotted: sampling gap · solid: router shutdown")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
@@ -301,19 +321,32 @@ struct RouterHealthView: View {
             .filter { $0.midpoint >= cutoff }
     }
 
+    private var visibleEvents: [I2PRouterHealthEvent] {
+        let cutoff = Date().addingTimeInterval(-window.duration)
+        return reading.events.filter { $0.occurredAt >= cutoff }
+    }
+
     private func interruptionLineStyle(for interruption: I2PRouterHealthInterruption) -> StrokeStyle {
-        guard window == .sevenDays, interruption.cause == .samplingPaused else {
+        switch interruption.cause {
+        case .appSuspended:
             return StrokeStyle(lineWidth: 1, dash: [4, 4])
+        case .samplingPaused:
+            return StrokeStyle(lineWidth: 1, dash: [1, 3])
+        case .routerStopped:
+            return StrokeStyle(lineWidth: 2)
         }
-        return StrokeStyle(lineWidth: 1, dash: [1, 3])
     }
 
     private var availabilityAccessibilityLabel: String {
-        guard !reading.chartPoints.isEmpty else { return "No availability samples yet" }
+        guard !reading.chartPoints.isEmpty || !visibleEvents.isEmpty else {
+            return "No availability samples or router lifecycle events yet"
+        }
         let gaps = visibleInterruptions.count
+        let starts = visibleEvents.filter { $0.kind == .started }.count
+        let stops = visibleEvents.filter { $0.kind == .cleanStop }.count
         return "Availability over the last \(window.title). "
             + "\(reading.uptimePercent.map { String(format: "%.1f percent", $0) } ?? "Uptime not available yet"). "
-            + "\(gaps) sampling interruption\(gaps == 1 ? "" : "s")."
+            + "\(gaps) interruption markers, \(starts) router starts and \(stops) clean stops."
     }
 
     // MARK: - Peer and tunnel trends
@@ -481,20 +514,48 @@ struct RouterHealthView: View {
     // MARK: - Interruptions
 
     private var interruptionCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Last interruption")
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Interruptions & router events")
                 .font(.headline)
                 .foregroundStyle(.primary)
                 .accessibilityAddTraits(.isHeader)
+
             if let interruption = reading.lastInterruption {
-                Text("\(dateText(interruption.startedAt)) · \(durationText(interruption.duration))")
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Last interruption · \(interruption.cause.title)")
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(interruption.cause == .appSuspended ? warning : .primary)
+                    Text("\(dateText(interruption.startedAt)) · \(durationText(interruption.duration))")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Text("No interruptions in this window")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
-                Text(interruption.cause.title)
-                    .font(.caption2)
-                    .foregroundStyle(interruption.cause == .appSuspended ? warning : .secondary)
+            }
+
+            if !visibleEvents.isEmpty {
+                Divider().overlay(Color.white.opacity(0.08))
+                Text("Router lifecycle")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                ForEach(visibleEvents.sorted { $0.occurredAt > $1.occurredAt }.prefix(4)) { event in
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(event.kind == .started ? healthy : Color.red)
+                            .frame(width: 7, height: 7)
+                        Text(event.kind.title)
+                            .font(.footnote)
+                        Spacer(minLength: 8)
+                        Text(dateText(event.occurredAt))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .accessibilityElement(children: .combine)
+                }
             } else {
-                Text("No sampling gaps in this window")
+                Text("No router start or clean-stop events in this window")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }

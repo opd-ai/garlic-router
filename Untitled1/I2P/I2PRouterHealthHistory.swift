@@ -37,11 +37,13 @@ struct I2PRouterHealthInterruption: Codable, Equatable, Identifiable {
     enum Cause: String, Codable {
         case appSuspended
         case samplingPaused
+        case routerStopped
 
         var title: String {
             switch self {
             case .appSuspended: return "App suspended"
             case .samplingPaused: return "Sampling paused"
+            case .routerStopped: return "Router stopped"
             }
         }
     }
@@ -52,6 +54,30 @@ struct I2PRouterHealthInterruption: Codable, Equatable, Identifiable {
 
     var id: Int64 { Int64(startedAt.timeIntervalSince1970) }
     var midpoint: Date { startedAt.addingTimeInterval(duration / 2) }
+}
+
+enum I2PRouterHealthEventKind: String, Codable, Equatable {
+    case started
+    case cleanStop
+
+    var title: String {
+        switch self {
+        case .started: return "Router started"
+        case .cleanStop: return "Router cleanly stopped"
+        }
+    }
+}
+
+struct I2PRouterHealthEvent: Codable, Equatable, Identifiable {
+    let id: UUID
+    let kind: I2PRouterHealthEventKind
+    let occurredAt: Date
+
+    init(kind: I2PRouterHealthEventKind, at date: Date) {
+        id = UUID()
+        self.kind = kind
+        occurredAt = date
+    }
 }
 
 struct I2PRouterHealthSample: Codable, Equatable, Identifiable {
@@ -80,6 +106,7 @@ struct I2PRouterHealthChartPoint: Identifiable {
 struct I2PRouterHealthReading {
     let samples: [I2PRouterHealthSample]
     let chartPoints: [I2PRouterHealthChartPoint]
+    let events: [I2PRouterHealthEvent]
     let uptimePercent: Double?
     let onlineSeconds: TimeInterval
     let receivedBytes: Int
@@ -104,12 +131,16 @@ final class I2PRouterHealthHistory: @unchecked Sendable {
         var resumedAt: Date?
         var lastCumulativeReceivedBytes: Int?
         var lastCumulativeSentBytes: Int?
+        // Optional for decoding history written before lifecycle events existed.
+        var events: [I2PRouterHealthEvent]?
     }
 
     private static let storageKey = "i2p.router.health.history.v1"
     private let lock = NSLock()
     private let defaults: UserDefaults
     private var samples: [I2PRouterHealthSample]
+    private var events: [I2PRouterHealthEvent]
+    private var routerIsRunning = false
     private var isSuspended: Bool
     private var suspensionStartedAt: Date?
     private var resumedAt: Date?
@@ -122,6 +153,7 @@ final class I2PRouterHealthHistory: @unchecked Sendable {
         if let data = defaults.data(forKey: Self.storageKey),
            let state = try? JSONDecoder().decode(StoredState.self, from: data) {
             samples = state.samples
+            events = state.events ?? []
             isSuspended = state.isSuspended
             suspensionStartedAt = state.suspensionStartedAt
             resumedAt = state.resumedAt
@@ -130,6 +162,7 @@ final class I2PRouterHealthHistory: @unchecked Sendable {
             forceNextSample = state.resumedAt != nil && !state.isSuspended
         } else {
             samples = []
+            events = []
             isSuspended = false
             suspensionStartedAt = nil
             resumedAt = nil
@@ -182,6 +215,11 @@ final class I2PRouterHealthHistory: @unchecked Sendable {
                         duration: duration,
                         cause: .appSuspended)
                 }
+            } else if let shutdown = completedShutdown(after: previous.sampledAt, through: now) {
+                interruption = I2PRouterHealthInterruption(
+                    startedAt: shutdown.stoppedAt,
+                    duration: max(0, shutdown.startedAt.timeIntervalSince(shutdown.stoppedAt)),
+                    cause: .routerStopped)
             } else if elapsed > Self.sampleInterval * 1.5 {
                 let gapStart = previous.sampledAt.addingTimeInterval(Self.sampleInterval)
                 interruption = I2PRouterHealthInterruption(
@@ -216,6 +254,48 @@ final class I2PRouterHealthHistory: @unchecked Sendable {
         forceNextSample = false
         pruneLocked(at: now)
         persistLocked()
+    }
+
+    /// Records an intentional router start independently of the minute samples.
+    /// Duplicate lifecycle calls do not create duplicate markers.
+    func recordRouterStart(at date: Date = Date()) {
+        recordRouterLifecycleEvent(.started, at: date)
+    }
+
+    /// Records an intentional, clean router shutdown. App suspension uses the
+    /// separate sampling-gap path and must never be reported as a clean stop.
+    func recordRouterCleanStop(at date: Date = Date()) {
+        recordRouterLifecycleEvent(.cleanStop, at: date)
+    }
+
+    private func recordRouterLifecycleEvent(_ kind: I2PRouterHealthEventKind, at date: Date) {
+        lock.lock()
+        defer { lock.unlock() }
+        let shouldBeRunning = kind == .started
+        guard routerIsRunning != shouldBeRunning else { return }
+        routerIsRunning = shouldBeRunning
+        events.append(I2PRouterHealthEvent(kind: kind, at: date))
+        pruneLocked(at: date)
+        persistLocked()
+    }
+
+    /// Finds a clean stop/start pair between two samples. The resulting gap is
+    /// classified as intentional downtime, not as an app-suspension gap.
+    private func completedShutdown(after date: Date, through end: Date) -> (stoppedAt: Date, startedAt: Date)? {
+        var pendingStop: Date?
+        var completed: (stoppedAt: Date, startedAt: Date)?
+        for event in events where event.occurredAt > date && event.occurredAt <= end {
+            switch event.kind {
+            case .cleanStop:
+                pendingStop = event.occurredAt
+            case .started:
+                if let stoppedAt = pendingStop {
+                    completed = (stoppedAt, event.occurredAt)
+                    pendingStop = nil
+                }
+            }
+        }
+        return completed
     }
 
     /// Called as the app enters the background. The recorder ignores any final
@@ -253,6 +333,7 @@ final class I2PRouterHealthHistory: @unchecked Sendable {
     func reading(window: I2PRouterHealthWindow, at now: Date = Date()) -> I2PRouterHealthReading {
         let cutoff = now.addingTimeInterval(-window.duration)
         let selected = allSamples(at: now).filter { $0.sampledAt >= cutoff }
+        let selectedEvents = allEvents(at: now).filter { $0.occurredAt >= cutoff }
         var segment = 0
         let points = selected.map { sample -> I2PRouterHealthChartPoint in
             if sample.interruptionBefore != nil { segment += 1 }
@@ -260,9 +341,9 @@ final class I2PRouterHealthHistory: @unchecked Sendable {
         }
 
         guard let first = selected.first, let last = selected.last else {
-            return I2PRouterHealthReading(samples: [], chartPoints: [], uptimePercent: nil,
-                                          onlineSeconds: 0, receivedBytes: 0, sentBytes: 0,
-                                          lastInterruption: nil)
+            return I2PRouterHealthReading(samples: [], chartPoints: [], events: selectedEvents,
+                                          uptimePercent: nil, onlineSeconds: 0,
+                                          receivedBytes: 0, sentBytes: 0, lastInterruption: nil)
         }
 
         let windowStart = max(cutoff, first.sampledAt.addingTimeInterval(-first.availableSeconds))
@@ -279,6 +360,7 @@ final class I2PRouterHealthHistory: @unchecked Sendable {
         return I2PRouterHealthReading(
             samples: selected,
             chartPoints: points,
+            events: selectedEvents,
             uptimePercent: span > 0 ? min(100, onlineSeconds / span * 100) : nil,
             onlineSeconds: onlineSeconds,
             receivedBytes: selected.reduce(0) { $0 + $1.receivedBytes },
@@ -287,9 +369,17 @@ final class I2PRouterHealthHistory: @unchecked Sendable {
         )
     }
 
+    private func allEvents(at now: Date) -> [I2PRouterHealthEvent] {
+        lock.lock()
+        defer { lock.unlock() }
+        pruneLocked(at: now)
+        return events
+    }
+
     private func pruneLocked(at now: Date) {
         let cutoff = now.addingTimeInterval(-Self.retention)
         samples.removeAll { $0.sampledAt < cutoff }
+        events.removeAll { $0.occurredAt < cutoff }
         if samples.count > Self.maximumSamples {
             samples.removeFirst(samples.count - Self.maximumSamples)
         }
@@ -301,7 +391,8 @@ final class I2PRouterHealthHistory: @unchecked Sendable {
                                 suspensionStartedAt: suspensionStartedAt,
                                 resumedAt: resumedAt,
                                 lastCumulativeReceivedBytes: lastCumulativeReceivedBytes,
-                                lastCumulativeSentBytes: lastCumulativeSentBytes)
+                                lastCumulativeSentBytes: lastCumulativeSentBytes,
+                                events: events)
         guard let data = try? JSONEncoder().encode(state) else { return }
         defaults.set(data, forKey: Self.storageKey)
     }
@@ -349,6 +440,7 @@ enum I2PRouterHealthHistorySelfTest {
             defer { defaults.removePersistentDomain(forName: suite) }
             let history = I2PRouterHealthHistory(defaults: defaults)
             let start = Date(timeIntervalSince1970: 1_700_000_000)
+            history.recordRouterStart(at: start)
             history.record(available: true, activePeers: 1, readyTunnels: 1,
                            cumulativeReceivedBytes: 10, cumulativeSentBytes: 10, at: start)
             history.record(available: true, activePeers: 1, readyTunnels: 1,
@@ -369,6 +461,35 @@ enum I2PRouterHealthHistorySelfTest {
                   reading.chartPoints.map({ $0.sample.readyTunnels }) == [1, 1, 2],
                   reading.chartPoints.map(\.segment) == [0, 0, 1] else { return nil }
             return "App suspended · peer and ready-tunnel samples retain values and restart as separate chart segments"
+        }
+
+        check("Router health: explicit router lifecycle events distinguish clean shutdowns from suspension") {
+            let suite = "i2p.health.lifecycle.selftest.\(UUID().uuidString)"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let history = I2PRouterHealthHistory(defaults: defaults)
+            let start = Date(timeIntervalSince1970: 1_700_100_000)
+            history.recordRouterStart(at: start)
+            history.record(available: true, activePeers: 1, readyTunnels: 1,
+                           cumulativeReceivedBytes: 10, cumulativeSentBytes: 10, at: start)
+            history.record(available: true, activePeers: 1, readyTunnels: 1,
+                           cumulativeReceivedBytes: 20, cumulativeSentBytes: 20,
+                           at: start.addingTimeInterval(60))
+            let stopped = start.addingTimeInterval(70)
+            let restarted = start.addingTimeInterval(190)
+            history.recordRouterCleanStop(at: stopped)
+            history.recordRouterStart(at: restarted)
+            history.record(available: true, activePeers: 2, readyTunnels: 2,
+                           cumulativeReceivedBytes: 30, cumulativeSentBytes: 30,
+                           at: start.addingTimeInterval(200))
+            let reading = history.reading(window: .sixHours, at: start.addingTimeInterval(200))
+            guard reading.events.map(\.kind) == [.started, .cleanStop, .started],
+                  let interruption = reading.lastInterruption,
+                  interruption.cause == .routerStopped,
+                  interruption.startedAt == stopped,
+                  interruption.duration == 120,
+                  reading.chartPoints.map(\.segment) == [0, 0, 1] else { return nil }
+            return "Start and clean-stop events persist alongside samples; shutdown is solid-marked and separate from app-suspension gaps"
         }
 
         check("Router health: seven-day range includes retained samples, totals and gaps") {

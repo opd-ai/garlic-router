@@ -405,6 +405,7 @@ final class I2PRouterAppContext {
         guard !started else { return }
         started = true
         lifecycleState = .running
+        I2PRouterHealthHistory.shared.recordRouterStart()
         _ = try? ntcp2.startListener(port: 0)
         let bridge = NTCP2I2NPBridge(router: i2npRouter)
         ntcp2Bridge = bridge
@@ -445,11 +446,10 @@ final class I2PRouterAppContext {
         Task { await applyParticipationSettings() }
     }
 
-    /// Clean shutdown for app termination or background suspension: stops the
-    /// NTCP2 listener and sessions, the bootstrap cycle, the tunnel pool's
-    /// maintenance loop and the SAM socket. Netdb state rides persistent
-    /// storage, so suspension loses nothing; a later resume restarts everything
-    /// gracefully.
+    /// Cleanly shuts down the router's listeners, sessions, maintenance loops
+    /// and SAM socket. This is an intentional stop, not the app-background path:
+    /// app suspension is recorded separately by the health sampler, and iOS may
+    /// resume the still-running router when the app becomes active again.
     func shutdownForTermination() {
         guard started else { return }
         started = false
@@ -469,6 +469,7 @@ final class I2PRouterAppContext {
         tunnelPool.stop()
         engine.stop()
         samServer.stop()
+        I2PRouterHealthHistory.shared.recordRouterCleanStop()
     }
 
     /// Graceful restart on launch or after a background suspension. Re-running
