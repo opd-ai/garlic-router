@@ -10,6 +10,12 @@ This is a bounded source/build review, not a security certification or App Store
 - Moved saved IRC server passwords out of `UserDefaults` into the device-only Keychain (`AfterFirstUnlockThisDeviceOnly`). Existing entries are migrated and scrubbed; when secure storage is unavailable, the plaintext is still removed, that password is discarded and the server list warns the user. New password saves and server deletion fail closed if the Keychain operation fails.
 - Removed API-key importer debug output that included bundled plist contents, key identifiers and secret lengths.
 
+## Decisions recorded (2026-11-25)
+
+- **Language policy: English only, by decision.** The project sets `LOCALIZATION_PREFERS_STRING_CATALOGS = YES` and `SWIFT_EMIT_LOC_STRINGS = YES`, but ships no `*.xcstrings` and no `Localizable.strings`; every shipped string is inline English. That is the current answer rather than an unfinished feature, so an App Store listing must not claim another language until a catalogue is added. Adding one later is a self-contained change: the build settings already point at the mechanism.
+- **`ApiKeyManager` is kept, with its limit recorded rather than removed.** It is the mechanism by which a key entered at runtime reaches the Keychain, and nothing calls it yet. Its bundled `ENCRYPTED_KEYS.plist` is decrypted with a key derived from the public bundle identifier, and that file ships inside the app bundle, so its contents are extractable from any IPA: it obscures a value, it does not protect one. Nothing that must stay secret may be placed in it. Keychain entries written at runtime are the supported path.
+- **Exports are pinned to their stated fields.** The alignment JSON, the peer traffic CSV and the router health CSV are each asserted by a unit test against exact column names and values, so a field cannot be added silently. The alignment and peer-traffic cases additionally assert that nothing about peers, sessions or destinations appears in the file.
+
 ## Finalization verification (2026-11-21)
 
 - `xcodebuild clean build-for-testing -project Untitled1.xcodeproj -scheme Untitled1 -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO` succeeded after the final code changes. This compiles the app, unit-test target and UI-test target; it does not execute XCTest cases.

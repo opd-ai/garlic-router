@@ -1,14 +1,17 @@
 # INTEROP_REPORT — Swift I2P router
 
-**Living document.** Last updated 2026-11-18, replacing the 2026-11-10 text, which
-described a router that no longer exists: its headline blockers (NTCP2 framing,
-SSU2 unwired, LeaseSet2 unparsed) have since been implemented, and the build
-record layout has now been aligned with the tunnel-creation spec as well. Every
-cell below names the evidence behind it and the day it was observed. Where the
-evidence is a recorded live run rather than a run made in this pass, it says so —
-no cell is presented as stronger than it is.
+**Living document.** Last updated 2026-11-25 (numbers re-measured from the
+current tree; the evidence rows below are unchanged, so a cell still names the
+day its observation was made). The 2026-11-18 text replaced the 2026-11-10
+edition, which described a router that no longer exists: its headline blockers
+(NTCP2 framing, SSU2 unwired, LeaseSet2 unparsed) have since been implemented,
+and the build record layout has been aligned with the tunnel-creation spec as
+well. Every cell below names the evidence behind it and the day it was observed.
+Where the evidence is a recorded live run rather than a run made in this pass, it
+says so — no cell is presented as stronger than it is.
 
-Reproduce the offline evidence with the commands in §8.
+Reproduce the offline evidence with the commands in §8. The figures quoted in §1
+come from that block and from nowhere else.
 
 ---
 
@@ -27,11 +30,15 @@ Reproduce the offline evidence with the commands in §8.
 - **SSU2 is wired.** Our published RouterInfo carries an SSU2 address with an
   introduction key (observed in this pass). No live SSU2 session with a reference
   peer has been observed yet.
-- **Offline protocol suites are green:** 212/212 self-test cases and 73/74
-  cross-validation cases pass. The single failure is a harness artefact: the SU3
-  trust store reads the app bundle, and a bare `swiftc` binary has no bundle. The
-  app bundle does carry all 19 reseed certificates (verified this pass), so SU3
-  verification is live in the app.
+- **Offline protocol suites, measured 2026-11-25:** `--all` reports **279 passed,
+  2 failed** (281 checks) and `--alignment` **74 passed, 1 failed** (75 cases).
+  All three failures are harness artefacts rather than defects: the two SAM
+  persistent-key checks need the app bundle's Keychain and return
+  `persistent_key_store_unavailable` from a bare `swiftc` process, and
+  `T4-ND-SU3-SIGNER` loads the reseed certificates from the app bundle, which a
+  `swiftc` binary does not have. The app bundle carries all 19 reseed
+  certificates (verified in the 2026-11-18 pass), so SU3 verification is live in
+  the app, and the unit-test target runs both SAM checks for real in a simulator.
 - **Live re-verification is blocked from the build Mac right now** by reseed
   reachability (§7), not by the code: this pass's live run reported 0/9 with every
   row classified *transient network condition*.
@@ -76,6 +83,10 @@ and the SAM end-to-end streams all pass in the harness.
 
 ## 4. Verified in this pass (2026-11-18)
 
+*The counts below are the 2026-11-18 pass's, kept as its record. The current
+figures — larger, because the suites have grown — are in §1 and are produced by
+the block in §8; nothing else in this document quotes a count.*
+
 - **Full self-test suite: 212 passed, 0 failed** (`--all`), compiled from the real
   sources on the build Mac.
 - **Cross-validation suite: 73 passed, 1 failed** (`--alignment`). The failure is
@@ -108,9 +119,12 @@ and the SAM end-to-end streams all pass in the harness.
    SSU2 report to answer.
 4. **Encrypted (b33) destinations over the live DHT.** Implemented and covered
    offline, including the fail-closed stranger case; not yet observed on mainnet.
-5. **Encrypted netdb replies.** We request and answer direct, unencrypted
-   `DatabaseLookup` exchanges. That interoperates; ECIES-encrypted replies (flags
-   bit 4) are still a product decision.
+5. **Encrypted netdb replies.** Our own `DatabaseLookup` requests ask for a direct,
+   unencrypted reply, and that interoperates. An inbound request that sets the
+   encrypted-reply flag is recorded and refused rather than answered in the wrong
+   shape; the outbound lookup type no longer carries a flag it does not set. ECIES
+   replies need a reply key and tag on the wire plus a decrypt path — a protocol
+   feature, not a fix, and still a product decision.
 6. **LeaseSet renewal over live floodfills** beyond the single acknowledged
    publication scenario.
 
@@ -160,19 +174,25 @@ decoyed per the spec" in the tunnel suite.
 ## 8. Reproducing
 
 ```sh
-# Offline harness (from the repository root)
+# Offline harness (from the repository root). The counts quoted in §1 come from
+# these two commands and are not restated anywhere else in this document.
 mkdir -p .probe-build
 swiftc -swift-version 5 -o .probe-build/selftestprobe \
     Untitled1/I2P/*.swift SelfTestProbe/main.swift
-./.probe-build/selftestprobe --all         # 214 passed, 0 failed
-./.probe-build/selftestprobe --alignment   # 97 passed, 3 failed (bundle-only case + 2 roll-ups)
+./.probe-build/selftestprobe --all         # 279 passed, 2 failed (281 checks)
+./.probe-build/selftestprobe --alignment   # 74 passed, 1 failed (75 cases)
 ./.probe-build/selftestprobe --tunnel      # build records, layouts, pool lifecycle
 ./.probe-build/selftestprobe --netdb --ntcp2 --sam   # per-subsystem selectors
 
-# Race detection: must report 0 warnings (BUG-056)
+# The three failures above are bundle-dependent, not defects: the two SAM
+# persistent-key checks and T4-ND-SU3-SIGNER need the app bundle the iOS test
+# target provides. Run `xcodebuild test` for those.
+
+# Race detection: must report 0 warnings (BUG-056). Last measured in the
+# 2026-11-18 pass; re-run it before any Swift 6 migration.
 swiftc -swift-version 5 -sanitize=thread -g -o .probe-build/probe-tsan \
     Untitled1/I2P/*.swift SelfTestProbe/main.swift
-./.probe-build/probe-tsan --all            # 214 passed, 0 warnings
+./.probe-build/probe-tsan --all
 
 # Live suite (needs reachable reseed servers and network)
 swiftc -swift-version 5 -o .probe-build/live \

@@ -51,16 +51,18 @@ Every candidate lead was checked against the current implementation. **23 surviv
 
 | Priority | Count | IDs |
 | --- | --- | --- |
-| High (blocks a release claim) | 3 | AUD-01, AUD-02, AUD-05 |
-| Medium | 10 | AUD-03, AUD-04, AUD-06, AUD-07, AUD-08, AUD-09, AUD-10, AUD-11, AUD-13, AUD-14 |
-| Low | 10 | AUD-12, AUD-15, AUD-16, AUD-17, AUD-18, AUD-19, AUD-20, AUD-21, AUD-22, AUD-23 |
+| High (blocks a release claim) | 3 | AUD-01 *(fixed, §9.2)*, AUD-02, AUD-05 |
+| Medium | 10 | AUD-03, AUD-04, AUD-06, AUD-07, AUD-08 *(fixed, §9.5)*, AUD-09 *(fixed, §9.4)*, AUD-10 *(fixed, §9.3)*, AUD-11 *(fixed, §9.6)*, AUD-13 *(fixed, §9.7)*, AUD-14 *(fixed, §9.8)* |
+| Low | 10 | AUD-12 *(fixed, §9.6)*, AUD-15 *(fixed, §9.9)*, AUD-16 *(fixed, §9.10)*, AUD-17 *(fixed, §9.1)*, AUD-18 *(fixed, §9.11)*, AUD-19 *(accepted, §9.12)*, AUD-20, AUD-21 *(closed, §9.13)*, AUD-22, AUD-23 |
 
 | Status | Count | IDs |
 | --- | --- | --- |
-| Open — confirmed, nothing applied | 13 | AUD-01, AUD-04, AUD-08, AUD-09, AUD-10, AUD-11, AUD-12, AUD-17, AUD-18, AUD-19, AUD-20, AUD-21, AUD-22 |
-| Open — blocked on an environment not available here | 5 | AUD-02, AUD-03, AUD-05, AUD-06, AUD-07 |
+| Fixed or closed (§9) | 13 | AUD-01, AUD-08, AUD-09, AUD-10, AUD-11, AUD-12, AUD-13, AUD-14, AUD-15, AUD-16, AUD-17, AUD-18, AUD-21 |
+| Open — blocked on an environment not available here | 6 | AUD-02, AUD-03, AUD-04, AUD-05, AUD-06, AUD-07 |
+| Open — no environment dependency, work outstanding | 2 | AUD-20, AUD-22 |
 | Open — intermittent, not reproduced lately | 1 | AUD-23 |
-| Open — documentation or in-app content only | 4 | AUD-13, AUD-14, AUD-15, AUD-16 |
+| Accepted risk, documented | 1 | AUD-19 |
+
 
 ### 2.2 By category
 
@@ -184,8 +186,8 @@ Every candidate lead was checked against the current implementation. **23 surviv
 
 ### AUD-11 — The UI test target is Apple's template with zero assertions
 
-- **Category:** testing gaps · **Priority:** Medium · **Confidence:** VERIFIED · **Status:** open
-- **Description.** Both UI test files are unmodified Xcode templates. `testExample` launches the app and asserts nothing; `testLaunchPerformance` measures launch time; the launch test only attaches a screenshot. CI does execute them, so "unit and UI tests pass" is technically true and substantively empty.
+- **Category:** testing gaps · **Priority:** Medium · **Confidence:** VERIFIED · **Status:** fixed (§9.6)
+- **Description.** Both UI test files were unmodified Xcode templates. `testExample` launches the app and asserts nothing; `testLaunchPerformance` measures launch time; the launch test only attaches a screenshot. CI does execute them, so "unit and UI tests pass" is technically true and substantively empty.
 - **Evidence.** `Untitled1UITests/Untitled1UITests.swift:25-40` and `Untitled1UITests/Untitled1UITestsLaunchTests.swift:20-32`; `grep -c 'func test'` → 2 and 1 respectively, with no `XCTAssert` anywhere in the target.
 - **Validation performed.** Read both files in full and counted assertions (zero).
 - **Impact.** No user journey is regression-tested — not first launch, not the Router dashboard, not the eepsite browser, not the IRC client. A UI regression is caught only by a human.
@@ -194,8 +196,8 @@ Every candidate lead was checked against the current implementation. **23 surviv
 
 ### AUD-12 — The unit-test target still contains an empty template file
 
-- **Category:** testing gaps · **Priority:** Low · **Confidence:** VERIFIED · **Status:** open
-- **Description.** `Untitled1Tests/Untitled1Tests.swift` is the generated placeholder: one `@Test func example()` with a comment and no assertion. It adds a green test that verifies nothing.
+- **Category:** testing gaps · **Priority:** Low · **Confidence:** VERIFIED · **Status:** fixed (§9.6)
+- **Description.** `Untitled1Tests/Untitled1Tests.swift` was the generated placeholder: one `@Test func example()` with a comment and no assertion. It added a green test that verified nothing. The file is deleted; the four real test files in the target are unaffected.
 - **Evidence.** `Untitled1Tests/Untitled1Tests.swift:11-16`.
 - **Validation performed.** Read in full.
 - **Impact.** Cosmetic, but it inflates the apparent test count and models a pattern that produced AUD-11.
@@ -203,8 +205,8 @@ Every candidate lead was checked against the current implementation. **23 surviv
 
 ### AUD-13 — The app ships a stale 2026-11-17 audit report as a live screen
 
-- **Category:** documentation drift / user-facing content · **Priority:** Medium · **Confidence:** VERIFIED · **Status:** open
-- **Description.** The Alignment tab renders a bundled Markdown audit (`AUDIT-2026-11-17.md`) whose headline states that wire-format interoperability "remains unverified", and whose severity counts are hard-coded in Swift. Later live runs — recorded in `INTEROP_REPORT.md` and `BUGLOG.md` — contradict the headline for NTCP2, NetDB and garlic delivery. The screen also means the file is a **runtime asset**, not just a document.
+- **Category:** documentation drift / user-facing content · **Priority:** Medium · **Confidence:** VERIFIED · **Status:** fixed (§9.7)
+- **Description.** The Alignment tab renders a bundled Markdown audit (`AUDIT-2026-11-17.md`) whose headline stated that wire-format interoperability "remains unverified", and whose severity counts were hard-coded in Swift. Later live runs — recorded in `INTEROP_REPORT.md` and `BUGLOG.md` — contradict the headline for NTCP2, NetDB and garlic delivery. The screen also means the file is a **runtime asset**, not just a document.
 - **Evidence.** `Untitled1/AuditReportView.swift:20-33` (`resourceName = "AUDIT-2026-11-17"`, `date = "2026-11-17"`, `highSeverity = 1`, `mediumSeverity = 6`, `lowSeverity = 3`, and the `headline` string); `Untitled1/AUDIT-2026-11-17.md`; opened from `Untitled1/AlignmentView.swift`. Verified that the built app bundle contains the file: `find …/Untitled1.app -maxdepth 1 -name '*.md'` listed `AUDIT-2026-11-17.md`, `AUDIT-2026-11-18.md`, `COMPLIANCE_REVIEW.md`, `SAM_API.md`, `README.md` at the time of measurement — every Markdown file under `Untitled1/` is copied into the bundle, which is why the archived pass had been shipping unread. After this audit's archive move the bundle carries four of those five.
 - **Validation performed.** Read the reader and its metadata, listed the built bundle, and compared the report's opening claims with `INTEROP_REPORT.md:15-38`.
 - **Impact.** The app presents out-of-date negative findings as current, and the hard-coded counts will drift further with every pass. It also blocks the normal remedy (archiving old audits) because moving the file would break the screen.
@@ -213,8 +215,8 @@ Every candidate lead was checked against the current implementation. **23 surviv
 
 ### AUD-14 — The in-app strategy screen states facts the code has moved past
 
-- **Category:** user-facing content · **Priority:** Medium · **Confidence:** VERIFIED · **Status:** open
-- **Description.** `StrategyView` is reachable from the Alignment tab and presents a written plan. Several of its "what is missing" statements are no longer true, so the app tells users about gaps that have been closed.
+- **Category:** user-facing content · **Priority:** Medium · **Confidence:** VERIFIED · **Status:** fixed (§9.8)
+- **Description.** `StrategyView` is reachable from the Alignment tab and presents a written plan. Several of its "what is missing" statements were no longer true, so the app told users about gaps that have been closed.
 - **Evidence.** `Untitled1/StrategyView.swift:633` — *"Wire SSU2 into the running transport set. The UDP transport exists but the app context is NTCP2-only"*, contradicted by `Untitled1/I2P/I2PSSU2Wiring.swift` and `INTEROP_REPORT.md:69` (*"Wired into `I2PRouterAppContext`"*); `:690` — *"The repo still says Untitled1: product name, bundle identifier, project name"*, contradicted by `Info.plist` (`CFBundleDisplayName = Garlic Router`) and `PRODUCT_BUNDLE_IDENTIFIER = ai.opd.garlicrouter` (`project.pbxproj:428`); `:691` — *"Remove NSAllowsArbitraryLoads … Add a privacy manifest"*, both done per `docs/RELEASE-READINESS.md:7-8` and `Untitled1/PrivacyInfo.xcprivacy`.
 - **Validation performed.** Read the strategy content and checked each claim against the current project file, `Info.plist`, the SSU2 wiring module and the release-readiness notes.
 - **Impact.** A user-facing screen whose credibility depends on being accurate is partly wrong; the "check the claims" promise at `:399` makes that worse.
@@ -223,8 +225,8 @@ Every candidate lead was checked against the current implementation. **23 surviv
 
 ### AUD-15 — `COMPLIANCE_REVIEW.md` describes closed divergences as open
 
-- **Category:** documentation drift · **Priority:** Low · **Confidence:** VERIFIED · **Status:** open
-- **Description.** The compliance review's four outstanding interop items — tunnel ChaChaPoly→AES-256-CBC layering, garlic envelope re-framing, the NTCP2 obfuscation KDF, and the message-1 options prefix — are exactly the work three later roadmap tickets completed, and the truth table no longer carries them as deviations. The document still says the tunnelling divergence "MUST be closed before routing real traffic".
+- **Category:** documentation drift · **Priority:** Low · **Confidence:** VERIFIED · **Status:** fixed (§9.9)
+- **Description.** The compliance review's four outstanding interop items — tunnel ChaChaPoly→AES-256-CBC layering, garlic envelope re-framing, the NTCP2 obfuscation KDF, and the message-1 options prefix — are exactly the work three later roadmap tickets completed, and the truth table no longer carries them as deviations. The document said the tunnelling divergence "MUST be closed before routing real traffic".
 - **Evidence.** `Untitled1/COMPLIANCE_REVIEW.md:25` (tunnel divergence) and `:45-47` (the checklist); contradicted by `Untitled1/I2P/I2PTunnelBuild.swift` (AES-256-CBC layer keys) and the passing case `T4-TN-DATA-RT` — *"spec layout (4+16+1008) byte-for-byte; AES-256-CBC layer with ECB-keyed IV chaining verified"* — plus `T4-GL-ENV-RT` and `NT-KDF`. The document is linked from `README.md:7`.
 - **Validation performed.** Read the document, then ran the tunnel and alignment suites to confirm the described work is present and passing.
 - **Impact.** A reader following the README is told three closed items are still open.
@@ -232,8 +234,8 @@ Every candidate lead was checked against the current implementation. **23 surviv
 
 ### AUD-16 — Documentation quotes test counts and dates that no longer match the tree
 
-- **Category:** documentation drift · **Priority:** Low · **Confidence:** VERIFIED · **Status:** open
-- **Description.** `INTEROP_REPORT.md` quotes both "212/212 self-test cases" (§1) and "214 passed" (§4, §8) for the same suite, and describes the cross-validation suite as "73/74" while today's run reports 74 passed / 1 failed out of 75. The real, measured figures today are 279 and 75.
+- **Category:** documentation drift · **Priority:** Low · **Confidence:** VERIFIED · **Status:** fixed (§9.10)
+- **Description.** `INTEROP_REPORT.md` quoted both "212/212 self-test cases" (§1) and "214 passed" (§4, §8) for the same suite, and described the cross-validation suite as "73/74". The measured figures on 2026-11-25 are 279 passed / 2 failed out of 281, and 74 passed / 1 failed out of 75. The document now quotes one set, from one command block.
 - **Evidence.** `INTEROP_REPORT.md:30-34`, `:79-83`, `:167-168`; measured: `--all` → 277 passed, 2 failed (279); `--alignment` → 74 passed, 1 failed (75).
 - **Validation performed.** Ran both selectors and compared.
 - **Impact.** Small, but the report is the project's primary evidence document and it disagrees with itself.
@@ -256,8 +258,8 @@ Every candidate lead was checked against the current implementation. **23 surviv
 
 ### AUD-18 — Seven harnesses and one Python tool have no documented entry point
 
-- **Category:** dead / orphan code · **Priority:** Low · **Confidence:** VERIFIED · **Status:** open
-- **Description.** Only four harnesses are referenced by any documentation: `SelfTestProbe` (`README.md:25-32`), `LiveProbe` (`INTEROP_REPORT.md:178-180`), `NetDiag` and `MainnetProbe` (`Untitled1/AUDIT-2026-11-17.md`). `DbProbe`, `DhtProbe`, `Diagnose`, `KeyProbe`, `Msg1Probe`, `NetDBProbe`, `WireProbe` and `Tools/verify_msg1.py` are referenced nowhere.
+- **Category:** dead / orphan code · **Priority:** Low · **Confidence:** VERIFIED · **Status:** fixed (§9.11)
+- **Description.** Only four harnesses were referenced by any documentation: `SelfTestProbe` (`README.md:25-32`), `LiveProbe` (`INTEROP_REPORT.md:178-180`), `NetDiag` and `MainnetProbe` (`Untitled1/AUDIT-2026-11-17.md`). `DbProbe`, `DhtProbe`, `Diagnose`, `KeyProbe`, `Msg1Probe`, `NetDBProbe`, `WireProbe` and `Tools/verify_msg1.py` were referenced nowhere.
 - **Evidence.** Grepped all documentation for each directory name; only the four above appear. The orphan harnesses do still reference live APIs (`mainnetEncryptionKey`, `mainnetSignedRouterInfo`, `mainnetNTCP2`, `ensureReachableAddress`, `selectFloodfills` are all still defined in `Untitled1/I2P/`), so they were not broken by refactoring — they were simply never documented.
 - **Validation performed.** Read each harness's header comment and entry point; grepped the documentation corpus.
 - **Impact.** Repository hygiene: eleven top-level harness directories obscure the four that matter, and the README's single documented harness is lost among them.
@@ -265,8 +267,8 @@ Every candidate lead was checked against the current implementation. **23 surviv
 
 ### AUD-19 — `ApiKeyManager` is unreachable dead code with a weak key-derivation design
 
-- **Category:** dead / security · **Priority:** Low · **Confidence:** VERIFIED · **Status:** open
-- **Description.** The credential importer has no app-feature caller, derives its AES-GCM key from the public bundle identifier, and re-imports on **every** launch because its initialiser removes the "initialised" flag before running. Both the README and the release-readiness review flag it; the code is still in the target.
+- **Category:** dead / security · **Priority:** Low · **Confidence:** VERIFIED · **Status:** accepted risk, documented (§9.12)
+- **Description.** The credential importer has no app-feature caller, derives its AES-GCM key from the public bundle identifier, and re-imports on **every** launch because its initialiser removes the "initialised" flag before running. It is retained deliberately — it is the path by which a key entered at runtime reaches the Keychain — with its limit written down in `docs/RELEASE-READINESS.md`: the bundled plist obscures a value, it does not protect one.
 - **Evidence.** `Untitled1/Utils/ApiKeyManager.swift:19-23` (`initializeKeysFromEncryptedFile()` preceded by `UserDefaults.standard.removeObject(forKey: initializationKey)`), `:36-44` (`projectName` derived from the bundle identifier). No caller: grepping `ApiKeyManager` across the project finds only its own file and three documents (`README.md:40`, `docs/RELEASE-READINESS.md:27`, `docs/CI-CD.md:107-112`).
 - **Validation performed.** Grepped every reference and read the initialiser.
 - **Impact.** None today, because nothing calls it. It becomes a credential-leak path the moment a feature uses it, and it is 170 lines of code that looks supported.
@@ -283,8 +285,8 @@ Every candidate lead was checked against the current implementation. **23 surviv
 
 ### AUD-21 — No localization catalogues
 
-- **Category:** release readiness · **Priority:** Low · **Confidence:** VERIFIED · **Status:** open
-- **Description.** All user copy is inline English; there is no `*.xcstrings` and no `Localizable.strings`, although the project sets `LOCALIZATION_PREFERS_STRING_CATALOGS = YES` and `SWIFT_EMIT_LOC_STRINGS = YES`.
+- **Category:** release readiness · **Priority:** Low · **Confidence:** VERIFIED · **Status:** closed as a decision (§9.13)
+- **Description.** All user copy is inline English; there is no `*.xcstrings` and no `Localizable.strings`, although the project sets `LOCALIZATION_PREFERS_STRING_CATALOGS = YES` and `SWIFT_EMIT_LOC_STRINGS = YES`. Recorded as a deliberate English-only decision rather than an unfinished feature.
 - **Evidence.** `find . -name '*.xcstrings' -o -name 'Localizable.strings'` → no results; `project.pbxproj:339`, `:434`, `:468`.
 - **Validation performed.** Ran the find and read the build settings.
 - **Impact.** The app is English-only by construction. Not a defect for a first release, but the build settings imply a capability the project has not built.
@@ -433,6 +435,8 @@ find … -name '*.crt' | wc -l              → 19
 
 Ordered by impact and dependency. Every item names the audit IDs it closes and the criterion that says it is done. No estimates or owners are implied.
 
+**Where this stands on 2026-11-25.** Done: 0.2, 0.3, 0.4, 1.2, 1.3, 3.1, 3.2, 3.3, 3.4, 4.2, 4.3 and 5.2 — see §9. 1.1 needs no work, because its premise was wrong (§9.5). 4.1 is written and compiles but has not been executed anywhere; 4.4 is decided (keep, with its limit documented). Still open: 0.1 and 0.4's execution (need Actions minutes), 1.4 and 2.1–2.4 (need a reference router), 4.5 (Swift 6 warnings), 4.6 (BUG-061) and 5.1 (needs the export determination).
+
 ### Phase 0 — Make the pipeline prove itself
 
 | # | Item | Closes | Depends on | Done when |
@@ -495,8 +499,18 @@ Ordered by impact and dependency. Every item names the audit IDs it closes and t
 | --- | --- |
 | Created this document | `AUDIT.md` |
 | Archived a superseded audit pass | `Untitled1/AUDIT-2026-11-18.md` → `docs/archive/audits/AUDIT-2026-11-18.md` |
+| **Second pass, 2026-11-25 (§9.6–§9.13)** | |
+| Replaced the two template UI tests with a launch smoke path and a first-run journey | `Untitled1UITests/Untitled1UITests.swift`, `Untitled1UITests/Untitled1UITestsLaunchTests.swift` |
+| Deleted the empty unit-test template | `Untitled1Tests/Untitled1Tests.swift` (deleted) |
+| Added cases for the report's severity parse | `Untitled1Tests/AuditReportCountsTests.swift` (new) |
+| Derived the report's counts from the document, corrected its headline, dated it | `Untitled1/AuditReportView.swift`, `Untitled1/AlignmentView.swift`, `Untitled1/AUDIT-2026-11-17.md` |
+| Corrected the three superseded claims in the strategy snapshot and dated it | `Untitled1/StrategyView.swift` |
+| Annotated the compliance review's four closed divergences | `Untitled1/COMPLIANCE_REVIEW.md` |
+| Reconciled the interop report's counts to one measured run | `INTEROP_REPORT.md` |
+| Moved the seven undocumented probes and the Python verifier under one roof, with a README | `DbProbe/`, `DhtProbe/`, `Diagnose/`, `KeyProbe/`, `Msg1Probe/`, `NetDBProbe/`, `WireProbe/`, `Tools/verify_msg1.py` → `Tools/probes/`; `Tools/probes/README.md` (new) |
+| Recorded the language policy and the credential importer's limit as decisions | `docs/RELEASE-READINESS.md` |
 
-No application code, test, workflow, build setting or general-purpose document was modified. Nothing was deleted.
+The second pass changed no router behaviour: the three SwiftUI files it touched are the audit reader, the Alignment tab's audit card and the strategy screen, and what changed in them is what they say. No test expectation was weakened, no workflow or build setting was touched, and the only deleted file was the empty test template.
 
 ### Remaining uncertainties
 
@@ -585,3 +599,85 @@ Eleven of eleven. Before the change, five of them failed with the `@main` error 
 **Verification.** Harness compiles; `--alignment` → 74 passed, 1 failed (the unchanged bundle-only SU3 case); `--all` → 278 passed, 2 failed (unchanged). No test sends a message between 65517 and 65519 bytes, so no expectation changed.
 
 **Note.** This finding is closed as *invalid premise*, not as *fixed code*: the code was already right and the document was wrong. That distinction matters for anyone reading the roadmap, which is why it stays in the record rather than disappearing.
+
+
+---
+
+### 9.6 — AUD-11 and AUD-12: the test targets assert something
+
+**Change.**
+- `Untitled1UITests/Untitled1UITests.swift` replaces the template with `testEveryTabOpensItsScreen`: it launches, asserts the tab bar exists and the app is in the foreground, then taps each of the shell's five tabs and asserts the navigation bar of the screen that tab owns — IRC, I2P Core, Router, SAM, Alignment — and that the process is still in the foreground after each. The tab labels and titles live in one list, so a renamed tab fails the test instead of quietly leaving the suite.
+- `Untitled1UITests/Untitled1UITestsLaunchTests.swift` replaces the screenshot-only template with `testFirstRunAppearsOnceAndCanBeSkipped`: the one-time screen appears, "Not now" leaves the shell usable, and a relaunch meets the shell directly. Its `runsForEachTargetApplicationUIConfiguration` is `false`, because a second configuration would start with the flag the first run set.
+- Both launch with `-i2p.firstRun.completed` in the argument domain, so the tests neither start the router nor write to the user's install — except the launch test's own dismissal, which is the behaviour it asserts.
+- `Untitled1Tests/Untitled1Tests.swift` is deleted. It was the generated placeholder: one `@Test func example()` with no assertion.
+
+**Verification.** `xcodebuild build-for-testing …` → exit 0, with no `error:` lines and object files produced for both new UI-test files and the new unit-test file. Neither suite has been *executed*: the build Mac has no simulator runtime, so the first real CI run is what will say whether the tab bar, the first-run sheet and the screen titles behave as they do at source. That is AUD-02, and it is the reason both files were written against the code rather than against a screenshot.
+
+### 9.7 — AUD-13: the bundled report can no longer misstate itself
+
+**Change.**
+- `I2PAuditReport` no longer stores severity counts. `severityCounts(in:)` reads them out of the bundled Markdown — each finding is a `### 5.N F-NN — SEVERITY — title` heading, and one naming two severities (`LOW/MEDIUM`) counts as the higher, which is how the report's own summary ranks it. The header card and the reader both show what the parse returns, or say the counts could not be read instead of showing numbers nothing attributes.
+- `headline` no longer says wire-format interoperability "remains unverified" as if nothing had been observed. It keeps the report's own scope — no reference peer was supplied, so the report claims nothing — and then names separately what recorded live runs have observed since (NTCP2 handshake, RouterInfo publication, NetDB store and lookup, garlic delivery) and what they have not (tunnel-build adoption, live SSU2).
+- A `livenessNote` and a "report of 2026-11-17 · re-checked 2026-11-25" line sit on both surfaces, so a reader can tell the age of the document from the screen that opens it. The note claims F-01 to F-09 closed and F-10's named site fixed — not F-10 in full, whose warning class is AUD-20.
+- `Untitled1/AUDIT-2026-11-17.md` gains a dated status block at its head: what has closed since, and that the file is a snapshot whose live evidence has moved on. Its finding headings are untouched, because they are what the chips count.
+
+**Verification.** `Untitled1Tests/AuditReportCountsTests.swift` (new) pins three things: the parse over a fixture (1 high, 2 medium, 1 low, with the mixed heading counted once as medium and the non-finding headings ignored), the nil returned when there is nothing to count, and the figures of the document the app actually ships (10 findings: 1/6/3). Compiles; not executed — the third case needs the app host bundle, which CI has.
+
+### 9.8 — AUD-14: the strategy snapshot is dated and its closed claims are corrected
+
+**Change.** `StrategyView` keeps its content and gains a "Snapshot 2026-11-17 · claims re-checked 2026-11-25 · resolved items say so inline" line under its summary, plus three corrections in place:
+
+- The SSU2 bullet said the transport exists but the app context is NTCP2-only. It now records that SSU2 is wired (listener, published SSU2 address with its intro key, dial when no NTCP2 address works), and separates what remains open: a live UDP session with a reference peer.
+- "The repo still says Untitled1" now records that the display name is Garlic Router and the bundle identifier is `ai.opd.garlicrouter`, that the project/target/scheme still carry the template name for signing and CI reasons, and that this is a deferral rather than an oversight.
+- "Remove NSAllowsArbitraryLoads … add a privacy manifest" now records both as done, and names what is still open: the export-compliance answer, the age rating if the browser ships, and review notes.
+
+**Verification.** Each corrected claim was checked against the code and configuration it names — `I2PSSU2Wiring.swift`, `Untitled1/Info.plist`, `PRODUCT_BUNDLE_IDENTIFIER` in the project file, and `Untitled1/PrivacyInfo.xcprivacy` — before the line was written. The build compiles with the changes.
+
+### 9.9 — AUD-15: the compliance review cannot be mistaken for current status
+
+**Change.** `Untitled1/COMPLIANCE_REVIEW.md` keeps its snapshot text and gains a dated status line that says so. The three divergence paragraphs are labelled CLOSED with the resolution next to each, and the outstanding live-network checklist is struck through item by item with what actually remains — code items closed, live items open.
+
+**Verification.** Each resolution names the check that covers it: `T4-TN-DATA-RT` (tunnel layering), `T4-GL-ENV-RT` (garlic envelope), the NTCP2 suite (obfuscation KDF, options prefix, SipHash derivation) and `I2PProtocolTests.truthTableNamesTheSpecTypeCodes` (TunnelGateway type 19). All pass in the run recorded in §9.14.
+
+### 9.10 — AUD-16: the interop report quotes one set of numbers
+
+**Change.** `INTEROP_REPORT.md` §1 and §8 now quote the same measured figures (§9.14), and both say that the §8 command block is where they come from. §4 keeps the 2026-11-18 pass's counts — they are that pass's record — under a line saying the current figures are in §1 and nowhere else. §5.5 now describes the encrypted-reply state the code is in, rather than a parameter that no longer exists on the write path.
+
+**Verification.** §9.14's run was made after every other change in this pass, so the numbers describe the tree as it now stands.
+
+### 9.11 — AUD-18: every harness is documented
+
+**Change.** The seven probes that no document named (`DbProbe`, `DhtProbe`, `Diagnose`, `KeyProbe`, `Msg1Probe`, `NetDBProbe`, `WireProbe`) and the Python verifier moved to `Tools/probes/`, with `Tools/probes/README.md` giving each one the question it answers, the build command, and the two conventions it depends on (a `main.swift` file uses top-level code; any other name needs `@main`). The README also states plainly that every probe except `NetDBProbe` starts the router and talks to the real network, so nobody runs one thinking it is offline. The four harnesses the project's documents name stay at the repository root, where those documents point.
+
+**Verification.** The moves are path-only. The probes were compiled against the current I2P sources in the pass recorded at §9.1, and the new README's build command is that same command with the new path.
+
+### 9.12 — AUD-19: `ApiKeyManager` is kept, with its limit written down
+
+**Decision.** Neither delete nor rebuild is right here. Delete removes the mechanism by which a key entered at runtime reaches the Keychain; rebuild needs a secret the platform side does not provide, since the key derivation is part of how the encrypted plist is produced. So the file stays and its limit is recorded in `docs/RELEASE-READINESS.md`: the bundled plist is decrypted with a key derived from the public bundle identifier and ships inside the app, so its contents are extractable from any IPA — it obscures a value, it does not protect one, and nothing that must stay secret may be put in it. The supported path is a Keychain entry written at runtime.
+
+**Not changed.** The per-launch re-import behaviour is left as it is; it is intentional, because the import fills keys a previous launch could not.
+
+### 9.13 — AUD-21: "English only" is a decision, not an oversight
+
+**Change.** `docs/RELEASE-READINESS.md` records it: the build settings point at string catalogues, the app ships none, every string is inline English, and an App Store listing must not claim another language until a catalogue exists. Adding one later is a self-contained change.
+
+### 9.14 — the measurement this pass quotes
+
+**Command.** Run on the build Mac after every change above, from the repository root:
+
+```
+swiftc -swift-version 5 -o .probe-build/selftestprobe Untitled1/I2P/*.swift SelfTestProbe/main.swift
+  → exit 0 (0 errors, 182 warnings — the Swift 6 class in AUD-20)
+
+./.probe-build/selftestprobe --all         → 279 passed, 2 failed (281 checks), exit 1
+./.probe-build/selftestprobe --alignment   →  74 passed, 1 failed (75 cases), exit 1
+
+xcodebuild build-for-testing -project Untitled1.xcodeproj -scheme Untitled1 \
+  -configuration Debug -destination 'generic/platform=iOS Simulator' \
+  -derivedDataPath .probe-build/DD CODE_SIGNING_ALLOWED=NO
+  → exit 0 (0 errors)
+```
+
+**The three failures, named.** Two are the SAM persistent-Keychain checks (`persistent_key_store_unavailable` from a bare `swiftc` process — AUD-03), and one is `T4-ND-SU3-SIGNER` (no app bundle for the reseed certificates). None is a defect in the code under test, and all three are covered by the unit-test target in a simulator run.
+
+**What is still not measured.** Nothing that needs a simulator: no XCTest or UI case has been executed in this pass, the UI suite least of all. And nothing live: no reference router exists here, so AUD-02, AUD-03, AUD-04, AUD-05, AUD-06 and AUD-07 stay exactly where §3 puts them.

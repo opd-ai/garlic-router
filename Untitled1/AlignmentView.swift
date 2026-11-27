@@ -675,19 +675,32 @@ struct AlignmentView: View {
         card(title: "Independent audit") {
             Text(I2PAuditReport.title)
                 .font(.subheadline.weight(.semibold))
-            Text("garlic-router · \(I2PAuditReport.date)")
+            Text("garlic-router · report of \(I2PAuditReport.date) · re-checked \(I2PAuditReport.lastReviewed)")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
 
-            HStack(spacing: 8) {
-                chip("high", count: I2PAuditReport.highSeverity, color: .red)
-                chip("medium", count: I2PAuditReport.mediumSeverity, color: .orange)
-                chip("low", count: I2PAuditReport.lowSeverity, color: .gray)
+            if let counts = I2PAuditReport.counts {
+                HStack(spacing: 8) {
+                    chip("high", count: counts.high, color: .red)
+                    chip("medium", count: counts.medium, color: .orange)
+                    chip("low", count: counts.low, color: .gray)
+                }
+            } else {
+                Text("The severity counts could not be read from the bundled document, so none are shown.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             Text(I2PAuditReport.headline)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Text(I2PAuditReport.livenessNote)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
 
             Button {

@@ -83,6 +83,11 @@ struct StrategyView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
+            Text("Snapshot 2026-11-17 · claims re-checked 2026-11-25 · resolved items say so inline")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+
             HStack(spacing: 8) {
                 chip("5", label: "improvements")
                 chip("7", label: "phases")
@@ -629,9 +634,10 @@ private enum StrategyContent {
             effort: "L · 4-6 wks",
             dependsOn: "nothing. This is the gate.",
             detail: [
-                "Record shape is now on spec: 154-byte short request records sealed with the Noise_N_X25519/ChaChaPoly handshake into 218-byte ShortTunnelBuild records (I2NP types 25/26), and reply records follow the KDF, nonce and AD rules. The loopback suite proves the build/reply path; what is left is proving it against live routers.",
-                "Wire SSU2 into the running transport set. The UDP transport exists but the app context is NTCP2-only, so a phone behind carrier NAT can never be reachable, selected as a hop or able to accept an inbound tunnel.",
-                "Keep hidden mode until SSU2 works: the router already publishes only once a listener and an external IPv4 are known, so peers are never handed an unreachable address."
+                "Record shape is now on spec: 154-byte short request records sealed with the Noise_N_X25519/ChaChaPoly handshake into 218-byte ShortTunnelBuild records (I2NP types 25/26), and reply records follow the KDF, nonce and AD rules. The loopback suite proves the build/reply path; what is left is proving it against live routers — the last recorded run showed 21 build starts and 0 tunnels adopted.",
+                "Resolved since this snapshot: SSU2 is wired into the running transport set. The app context opens the UDP listener, publishes an SSU2 address with its introduction key beside the NTCP2 one, and dials SSU2 when no NTCP2 address works (I2PSSU2Wiring.swift, covered by the transport-wiring and UDP loopback suites).",
+                "Still open on this item: a live SSU2 session with a reference peer. Loopback evidence is not that, so a phone behind carrier NAT is still unproven for reachability, hop selection and inbound tunnels.",
+                "Keep hidden mode until SSU2 works end to end: the router already publishes only once a listener and an external IPv4 are known, so peers are never handed an unreachable address."
             ],
             exitCriterion: "Exit: 90%+ of builds through modern mainnet routers succeed, and a real .i2p page is fetched over our own tunnels."
         ),
@@ -687,8 +693,8 @@ private enum StrategyContent {
             effort: "S-M · ~2 wks",
             dependsOn: "nothing, but must land before the ship phase.",
             detail: [
-                "The repo still says Untitled1: product name, bundle identifier, project name. The display name Garlic Router is good; make everything else match it.",
-                "Remove NSAllowsArbitraryLoads or scope it narrowly. Add a privacy manifest, an export-compliance answer, a 17+ rating if the browser ships, and review notes with a demo video.",
+                "Resolved since this snapshot: the display name is Garlic Router and the bundle identifier is ai.opd.garlicrouter. The Xcode project, the target and the scheme are still named Untitled1 — cosmetic, but renaming them touches signing and the CI scheme, so it is a deliberate deferral rather than an oversight.",
+                "Partly resolved since this snapshot: the NSAllowsArbitraryLoads exception is gone and PrivacyInfo.xcprivacy is in the app. Still open: the export-compliance answer (ITSAppUsesNonExemptEncryption is not set, so every upload asks the question), the age rating if the browser ships, and review notes with a demo video.",
                 "Distribution is not App Store and hope: the first 500 users are the I2P forum, r/i2p, the i2pd and Java I2P developers, and the self-hosting crowd."
             ],
             exitCriterion: "Exit: passes review, and 500 community testers have run the real build."

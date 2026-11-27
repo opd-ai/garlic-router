@@ -4,7 +4,7 @@ Garlic Router is an iOS application for exploring a pure-Swift I2P router and it
 
 ## Status and limitations
 
-This is an experimental implementation, not a production-ready or independently audited I2P router. The protocol suites provide local, deterministic and loopback evidence; they do not establish full interoperability. The most recent checked-in interoperability report (2026-11-18) reports a recorded NTCP2 handshake and several mainnet exchanges, but live tunnel-build adoption and live SSU2 interoperability remain unverified. See [INTEROP_REPORT.md](INTEROP_REPORT.md) and [the compliance review](Untitled1/COMPLIANCE_REVIEW.md) for evidence and open protocol gaps.
+This is an experimental implementation, not a production-ready or independently audited I2P router. The protocol suites provide local, deterministic and loopback evidence; they do not establish full interoperability. The checked-in interoperability report (evidence rows from 2026-11-18, counts re-measured 2026-11-25) reports a recorded NTCP2 handshake and several mainnet exchanges, but live tunnel-build adoption and live SSU2 interoperability remain unverified. See [INTEROP_REPORT.md](INTEROP_REPORT.md), [the 2026-11-25 audit](AUDIT.md) and [the compliance review](Untitled1/COMPLIANCE_REVIEW.md) for evidence and open protocol gaps.
 
 The live mainnet probes are opt-in. Running one contacts public reseed services and a bounded set of floodfill peers; it should be done only with network access and an understanding that it sends real traffic. Do not treat a green local suite as proof of live-network security or interoperability.
 
@@ -32,6 +32,8 @@ swiftc -swift-version 5 -o .probe-build/selftestprobe \
 ```
 
 The harness supports focused selectors such as `--sam`, `--tunnel`, `--netdb`, `--netdb-entries`, `--alignment`, `--b33` and `--spec`; it exits nonzero when any selected check fails. Some bundle-dependent checks are only meaningful in the app/test bundle. In particular, the standalone macOS process used for this review could not access the app Keychain and its SAM persistent-key checks returned `persistent_key_store_unavailable`; run those checks in the iOS test bundle or on a configured device. Live-network verification requires reachable external services. See [CI and CD](docs/CI-CD.md) for CI and TestFlight setup.
+
+The repository's other developer probes — netdb wire diagnosis, DHT selection, and the handshake message 1 and 3 diagnostics, plus an independent Python verifier for a SessionRequest — are documented in [Tools/probes](Tools/probes/README.md). They are opt-in live tools: every one except `NetDBProbe` contacts real peers.
 
 ## Security and privacy notes
 

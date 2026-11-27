@@ -17,20 +17,85 @@ import SwiftUI
 
 /// Facts about the bundled report the Alignment tab shows before the document
 /// itself is opened. Kept here so the card and the reader cannot disagree.
+///
+/// The severity counts are read out of the document instead of being stored
+/// beside it: a hard-coded count stops matching the findings a reader scrolls
+/// through the moment one is added or closed, and a screen that misstates how
+/// many open findings a report holds is worse than one that says it cannot read
+/// them.
 enum I2PAuditReport {
     static let resourceName = "AUDIT-2026-11-17"
     static let title = "Defensive end-to-end audit"
     static let date = "2026-11-17"
-    static let highSeverity = 1
-    static let mediumSeverity = 6
-    static let lowSeverity = 3
+    /// The day the report's findings were last checked against the code.
+    static let lastReviewed = "2026-11-25"
 
-    /// The one sentence the report asks a reader to carry away.
+    /// The one sentence the report asks a reader to carry away. It stays scoped
+    /// to what the report could obtain — no reference peer was supplied — and
+    /// the live observations recorded since are stated separately, because the
+    /// document's opening line otherwise reads as if nothing had been observed.
     static let headline = """
-        Wire-format interoperability with Java I2P and i2pd remains unverified — \
-        no authorised test environment was supplied, so the report makes no \
-        interoperability claim.
+        The report was given no reference peer, so it makes no interoperability \
+        claim of its own. Recorded live runs since then have observed an NTCP2 \
+        handshake, RouterInfo publication, NetDB store and lookup, and garlic \
+        delivery; live tunnel-build adoption and live SSU2 remain unverified.
         """
+
+    /// How old the document is and what has moved since, so a reader can tell
+    /// "the audit found this" from "this is still true".
+    static let livenessNote = """
+        Findings as of \(date), re-checked \(lastReviewed). F-01 to F-09 are \
+        closed in the code and F-10's named site is fixed; the remaining Swift 6 \
+        warnings are tracked separately. The open items as of \(lastReviewed) are \
+        in INTEROP_REPORT.md and the current audit, not in this snapshot.
+        """
+
+    // MARK: Severity counts
+
+    struct SeverityCounts: Equatable {
+        let high: Int
+        let medium: Int
+        let low: Int
+        var total: Int { high + medium + low }
+    }
+
+    /// What the chips show, or nil when the bundled document is missing or holds
+    /// no finding headings to count. Parsed once per process.
+    static let counts: SeverityCounts? = markdown().flatMap(severityCounts(in:))
+
+    /// Counts the findings straight out of the document. A finding is a heading
+    /// shaped `### 5.1 F-01 — HIGH — title`; one that names two severities
+    /// (`LOW/MEDIUM`) counts as the higher, which is how the report's own
+    /// summary ranks it.
+    static func severityCounts(in markdown: String) -> SeverityCounts? {
+        var high = 0
+        var medium = 0
+        var low = 0
+        for line in markdown.components(separatedBy: "\n") {
+            guard line.hasPrefix("### 5.") else { continue }
+            switch severity(of: line) {
+            case .some(.high): high += 1
+            case .some(.medium): medium += 1
+            case .some(.low): low += 1
+            case .none: continue
+            }
+        }
+        guard high + medium + low > 0 else { return nil }
+        return SeverityCounts(high: high, medium: medium, low: low)
+    }
+
+    private enum Severity { case high, medium, low }
+
+    private static func severity(of heading: String) -> Severity? {
+        // `### 5.1 F-01 — HIGH — the finding's title`
+        let fields = heading.components(separatedBy: " — ")
+        guard fields.count >= 2 else { return nil }
+        let token = fields[1].uppercased()
+        if token.contains("HIGH") { return .high }
+        if token.contains("MEDIUM") { return .medium }
+        if token.contains("LOW") { return .low }
+        return nil
+    }
 
     /// Loads the bundled Markdown. Returns nil when the resource is missing,
     /// which the reader surfaces instead of pretending the report is empty.
@@ -260,19 +325,32 @@ struct AuditReportView: View {
         VStack(alignment: .leading, spacing: 10) {
             Text(I2PAuditReport.title)
                 .font(.title3.weight(.semibold))
-            Text("garlic-router · \(I2PAuditReport.date)")
+            Text("garlic-router · report of \(I2PAuditReport.date) · re-checked \(I2PAuditReport.lastReviewed)")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
 
-            HStack(spacing: 8) {
-                severityChip("high", count: I2PAuditReport.highSeverity, color: .red)
-                severityChip("medium", count: I2PAuditReport.mediumSeverity, color: .orange)
-                severityChip("low", count: I2PAuditReport.lowSeverity, color: .gray)
+            if let counts = I2PAuditReport.counts {
+                HStack(spacing: 8) {
+                    severityChip("high", count: counts.high, color: .red)
+                    severityChip("medium", count: counts.medium, color: .orange)
+                    severityChip("low", count: counts.low, color: .gray)
+                }
+            } else {
+                Text("The severity counts could not be read from the bundled document, so none are shown.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             Text(I2PAuditReport.headline)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Text(I2PAuditReport.livenessNote)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
