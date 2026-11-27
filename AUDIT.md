@@ -276,8 +276,8 @@ Every candidate lead was checked against the current implementation. **23 surviv
 
 ### AUD-20 — Swift 6 migration warnings remain across the protocol layer
 
-- **Category:** build · **Priority:** Low · **Confidence:** VERIFIED · **Status:** open
-- **Description.** Compiling the sources emits a stream of `NSLock`-from-async warnings that Swift 6 turns into errors, plus unused-result warnings in the router context. The project is pinned to `SWIFT_VERSION = 5.0`, so this is a future break, not a current failure.
+- **Category:** build · **Priority:** Low · **Confidence:** VERIFIED · **Status:** in progress (§9.15)
+- **Description.** Compiling the sources under the Swift 6 language mode fails on nonisolated global mutable state and warns on `NSLock` used from async contexts and on unnecessary `try`. The project is pinned to `SWIFT_VERSION = 5.0`, so these are a future break, not a current failure. Swift 6 is not yet the project's language mode; the goal is to reach a clean `swiftc -swift-version 6` typecheck of the protocol layer.
 - **Evidence.** Harness compile log: `Untitled1/I2P/I2PTunnel.swift:813:14: warning: instance method 'unlock' is unavailable from asynchronous contexts; … this is an error in the Swift 6 language mode` (and the same for `lock()`); `project.pbxproj:435` and `:469` (`SWIFT_VERSION = 5.0`). `docs/RELEASE-READINESS.md:19` records the same class.
 - **Validation performed.** Observed the warnings in this audit's own `swiftc` run and in the `build-for-testing` log.
 - **Impact.** Moving to Swift 6 becomes a large mechanical change with concurrency-safety risk in the tunnel, transport and SAM paths — the exact areas that had four data races fixed in `BUG-055…060`.
@@ -681,3 +681,19 @@ xcodebuild build-for-testing -project Untitled1.xcodeproj -scheme Untitled1 \
 **The three failures, named.** Two are the SAM persistent-Keychain checks (`persistent_key_store_unavailable` from a bare `swiftc` process — AUD-03), and one is `T4-ND-SU3-SIGNER` (no app bundle for the reseed certificates). None is a defect in the code under test, and all three are covered by the unit-test target in a simulator run.
 
 **What is still not measured.** Nothing that needs a simulator: no XCTest or UI case has been executed in this pass, the UI suite least of all. And nothing live: no reference router exists here, so AUD-02, AUD-03, AUD-04, AUD-05, AUD-06 and AUD-07 stay exactly where §3 puts them.
+
+
+### 9.15 — AUD-20: the Swift 6 global-state class is being removed, batch by batch
+
+**Measured with.** `swiftc -swift-version 6 -typecheck Untitled1/I2P/*.swift` — the mode the project is not yet on, so this is a forward check, not the shipped setting.
+
+**Change (first batch).**
+- `I2PAlignmentBaseline` and `I2PAlignmentHistory` kept their mutable state in `static var`s behind an `NSLock`. Swift 6 rejects exactly that (`static property 'stored' is not concurrency-safe because it is nonisolated global shared mutable state`). Both now hold their state in a `private final class Store: @unchecked Sendable` with the lock *inside* it, reached through a `static let store`. The lock still guards every read and write; only the declaration shape changed, so behaviour is identical and `@unchecked Sendable` is justified by that lock rather than asserted over unprotected state.
+- `I2NPPipeline` wrapped a non-throwing initializer in `try?`; the warning was correct and the marker is removed, with the optional binding kept so the branch still reads as "no envelope".
+
+**Verification.** Harness compiles (0 errors) and runs `279 passed, 2 failed` — the two unchanged bundle-only Keychain checks. `--router-health` 5 passed. `--alignment` 74 passed, 1 failed (the unchanged reseed-certificate case). The app builds.
+
+**Still failing under `-swift-version 6` (enumerated, not yet changed).** The same declaration shape appears elsewhere; each is one of:
+- an `ObservableObject` singleton (`static let shared = …`), e.g. `I2PBrowserHistoryStore`, `I2PSavedHostsStore`, `I2PIRCKeywordBook`, `I2PIRCServerBook`, `I2POfflinePageStore`, `I2PB33HostBook`, `I2PLastReadPageStore`, `I2PIRCIgnoreBook`, `I2PIRCHistoryStore`, `I2PIRCSnoozeBook`, `I2PIRCServerPasswordKeychain`;
+- a non-`Sendable` class singleton, e.g. `I2PRouterAppContext`, `I2PTunnelPool`, `I2PEepsiteClient`.
+The fix for the first group is `@MainActor` isolation (their mutations are already documented as main-thread only); for the second, a lock-guarded store as above or an explicit `Sendable` conformance where the type really is immutable.

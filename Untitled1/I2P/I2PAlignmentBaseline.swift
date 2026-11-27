@@ -88,15 +88,34 @@ struct I2PAlignmentRegression: Identifiable, Equatable {
 
 enum I2PAlignmentBaseline {
 
-    private static let lock = NSLock()
-    private static var stored: I2PAlignmentBaselineSnapshot?
+    /// The one pinned baseline, guarded by its own lock. Held in an instance
+    /// rather than a `static var`, so the value has no nonisolated global
+    /// mutable state for Swift 6 to reject; the lock is what makes it safe.
+    private final class Store: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored: I2PAlignmentBaselineSnapshot?
+
+        var value: I2PAlignmentBaselineSnapshot? {
+            get {
+                lock.lock()
+                defer { lock.unlock() }
+                return stored
+            }
+        }
+
+        func set(_ snapshot: I2PAlignmentBaselineSnapshot?) {
+            lock.lock()
+            stored = snapshot
+            lock.unlock()
+        }
+    }
+
+    private static let store = Store()
 
     /// The pinned baseline, nil while nothing is pinned. Memory only: it is
     /// gone after a relaunch.
     static var snapshot: I2PAlignmentBaselineSnapshot? {
-        lock.lock()
-        defer { lock.unlock() }
-        return stored
+        store.value
     }
 
     static var isPinned: Bool {
@@ -117,17 +136,13 @@ enum I2PAlignmentBaseline {
                                                            counts: counts[row.id])
         }
         let snapshot = I2PAlignmentBaselineSnapshot(pinnedAt: pinnedAt, rows: snapshotRows)
-        lock.lock()
-        stored = snapshot
-        lock.unlock()
+        store.set(snapshot)
         return snapshot
     }
 
     /// Drops the pinned baseline. The rows go back to being read on their own.
     static func clear() {
-        lock.lock()
-        stored = nil
-        lock.unlock()
+        store.set(nil)
     }
 
     /// The rows that are worse than the baseline, keyed by row ID and in truth

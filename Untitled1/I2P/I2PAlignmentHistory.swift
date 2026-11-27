@@ -45,15 +45,55 @@ enum I2PAlignmentHistory {
     /// At most this many runs are kept; the oldest is dropped first.
     static let capacity = 30
 
-    private static let lock = NSLock()
-    private static var stored: [I2PAlignmentCoverageSample] = []
-    private static var nextID = 0
+    /// The window and its counter, guarded by one lock. Held in an instance so
+    /// the mutable state is not a nonisolated `static var`, which Swift 6
+    /// rejects; the lock is what makes it safe to share.
+    private final class Store: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored: [I2PAlignmentCoverageSample] = []
+        private var nextID = 0
+
+        var values: [I2PAlignmentCoverageSample] {
+            lock.lock()
+            defer { lock.unlock() }
+            return stored
+        }
+
+        /// Appends a sample under the lock, dropping the oldest once full.
+        func append(
+            ranAt: Date,
+            coverage: I2PAlignmentCoverage,
+            capacity: Int
+        ) -> [I2PAlignmentCoverageSample] {
+            lock.lock()
+            defer { lock.unlock() }
+            let sample = I2PAlignmentCoverageSample(
+                id: nextID,
+                ranAt: ranAt,
+                aligned: coverage.aligned,
+                pending: coverage.pendingWireVerification,
+                defects: coverage.defect,
+                total: coverage.total)
+            nextID += 1
+            stored.append(sample)
+            if stored.count > capacity {
+                stored.removeFirst(stored.count - capacity)
+            }
+            return stored
+        }
+
+        func removeAll() {
+            lock.lock()
+            stored.removeAll()
+            lock.unlock()
+        }
+    }
+
+    private static let store = Store()
 
     /// The kept runs, oldest first.
     static var samples: [I2PAlignmentCoverageSample] {
-        lock.lock()
-        defer { lock.unlock() }
-        return stored
+        store.values
     }
 
     /// The newest run's sample, nil before the first run.
@@ -82,30 +122,13 @@ enum I2PAlignmentHistory {
     @discardableResult
     static func record(ranAt: Date = Date(),
                        coverage: I2PAlignmentCoverage = I2PSpecTruthTable.coverage) -> [I2PAlignmentCoverageSample] {
-        lock.lock()
-        defer { lock.unlock() }
-        let sample = I2PAlignmentCoverageSample(
-            id: nextID,
-            ranAt: ranAt,
-            aligned: coverage.aligned,
-            pending: coverage.pendingWireVerification,
-            defects: coverage.defect,
-            total: coverage.total)
-        nextID += 1
-        stored.append(sample)
-        if stored.count > capacity {
-            stored.removeFirst(stored.count - capacity)
-        }
-        return stored
+        store.append(ranAt: ranAt, coverage: coverage, capacity: capacity)
     }
 
     /// Empties the window. The history is memory-only, so a relaunch does this
     /// by itself; this is for the self-tests.
     static func reset() {
-        lock.lock()
-        defer { lock.unlock() }
-        stored = []
-        nextID = 0
+        store.removeAll()
     }
 
     // MARK: Labels for the summary card

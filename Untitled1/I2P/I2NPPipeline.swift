@@ -293,7 +293,7 @@ final class I2NPMessageRouter {
             // a remote router (a delivery to our own hash would try to open a
             // session to ourselves and never reach the local body handlers).
             if toRouterHash == localRouterHash,
-               let envelope = try? I2NPMessage(type: .tunnelGateway, payload: gatewayPayload) {
+               let envelope = Optional(I2NPMessage(type: .tunnelGateway, payload: gatewayPayload)) {
                 onLocalTunnelDelivery?()
                 await handleIncoming(envelope, from: localRouterHash)
                 return
