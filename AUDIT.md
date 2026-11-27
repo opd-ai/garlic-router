@@ -726,3 +726,16 @@ xcodebuild build-for-testing -project Untitled1.xcodeproj -scheme Untitled1 \
 **Correction made during this pass.** The first version of the case expected four rows and failed: the interruption is stored on the sample that *follows* the gap, so a gap is one timeline row whose `startedAt` is where the gap began, not two rows. The case now asserts what the recorder actually does, and the harness failure is what said so.
 
 **Not verified.** The screen was not seen on a device or simulator — no simulator runtime here — so its layout, the segmented filter's behaviour and the empty states are checked at source only. No XCTest was added or executed for it.
+
+
+### 9.18 — Roadmap: daily availability rows in the seven-day view
+
+**Change.** The seven-day Router health view gains a "Daily availability" card, one compact row per day:
+
+- `I2PRouterHealthDay` carries the day, the observed availability, the online duration and the number of interruptions that began that day. `dailySummaries(calendar:at:)` groups the retained samples by the current calendar's day, sums their on-time with the same interval-overlap arithmetic the window reading uses, and returns the last seven days newest first.
+- **A day with no samples reports no percentage.** It says "No samples", not 0%, because "nothing was observed" and "down all day" are different claims and only one of them is a measurement. Its online duration reads "—" for the same reason.
+- A day that has only just begun is measured from its first covered interval to now, so a fresh day is not reported as mostly down. The row names the day as Today, Yesterday or the weekday and date.
+
+**Verification.** Harness `--router-health` → **8 passed, 0 failed**, one more than before. The new case seeds two available samples a minute apart today and asserts seven rows newest first, today reading **100%** over **60 s** with no interruption, and yesterday reading **no samples** rather than 0%. `--all` → **282 passed, 2 failed** (the two unchanged bundle-only Keychain checks). The app builds, so the card compiles into the target.
+
+**Not verified.** The rows were not seen on a device or simulator (no simulator runtime here), so the layout at large text sizes and the weekday labels are checked at source only. The daily boundaries use the device's current calendar and time zone; no test covers a non-UTC zone, and none was run.

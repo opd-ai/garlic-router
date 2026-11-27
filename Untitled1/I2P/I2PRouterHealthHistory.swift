@@ -152,6 +152,24 @@ struct I2PRouterTimelineEntry: Identifiable, Equatable {
     var isEvent: Bool { kind != nil }
 }
 
+// MARK: - Daily summary
+
+/// One day of the seven-day view: what the retained samples observed that day.
+/// A day with no samples keeps no percentage at all, which is not the same as a
+/// day the router was down for, so the screen can show the difference.
+struct I2PRouterHealthDay: Identifiable, Equatable {
+    /// The start of the day, in the current calendar.
+    let day: Date
+    /// Observed availability, or nil when the day holds no sample.
+    let availabilityPercent: Double?
+    let onlineSeconds: TimeInterval
+    /// Interruptions that began on this day.
+    let interruptionCount: Int
+
+    var id: Date { day }
+    var hasSamples: Bool { availabilityPercent != nil }
+}
+
 // MARK: - Local recorder
 
 final class I2PRouterHealthHistory: @unchecked Sendable {
@@ -412,6 +430,57 @@ final class I2PRouterHealthHistory: @unchecked Sendable {
         )
     }
 
+    /// One day's worth of the seven-day view, newest first. Only the days the
+    /// retention window covers are listed, and a day with no sample reports no
+    /// percentage rather than zero.
+    func dailySummaries(calendar: Calendar = .current,
+                        at now: Date = Date()) -> [I2PRouterHealthDay] {
+        let samples = allSamples(at: now)
+        let interruptions = samples.compactMap(\.interruptionBefore)
+        var days: [I2PRouterHealthDay] = []
+        var dayStarts: [Date] = []
+        for offset in 0..<7 {
+            guard let day = calendar.date(byAdding: .day, value: -offset, to: now) else { continue }
+            let start = calendar.startOfDay(for: day)
+            if dayStarts.contains(start) { continue }
+            dayStarts.append(start)
+            let end = calendar.date(byAdding: .day, value: 1, to: start) ?? start
+            let inDay = samples.filter { $0.sampledAt >= start && $0.sampledAt < end }
+            let gaps = interruptions.filter {
+                $0.startedAt >= start && $0.startedAt < end
+            }.count
+
+            guard let firstOfDay = inDay.first else {
+                days.append(I2PRouterHealthDay(day: start,
+                                                availabilityPercent: nil,
+                                                onlineSeconds: 0,
+                                                interruptionCount: gaps))
+                continue
+            }
+
+            var online: TimeInterval = 0
+            for sample in inDay where sample.available && sample.availableSeconds > 0 {
+                let intervalStart = sample.sampledAt.addingTimeInterval(-sample.availableSeconds)
+                let overlapStart = max(start, intervalStart)
+                let overlapEnd = min(end, sample.sampledAt)
+                online += max(0, overlapEnd.timeIntervalSince(overlapStart))
+            }
+            // The observed span runs from the day's first covered interval to the
+            // window edge, so a day that has only just begun does not read as
+            // mostly down.
+            let observedStart = max(start, firstOfDay.sampledAt
+                .addingTimeInterval(-firstOfDay.availableSeconds))
+            let observedEnd = min(end, now)
+            let span = max(0, observedEnd.timeIntervalSince(observedStart))
+            days.append(I2PRouterHealthDay(
+                day: start,
+                availabilityPercent: span > 0 ? min(100, online / span * 100) : nil,
+                onlineSeconds: online,
+                interruptionCount: gaps))
+        }
+        return days
+    }
+
     private func isSuspensionOpen(at now: Date) -> Date? {
         lock.lock()
         defer { lock.unlock() }
@@ -642,6 +711,39 @@ enum I2PRouterHealthHistorySelfTest {
                   open[0].seconds == nil,
                   !open[0].isMeasurable else { return nil }
             return "0–300 s suspension and 120–180 s stop read as 240 s and 60 s (overlap counted once), the 40 s gap stays separate, and an open suspension reads as unmeasurable"
+        }
+
+        check("Router health: each day of the week reports its own availability or a gap") {
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = TimeZone(identifier: "UTC")!
+            let noon = calendar.date(from: DateComponents(year: 2023, month: 11, day: 14,
+                                                          hour: 12))!
+            let suite = "i2p.health.days.\(UUID().uuidString)"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let history = I2PRouterHealthHistory(defaults: defaults)
+            // Two minutes of samples today, all available; nothing yesterday.
+            history.record(available: true, activePeers: 1, readyTunnels: 1,
+                           cumulativeReceivedBytes: 10, cumulativeSentBytes: 10,
+                           at: noon.addingTimeInterval(-60))
+            history.record(available: true, activePeers: 1, readyTunnels: 1,
+                           cumulativeReceivedBytes: 20, cumulativeSentBytes: 20,
+                           at: noon)
+
+            let days = history.dailySummaries(calendar: calendar, at: noon)
+            guard days.count == 7,
+                  calendar.isDate(days[0].day, inSameDayAs: noon),
+                  days[0].hasSamples,
+                  days[0].availabilityPercent == 100,
+                  days[0].onlineSeconds == 60,
+                  days[0].interruptionCount == 0,
+                  days[1].availabilityPercent == nil,
+                  !days[1].hasSamples,
+                  days[1].onlineSeconds == 0,
+                  // A day before the retained window is not invented as a gap;
+                  // the list is exactly the seven days the view draws.
+                  days.map(\.day) == days.map(\.day).sorted(by: >) else { return nil }
+            return "7 days newest first: today reads 100% over 60 s, yesterday reads no samples rather than 0%"
         }
 
         check("Router health: the lifecycle timeline lists events and interruptions newest first") {

@@ -69,6 +69,9 @@ struct RouterHealthView: View {
                     if reading.hasDowntime {
                         downtimeCard
                     }
+                    if window == .sevenDays {
+                        dailySummariesCard
+                    }
                 } else {
                     trendCard
                 }
@@ -596,6 +599,60 @@ struct RouterHealthView: View {
         .sheet(isPresented: $showingLifecycle) {
             LifecycleTimelineView()
         }
+    }
+
+    // MARK: - Daily summaries
+
+    /// One compact row per day of the seven-day view. A day with no sample says
+    /// so instead of showing 0%, because "nothing observed" and "down all day"
+    /// are different things and only one of them is a measurement.
+    private var dailySummariesCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Daily availability")
+                .font(.headline)
+                .foregroundStyle(.primary)
+                .accessibilityAddTraits(.isHeader)
+
+            ForEach(dailySummaryDays) { day in
+                HStack(spacing: 8) {
+                    Text(dayLabel(day.day))
+                        .font(.footnote.weight(.medium))
+                        .frame(minWidth: 88, alignment: .leading)
+                    Text(day.availabilityPercent.map { String(format: "%.0f%%", $0) } ?? "No samples")
+                        .font(.footnote)
+                        .foregroundStyle(day.hasSamples ? .primary : .secondary)
+                        .frame(minWidth: 74, alignment: .leading)
+                    Text(day.hasSamples ? durationText(day.onlineSeconds) : "—")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(minWidth: 56, alignment: .leading)
+                    Spacer(minLength: 4)
+                    Text(day.interruptionCount == 1 ? "1 gap" : "\(day.interruptionCount) gaps")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityElement(children: .combine)
+            }
+
+            Text("A day with no samples is shown as a gap rather than as 0% availability.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 18))
+    }
+
+    private var dailySummaryDays: [I2PRouterHealthDay] {
+        I2PRouterHealthHistory.shared.dailySummaries()
+    }
+
+    private func dayLabel(_ day: Date) -> String {
+        let calendar = Calendar.current
+        if calendar.isDateInToday(day) { return "Today" }
+        if calendar.isDateInYesterday(day) { return "Yesterday" }
+        return day.formatted(.dateTime.weekday(.abbreviated).day().month(.abbreviated))
     }
 
     // MARK: - Downtime by cause
