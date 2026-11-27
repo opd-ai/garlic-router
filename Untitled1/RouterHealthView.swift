@@ -39,6 +39,7 @@ struct RouterHealthView: View {
     @State private var selectedTrend: RouterHealthTrend = .peers
     @State private var reading = I2PRouterHealthHistory.shared.reading(window: .twentyFourHours)
     @State private var retainedSamples = I2PRouterHealthHistory.shared.allSamples()
+    @State private var showingLifecycle = false
 
     private let accent = Color(red: 0.47, green: 0.44, blue: 0.97)
     private let background = Color(red: 0.055, green: 0.06, blue: 0.09)
@@ -55,6 +56,7 @@ struct RouterHealthView: View {
 
                 uptimeCard
                 windowPicker
+                lifecycleLink
                 exportCard
 
                 if reading.hasSamples || !reading.events.isEmpty {
@@ -566,6 +568,34 @@ struct RouterHealthView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(16)
         .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 18))
+    }
+
+    /// The way into the timeline: the same events and gaps this screen marks on
+    /// the chart, listed newest first and filterable.
+    private var lifecycleLink: some View {
+        Button {
+            showingLifecycle = true
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "calendar.badge.clock")
+                Text("Lifecycle history")
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.secondary)
+            }
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(accent)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 10)
+            .padding(.horizontal, 14)
+            .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
+        }
+        .buttonStyle(.plain)
+        .accessibilityHint("Lists every retained router start, clean stop and interruption, newest first")
+        .sheet(isPresented: $showingLifecycle) {
+            LifecycleTimelineView()
+        }
     }
 
     // MARK: - Downtime by cause

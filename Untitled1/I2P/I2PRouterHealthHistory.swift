@@ -134,6 +134,24 @@ struct I2PRouterHealthReading {
     var hasDowntime: Bool { !downtime.isEmpty }
 }
 
+/// One row of the lifecycle timeline: a router start or clean stop, or one of
+/// the three interruption causes. Both kinds share the screen, because a reader
+/// asking "what happened at 14:20" wants one list, not two.
+struct I2PRouterTimelineEntry: Identifiable, Equatable {
+    let id: String
+    let kind: I2PRouterHealthEventKind?
+    let cause: I2PRouterHealthInterruption.Cause?
+    let startedAt: Date
+    /// Nil for a start/stop event and for a gap that has not closed yet.
+    let duration: TimeInterval?
+
+    var title: String {
+        kind?.title ?? cause?.title ?? "Unknown"
+    }
+
+    var isEvent: Bool { kind != nil }
+}
+
 // MARK: - Local recorder
 
 final class I2PRouterHealthHistory: @unchecked Sendable {
@@ -401,6 +419,38 @@ final class I2PRouterHealthHistory: @unchecked Sendable {
         return suspensionStartedAt
     }
 
+    /// The retained lifecycle events and interruptions as one list, newest
+    /// first, for the timeline screen. A gap that is still open is listed with
+    /// no duration, so it cannot read as an outage that has already ended.
+    func timeline(at now: Date = Date()) -> [I2PRouterTimelineEntry] {
+        let events = allEvents(at: now)
+        let interruptions = allSamples(at: now).compactMap(\.interruptionBefore)
+        var entries: [I2PRouterTimelineEntry] = events.map { event in
+            I2PRouterTimelineEntry(id: event.id.uuidString,
+                                    kind: event.kind,
+                                    cause: nil,
+                                    startedAt: event.occurredAt,
+                                    duration: nil)
+        }
+        for interruption in interruptions {
+            entries.append(I2PRouterTimelineEntry(
+                id: "gap-\(interruption.cause.rawValue)-\(interruption.startedAt.timeIntervalSince1970)",
+                kind: nil,
+                cause: interruption.cause,
+                startedAt: interruption.startedAt,
+                duration: interruption.duration))
+        }
+        if let openSince = isSuspensionOpen(at: now) {
+            entries.append(I2PRouterTimelineEntry(
+                id: "gap-open-\(openSince.timeIntervalSince1970)",
+                kind: nil,
+                cause: .appSuspended,
+                startedAt: openSince,
+                duration: nil))
+        }
+        return entries.sorted { $0.startedAt > $1.startedAt }
+    }
+
     /// Attributes each interruption to one cause, clipping to the window and
     /// subtracting time already attributed, so the totals never double-count an
     /// overlap. The order is the most specific cause first: an intentional
@@ -592,6 +642,39 @@ enum I2PRouterHealthHistorySelfTest {
                   open[0].seconds == nil,
                   !open[0].isMeasurable else { return nil }
             return "0–300 s suspension and 120–180 s stop read as 240 s and 60 s (overlap counted once), the 40 s gap stays separate, and an open suspension reads as unmeasurable"
+        }
+
+        check("Router health: the lifecycle timeline lists events and interruptions newest first") {
+            let suite = "i2p.health.timeline.\(UUID().uuidString)"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let history = I2PRouterHealthHistory(defaults: defaults)
+            let start = Date(timeIntervalSince1970: 1_700_300_000)
+            history.recordRouterStart(at: start)
+            history.record(available: true, activePeers: 1, readyTunnels: 1,
+                           cumulativeReceivedBytes: 10, cumulativeSentBytes: 10, at: start)
+            let suspendedAt = start.addingTimeInterval(70)
+            let resumedAt = start.addingTimeInterval(250)
+            history.markAppSuspended(at: suspendedAt)
+            history.resumeSampling(at: resumedAt)
+            history.record(available: true, activePeers: 1, readyTunnels: 1,
+                           cumulativeReceivedBytes: 10, cumulativeSentBytes: 10, at: resumedAt)
+            let stopped = start.addingTimeInterval(400)
+            history.recordRouterCleanStop(at: stopped)
+
+            let timeline = history.timeline(at: start.addingTimeInterval(500))
+            // The suspension is recorded on the sample that follows it, so its
+            // entry starts where the gap did: three entries, newest first.
+            guard timeline.count == 3,
+                  timeline.map(\.startedAt) == [stopped, suspendedAt, start],
+                  timeline.map(\.isEvent) == [true, false, true],
+                  timeline[0].kind == .cleanStop,
+                  timeline[1].kind == nil,
+                  timeline[1].cause == .appSuspended,
+                  timeline[1].duration == 180,
+                  timeline[2].kind == .started,
+                  timeline.map({ $0.id }).count == Set(timeline.map(\.id)).count else { return nil }
+            return "3 entries newest first: clean stop, the suspension gap, the router start; ids are unique"
         }
 
         check("Router health: explicit router lifecycle events distinguish clean shutdowns from suspension") {

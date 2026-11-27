@@ -712,3 +712,17 @@ xcodebuild build-for-testing -project Untitled1.xcodeproj -scheme Untitled1 \
 **Verification.** Harness `--router-health` → **6 passed, 0 failed**, one more than before. The new case asserts a 0–300 s suspension and a 120–180 s clean stop inside it read as **240 s** and **60 s** (the 60 s overlap counted once), a separate 40 s sampling gap stays 40 s, an interruption wholly outside the window contributes nothing, and an open suspension has `seconds == nil`. `--all` → **280 passed, 2 failed** (the two unchanged bundle-only Keychain checks); `--alignment` → 74 passed, 1 failed (the unchanged bundle-only reseed-certificate case). The app builds.
 
 **Not verified.** The rendered card was not seen: no simulator runtime here, so the layout, the colours and the "Measuring" state are checked at source only. The new unit test in `I2PRouterHealthExportTests` style was not added for this case — the harness case covers the logic — and no XCTest was executed.
+
+
+### 9.17 — Roadmap: the router lifecycle timeline screen
+
+**Change.** A new screen, opened from the Router health screen beside the range picker:
+
+- `I2PRouterHealthHistory.timeline(at:)` returns the retained router starts, clean stops and interruptions as one list, newest first, each with the time it began and its duration where one is known. A gap that is still open is listed with no duration, so an unfinished suspension cannot read as an outage that already ended. Ids are stable and unique per row (`gap-<cause>-<start>`), so a list redraw keeps its identity and no two rows collide.
+- `LifecycleTimelineView` draws it: a segmented filter (All / Start & stop / Interruptions), one row per entry with its cause-coloured dot, title, duration or "Still open · measuring", and the time; an empty state that distinguishes "nothing recorded yet" from "nothing of this kind", and a caption stating the seven-day local-only retention. Dark theme, violet accent, consistent with the Router health screen it opens from.
+
+**Verification.** Harness `--router-health` → **7 passed, 0 failed**, two more than before. The new case records a start, an app suspension with its resume, and a clean stop, then asserts the timeline holds exactly **3** entries newest first (clean stop, the suspension gap starting where the gap did, the router start), that only the two lifecycle rows read as events, that the suspension keeps its 180 s, and that every id is distinct. `--all` → **281 passed, 2 failed** (the two unchanged bundle-only Keychain checks). The app builds, so the new screen compiles into the target.
+
+**Correction made during this pass.** The first version of the case expected four rows and failed: the interruption is stored on the sample that *follows* the gap, so a gap is one timeline row whose `startedAt` is where the gap began, not two rows. The case now asserts what the recorder actually does, and the harness failure is what said so.
+
+**Not verified.** The screen was not seen on a device or simulator — no simulator runtime here — so its layout, the segmented filter's behaviour and the empty states are checked at source only. No XCTest was added or executed for it.
